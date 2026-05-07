@@ -45,7 +45,17 @@ def _get_model_class(model_name: str, trust_remote_code: bool = True):
     """
     from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
 
-    config = AutoConfig.from_pretrained(model_name, trust_remote_code=trust_remote_code)
+    try:
+        # 优先只读本地缓存，避免每次运行都访问 HuggingFace 网络
+        config = AutoConfig.from_pretrained(
+            model_name,
+            trust_remote_code=trust_remote_code,
+            local_files_only=True,
+        )
+    except Exception:
+        # 本地没有缓存时再允许联网下载
+        config = AutoConfig.from_pretrained(model_name, trust_remote_code=trust_remote_code)
+
     model_type = getattr(config, "model_type", "")
 
     # Qwen3.5 等多模态模型需要用 AutoModelForImageTextToText
@@ -71,10 +81,18 @@ class HFLoader:
         Returns:
             加载好的 tokenizer 实例
         """
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_name,
-            trust_remote_code=trust_remote_code,
-        )
+        try:
+            # 优先从本地缓存加载，避免无意义的网络 HEAD 请求
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_name,
+                trust_remote_code=trust_remote_code,
+                local_files_only=True,
+            )
+        except Exception:
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_name,
+                trust_remote_code=trust_remote_code,
+            )
         return tokenizer
 
     def load_model(
@@ -102,11 +120,20 @@ class HFLoader:
         # 根据模型类型自动选择正确的 Auto 类
         model_cls = _get_model_class(model_name, trust_remote_code)
 
-        model = model_cls.from_pretrained(
-            model_name,
-            torch_dtype=torch_dtype,
-            trust_remote_code=trust_remote_code,
-        )
+        try:
+            # 优先从本地缓存加载，避免运行 demo 时因为网络问题失败
+            model = model_cls.from_pretrained(
+                model_name,
+                dtype=torch_dtype,
+                trust_remote_code=trust_remote_code,
+                local_files_only=True,
+            )
+        except Exception:
+            model = model_cls.from_pretrained(
+                model_name,
+                dtype=torch_dtype,
+                trust_remote_code=trust_remote_code,
+            )
 
         model.eval()      # 切换到评估模式，关闭 dropout 等
         model.to(device)   # 将模型移至目标设备

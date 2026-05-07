@@ -1,14 +1,12 @@
-"""CLI 对话脚本
+"""第二阶段批量调度 Demo
 
-加载模型，接收用户输入，执行单请求推理并输出结果和性能指标。
-第二阶段的单请求对话也复用 RequestQueue / Scheduler / KVCacheManager，
-因此它和 batch demo 走的是同一套 engine loop。
+演示多请求进入队列后，engine 通过 Scheduler 每轮选择一批请求，
+按 decode-first 策略逐 step 推进直到全部完成。
 
-运行：python scripts/run_cli_chat.py
+运行：python scripts/run_batch_demo.py
 """
 
 import sys
-import uuid
 from pathlib import Path
 
 import torch
@@ -20,25 +18,21 @@ from miniservellm.config import ModelConfig
 from miniservellm.model_adapter.hf_loader import HFLoader
 from miniservellm.model_adapter.tokenizer_adapter import TokenizerAdapter
 from miniservellm.model_adapter.hf_model_runner import HFModelRunner
+
 from miniservellm.runtime.sampler import Sampler
 from miniservellm.runtime.prefill import PrefillExecutor
 from miniservellm.runtime.decode import DecodeExecutor
 from miniservellm.runtime.inference_engine import InferenceEngine
-from miniservellm.scheduler.request import Request, SamplingParams
+
+from miniservellm.cache.kv_cache_manager import KVCacheManager
 from miniservellm.scheduler.request_queue import RequestQueue
 from miniservellm.scheduler.scheduler import Scheduler
-from miniservellm.cache.kv_cache_manager import KVCacheManager
-from miniservellm.benchmark.metrics import RequestMetrics
+
+from miniservellm.benchmark.bench_batching import run_batch_requests
 
 
 def pick_device():
-    """自动选择推理设备
-
-    优先级：CUDA > MPS (Apple Silicon) > CPU
-
-    Returns:
-        设备名称字符串
-    """
+    """自动选择推理设备，优先级：CUDA > MPS > CPU"""
     if torch.cuda.is_available():
         return "cuda"
     if torch.backends.mps.is_available():
@@ -47,17 +41,18 @@ def pick_device():
 
 
 def pick_dtype(device: str):
-    """根据设备选择合适的精度
-
-    CPU 使用 float32，GPU/MPS 使用 float16 以节省显存并加速推理。
-    """
+    """根据设备选择推理精度"""
     if device == "cpu":
         return "float32"
     return "float16"
 
 
 def build_engine():
-    """构建第二阶段推理引擎
+    """构建第二阶段 InferenceEngine
+
+    组装组件：
+    HFLoader -> TokenizerAdapter -> HFModelRunner -> KVCacheManager ->
+    PrefillExecutor / DecodeExecutor -> RequestQueue -> Scheduler -> InferenceEngine
 
     Returns:
         (engine, tokenizer_adapter) 元组
@@ -85,13 +80,17 @@ def build_engine():
         trust_remote_code=model_cfg.trust_remote_code,
     )
 
-    # 组装 engine 依赖组件
+    # 组装推理基础组件
     tokenizer_adapter = TokenizerAdapter(tokenizer)
     model_runner = HFModelRunner(model, model_cfg.device)
     kv_cache_manager = KVCacheManager()
     sampler = Sampler()
+
+    # 执行器接入 KVCacheManager
     prefill_executor = PrefillExecutor(model_runner, sampler, kv_cache_manager)
     decode_executor = DecodeExecutor(model_runner, sampler, kv_cache_manager)
+
+    # 调度组件：请求队列 + decode-first scheduler
     request_queue = RequestQueue()
     scheduler = Scheduler(
         request_queue=request_queue,
@@ -111,42 +110,31 @@ def build_engine():
 
 
 def main():
+    """运行批量请求 Demo"""
     engine, tokenizer_adapter = build_engine()
-    tokenizer = tokenizer_adapter.tokenizer
 
-    # 获取用户输入并构建 prompt
-    user_input = input("User> ").strip()
-    prompt_text = tokenizer_adapter.build_prompt(user_input)
-    prompt_token_ids = tokenizer_adapter.encode(prompt_text)
+    prompts = [
+        "请用三句话解释什么是 KV Cache。",
+        "介绍一下 FlashAttention 的核心思想。",
+        "为什么 decode 阶段通常比 prefill 阶段更 memory-bound？",
+    ]
 
-    # EOS 作为停止 token
-    stop_token_ids = []
-    if tokenizer.eos_token_id is not None:
-        stop_token_ids.append(tokenizer.eos_token_id)
-
-    # 构造单请求；后续由 engine.add_request() 放入 RequestQueue
-    request = Request(
-        request_id=str(uuid.uuid4()),
-        prompt=prompt_text,
-        prompt_token_ids=prompt_token_ids,
-        sampling_params=SamplingParams(
-            max_new_tokens=10240,
-            temperature=0.7,
-            top_k=20,
-            top_p=0.9,
-            stop_token_ids=stop_token_ids,
-        ),
+    outputs, metrics = run_batch_requests(
+        engine,
+        tokenizer_adapter,
+        prompts=prompts,
+        max_new_tokens=32,
     )
 
-    # 兼容第一阶段的单请求 generate API，内部仍走第二阶段 step loop
-    output_text = engine.generate(request)
+    print("\n===== OUTPUTS =====")
+    for item in outputs:
+        print(f"[{item['request_id']}]")
+        print(item["text"])
+        print("-" * 60)
 
-    print("\nAssistant>")
-    print(output_text)
-
-    metrics = RequestMetrics(request)
-    print("\nMetrics>")
-    print(metrics.summary())
+    print("\n===== METRICS =====")
+    for metric in metrics:
+        print(metric)
 
 
 if __name__ == "__main__":

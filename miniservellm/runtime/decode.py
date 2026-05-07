@@ -1,9 +1,10 @@
 """Decode 执行器
 
 负责自回归解码的每一步：输入上一个 token，配合 KV Cache 产出下一个 token。
-每步只输入 1 个 token，利用 KV Cache 避免重复计算之前的注意力。
+第二阶段从 KVCacheManager 读取和更新 cache。
 """
 
+import time
 import torch
 
 
@@ -11,49 +12,43 @@ class DecodeExecutor:
     """Decode 阶段执行器
 
     Attributes:
-        model_runner: 模型运行器，负责实际的前向推理
+        model_runner: 模型运行器，负责实际 forward
         sampler: 采样器，从 logits 中采样 token
+        kv_cache_manager: KV Cache 管理器
     """
 
-    def __init__(self, model_runner, sampler):
+    def __init__(self, model_runner, sampler, kv_cache_manager):
         self.model_runner = model_runner
         self.sampler = sampler
+        self.kv_cache_manager = kv_cache_manager
 
     def step(self, request):
-        """执行一步 decode：输入上一个 token，产出下一个 token
-
-        步骤：
-        1. 将上一个生成的 token 构造为 [1, 1] 输入
-        2. 构造正确长度的 attention_mask（覆盖 prompt + 已生成 token）
-        3. 调用模型 forward 得到 logits 和更新后的 KV Cache
-        4. 采样下一个 token
-        5. 判断是否达到终止条件
+        """执行一步 decode
 
         Args:
-            request: 请求对象，包含 past_key_values 和 sampling_params
+            request: 当前请求对象
 
         Returns:
-            (next_token_id, finished) 元组
-            - next_token_id: 本步采样的 token id
-            - finished: 是否满足终止条件
+            (next_token_id, finished)
         """
-        # 只输入上一个生成的 token，形状 [1, 1]
+        # 优先从 KVCacheManager 获取 cache，兼容 fallback 到 request.past_key_values
+        cache_handle = self.kv_cache_manager.get(request.request_id)
+        past_key_values = cache_handle.data if cache_handle is not None else request.past_key_values
+
+        # 每步 decode 只输入上一个生成的 token
         input_ids = torch.tensor([[request.last_token_id]], dtype=torch.long)
 
-        # attention_mask 长度必须等于 past_key_values 的序列长度 + 当前 token
-        # 否则模型无法正确计算注意力（这是 KV Cache 使用的关键）
-        prompt_len = len(request.prompt_token_ids)
-        generated_len = len(request.generated_token_ids)
-        total_len = prompt_len + generated_len
+        # 更严谨的 attention_mask：长度覆盖 prompt + 已生成 token。
+        # HF past_key_values 已包含之前 token 的 KV，当前 input_ids 是最后一个生成 token。
+        total_len = len(request.prompt_token_ids) + len(request.generated_token_ids)
         attention_mask = torch.ones(1, total_len, dtype=torch.long)
 
         output = self.model_runner.forward_decode(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            past_key_values=request.past_key_values,
+            past_key_values=past_key_values,
         )
 
-        # 从 logits 采样下一个 token
         next_token_id = self.sampler.sample(
             output.logits[:, -1, :],
             temperature=request.sampling_params.temperature,
@@ -66,10 +61,23 @@ class DecodeExecutor:
         request.last_token_id = next_token_id
         request.generated_token_ids.append(next_token_id)
 
-        # 终止条件：达到最大生成长度 或 采样到 stop token
+        if request.first_token_time is None:
+            request.first_token_time = time.time()
+
+        # 判断终止：达到最大长度或遇到 stop token
         finished = (
             len(request.generated_token_ids) >= request.sampling_params.max_new_tokens
             or next_token_id in request.sampling_params.stop_token_ids
         )
+
+        # 更新 cache manager，token_count = prompt + 已生成
+        self.kv_cache_manager.update(
+            request.request_id,
+            past_key_values=output.past_key_values,
+            token_count=len(request.prompt_token_ids) + len(request.generated_token_ids),
+        )
+
+        if finished:
+            request.finish_time = time.time()
 
         return next_token_id, finished

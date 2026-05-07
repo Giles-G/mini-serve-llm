@@ -1,54 +1,140 @@
 """推理引擎
 
-串联 Prefill 和 Decode 两个阶段，完成从 prompt 到生成文本的全流程。
+第二阶段的 InferenceEngine 不再只是单请求 generate()，而是支持：
+- add_request(): 持续接收请求
+- step(): 每次推进一批请求
+- run_until_complete(): 跑到所有请求完成
+
+当前版本的 batch 是调度层 batch，执行层仍逐 request forward。
 """
 
-import time
+from miniservellm.runtime.outputs import StepResult
 
 
 class InferenceEngine:
-    """推理引擎，协调 prefill 和 decode 执行器
+    """最小 serving engine
 
     Attributes:
-        tokenizer_adapter: tokenizer 适配器，用于解码生成的 token ids
-        prefill_executor: Prefill 执行器，处理 prompt 首次前向
-        decode_executor: Decode 执行器，逐 token 自回归解码
+        tokenizer_adapter: tokenizer 适配器，用于 token <-> text
+        prefill_executor: prefill 执行器
+        decode_executor: decode 执行器
+        request_queue: 请求队列
+        scheduler: 调度器
+        kv_cache_manager: KV Cache 管理器
     """
 
-    def __init__(self, tokenizer_adapter, prefill_executor, decode_executor):
+    def __init__(
+        self,
+        tokenizer_adapter,
+        prefill_executor,
+        decode_executor,
+        request_queue,
+        scheduler,
+        kv_cache_manager,
+    ):
         self.tokenizer_adapter = tokenizer_adapter
         self.prefill_executor = prefill_executor
         self.decode_executor = decode_executor
+        self.request_queue = request_queue
+        self.scheduler = scheduler
+        self.kv_cache_manager = kv_cache_manager
 
-    def generate(self, request) -> str:
-        """执行完整的文本生成流程
+    def add_request(self, request):
+        """添加一个新请求到引擎
 
-        流程：
-        1. Prefill：输入整段 prompt，产出第一个 token 并得到 KV Cache
-        2. Decode：循环逐 token 解码，直到满足终止条件
-        3. 将生成的 token ids 解码为文本
+        会先为请求分配 KV Cache handle，再加入 waiting queue。
+        """
+        self.kv_cache_manager.allocate(request.request_id)
+        self.request_queue.add_request(request)
 
-        Args:
-            request: 请求对象，包含 prompt、采样参数等
+    def has_pending(self) -> bool:
+        """是否仍有未完成请求"""
+        return self.request_queue.has_pending()
+
+    def step(self) -> list[StepResult]:
+        """推进引擎一步
+
+        一次 step 会：
+        1. 调用 scheduler 生成 BatchPlan
+        2. 逐个执行 plan.prefill_requests
+        3. 逐个执行 plan.decode_requests
+        4. 将未完成请求重新放回 decode queue
+        5. 返回本步每个请求生成的 token 文本增量
 
         Returns:
-            生成的文本字符串
+            本步生成结果列表
         """
-        # prefill: 输入整段 prompt，产出第一个 token，并得到 past_key_values
-        self.prefill_executor.run(request)
+        plan = self.scheduler.schedule()
+        results: list[StepResult] = []
 
-        # 检查首 token 是否已满足终止条件
-        finished = (
-            len(request.generated_token_ids) >= request.sampling_params.max_new_tokens
-            or request.generated_token_ids[-1] in request.sampling_params.stop_token_ids
-        )
+        # 执行 prefill 请求：每个请求会产出首 token 并初始化 KV Cache
+        for req in plan.prefill_requests:
+            next_token_id = self.prefill_executor.run(req)
 
-        # decode: 后续逐 token 解码，直到终止
-        while not finished:
-            _, finished = self.decode_executor.step(request)
+            finished = (
+                len(req.generated_token_ids) >= req.sampling_params.max_new_tokens
+                or next_token_id in req.sampling_params.stop_token_ids
+            )
 
-        # 记录完成时间，用于计算端到端延迟
-        request.finish_time = time.time()
+            if finished:
+                # 如果首 token 就结束，直接标记完成并释放 cache
+                req.finish_time = req.first_token_time
+                self.request_queue.mark_finished(req)
+                self.kv_cache_manager.free(req.request_id)
+            else:
+                # 未完成则进入 decode queue，后续每轮继续生成
+                self.request_queue.requeue_for_decode(req)
 
-        # 将生成的 token ids 解码为文本
-        return self.tokenizer_adapter.decode(request.generated_token_ids)
+            results.append(
+                StepResult(
+                    request_id=req.request_id,
+                    next_token_id=next_token_id,
+                    finished=finished,
+                    text_delta=self.tokenizer_adapter.decode([next_token_id]),
+                )
+            )
+
+        # 执行 decode 请求：每个请求推进一个 token
+        for req in plan.decode_requests:
+            next_token_id, finished = self.decode_executor.step(req)
+
+            if finished:
+                self.request_queue.mark_finished(req)
+                self.kv_cache_manager.free(req.request_id)
+            else:
+                self.request_queue.requeue_for_decode(req)
+
+            results.append(
+                StepResult(
+                    request_id=req.request_id,
+                    next_token_id=next_token_id,
+                    finished=finished,
+                    text_delta=self.tokenizer_adapter.decode([next_token_id]),
+                )
+            )
+
+        return results
+
+    def run_until_complete(self) -> list:
+        """持续 step，直到所有请求完成
+
+        Returns:
+            所有完成的 Request 列表
+        """
+        while self.has_pending():
+            self.step()
+        return self.request_queue.all_finished_requests()
+
+    def generate(self, request) -> str:
+        """兼容第一阶段的单请求 generate() API
+
+        Args:
+            request: 单个 Request
+
+        Returns:
+            生成文本
+        """
+        self.add_request(request)
+        finished_requests = self.run_until_complete()
+        final_request = finished_requests[-1]
+        return self.tokenizer_adapter.decode(final_request.generated_token_ids)

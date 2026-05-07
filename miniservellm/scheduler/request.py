@@ -1,6 +1,7 @@
 """请求与采样参数定义
 
-定义推理请求的数据结构，包含输入 prompt、采样参数和推理状态。
+第二阶段在第一阶段 Request 的基础上增加请求状态字段，
+用于支持 RequestQueue、Scheduler 和 continuous batching 调度。
 """
 
 from dataclasses import dataclass, field
@@ -29,19 +30,23 @@ class SamplingParams:
 class Request:
     """推理请求
 
-    包含请求的输入、采样参数、以及推理过程中动态更新的状态。
+    一个 Request 代表一次用户请求，包含输入、采样参数、运行状态和性能时间戳。
+    第二阶段引入状态机：WAITING -> PREFILLING -> DECODING -> FINISHED。
 
     Attributes:
         request_id: 请求唯一标识
-        prompt: 原始 prompt 文本
+        prompt: 完整 prompt 文本
         prompt_token_ids: prompt 编码后的 token id 列表
-        generated_token_ids: 已生成的 token id 列表（动态更新）
+        generated_token_ids: 已生成的 token id 列表
         sampling_params: 采样参数
-        past_key_values: KV Cache，推理过程中动态更新
+        status: 请求状态，WAITING / PREFILLING / DECODING / FINISHED
+        prefill_done: 是否已完成 prefill 阶段
+        finished: 是否已完成整个生成流程
+        past_key_values: HF 模型返回的 KV Cache（兼容第一阶段逻辑）
         last_token_id: 上一个生成的 token id
-        arrival_time: 请求到达时间
-        first_token_time: 首 token 产出时间（用于计算 TTFT）
-        finish_time: 请求完成时间（用于计算端到端延迟）
+        arrival_time: 请求加入系统的时间
+        first_token_time: 首 token 生成时间，用于计算 TTFT
+        finish_time: 请求完成时间，用于计算端到端延迟
     """
     request_id: str
     prompt: str
@@ -50,7 +55,12 @@ class Request:
     generated_token_ids: list[int] = field(default_factory=list)
     sampling_params: SamplingParams = field(default_factory=SamplingParams)
 
-    # 推理过程中动态更新的状态
+    # 生命周期状态字段
+    status: str = "WAITING"
+    prefill_done: bool = False
+    finished: bool = False
+
+    # 推理状态字段
     past_key_values: object | None = None
     last_token_id: int | None = None
 
@@ -58,3 +68,7 @@ class Request:
     arrival_time: float = field(default_factory=time.time)
     first_token_time: float | None = None
     finish_time: float | None = None
+
+    def total_output_tokens(self) -> int:
+        """返回当前已生成 token 数"""
+        return len(self.generated_token_ids)
