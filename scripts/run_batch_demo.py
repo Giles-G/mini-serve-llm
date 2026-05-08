@@ -123,7 +123,7 @@ def main():
         engine,
         tokenizer_adapter,
         prompts=prompts,
-        max_new_tokens=32,
+        max_new_tokens=10240,
     )
 
     print("\n===== OUTPUTS =====")

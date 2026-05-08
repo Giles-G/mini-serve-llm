@@ -135,6 +135,6 @@ class HFLoader:
                 trust_remote_code=trust_remote_code,
             )
 
-        model.eval()      # 切换到评估模式，关闭 dropout 等
+        model.eval()      # 切换到评估模式，主要是关闭dropout和batchnorm，从而能保证每次推理结果是一样的
         model.to(device)   # 将模型移至目标设备
         return model

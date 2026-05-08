@@ -1,6 +1,6 @@
 """Prefill 执行器
 
-负责将完整 prompt 一次性送入模型，产出第一个 token 并初始化 KV Cache。
+负责将完整 prompt 一次性送入模型，初始化 KV Cache并产出第一个 token 。
 第二阶段接入 KVCacheManager，由它统一管理 request_id -> past_key_values。
 """
 
