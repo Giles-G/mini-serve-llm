@@ -196,3 +196,17 @@ class InferenceEngine:
         while self.has_pending():
             self.step()
         return self.request_queue.all_finished_requests()
+
+    def generate(self, request) -> str:
+        """兼容第一阶段的单请求 generate() API
+
+        Args:
+            request: 单个 Request
+
+        Returns:
+            生成文本
+        """
+        self.add_request(request)
+        finished_requests = self.run_until_complete()
+        final_request = finished_requests[-1]
+        return self.tokenizer_adapter.decode(final_request.generated_token_ids)
