@@ -7,6 +7,8 @@
 import time
 import torch
 
+from miniservellm.runtime.outputs import PrefillResult
+
 
 class PrefillExecutor:
     """Prefill 阶段执行器
@@ -29,7 +31,7 @@ class PrefillExecutor:
             request: 当前请求对象
 
         Returns:
-            首个生成 token 的 id
+            PrefillResult: 首个生成的 token id
         """
         # prompt token ids -> [1, prompt_len]
         input_ids = torch.tensor([request.prompt_token_ids], dtype=torch.long)
@@ -67,4 +69,4 @@ class PrefillExecutor:
             token_count=len(request.prompt_token_ids) + len(request.generated_token_ids),
         )
 
-        return next_token_id
+        return PrefillResult(next_token_id=next_token_id)

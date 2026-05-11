@@ -1,8 +1,12 @@
 """请求性能指标统计
 
-第二阶段支持批量请求统计：既可以统计单个 Request，
-也可以一次性汇总多个完成请求。
+第三阶段在第二阶段基础上增加 prefill_cursor / prefill_done / chunk_size 指标，
+方便观察 chunked prefill 的效果。
 """
+
+from __future__ import annotations
+
+from miniservellm.runtime.outputs import MetricsSummary
 
 
 class RequestMetrics:
@@ -11,11 +15,12 @@ class RequestMetrics:
     def __init__(self, request):
         self.request = request
 
-    def summary(self):
+    def summary(self) -> MetricsSummary:
         """生成单个请求的性能指标摘要
 
         Returns:
-            包含 request_id、状态、prompt token 数、输出 token 数、TTFT 和端到端延迟的字典
+            MetricsSummary 包含 request_id、状态、prompt/output token 数、
+            prefill 进度、chunk_size、TTFT 和端到端延迟
         """
         ttft = None
         e2e_latency = None
@@ -28,14 +33,17 @@ class RequestMetrics:
         if self.request.finish_time is not None:
             e2e_latency = self.request.finish_time - self.request.arrival_time
 
-        return {
-            "request_id": self.request.request_id,
-            "status": self.request.status,
-            "prompt_tokens": len(self.request.prompt_token_ids),
-            "output_tokens": len(self.request.generated_token_ids),
-            "ttft": ttft,
-            "e2e_latency": e2e_latency,
-        }
+        return MetricsSummary(
+            request_id=self.request.request_id,
+            status=self.request.status,
+            prompt_tokens=len(self.request.prompt_token_ids),
+            output_tokens=len(self.request.generated_token_ids),
+            prefill_cursor=self.request.prefill_cursor,
+            prefill_done=self.request.prefill_done,
+            chunk_size=self.request.chunk_size,
+            ttft=ttft,
+            e2e_latency=e2e_latency,
+        )
 
 
 def summarize_requests(requests: list):
@@ -47,5 +55,4 @@ def summarize_requests(requests: list):
     Returns:
         每个请求的指标摘要列表
     """
-    summaries = [RequestMetrics(req).summary() for req in requests]
-    return summaries
+    return [RequestMetrics(req).summary() for req in requests]

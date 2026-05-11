@@ -1,8 +1,8 @@
 """CLI 对话脚本
 
-加载模型，接收用户输入，执行单请求推理并输出结果和性能指标。
-第二阶段的单请求对话也复用 RequestQueue / Scheduler / KVCacheManager，
-因此它和 batch demo 走的是同一套 engine loop。
+第三阶段更新：使用 ChunkedPrefillExecutor + BlockAllocator。
+由于第三阶段 Request 构造函数变更（sampling_params 必填），
+此脚本也做了相应适配。
 
 运行：python scripts/run_cli_chat.py
 """
@@ -21,12 +21,13 @@ from miniservellm.model_adapter.hf_loader import HFLoader
 from miniservellm.model_adapter.tokenizer_adapter import TokenizerAdapter
 from miniservellm.model_adapter.hf_model_runner import HFModelRunner
 from miniservellm.runtime.sampler import Sampler
-from miniservellm.runtime.prefill import PrefillExecutor
+from miniservellm.runtime.chunked_prefill import ChunkedPrefillExecutor
 from miniservellm.runtime.decode import DecodeExecutor
 from miniservellm.runtime.inference_engine import InferenceEngine
 from miniservellm.scheduler.request import Request, SamplingParams
 from miniservellm.scheduler.request_queue import RequestQueue
 from miniservellm.scheduler.scheduler import Scheduler
+from miniservellm.cache.block_allocator import BlockAllocator
 from miniservellm.cache.kv_cache_manager import KVCacheManager
 from miniservellm.benchmark.metrics import RequestMetrics
 
@@ -57,7 +58,9 @@ def pick_dtype(device: str):
 
 
 def build_engine():
-    """构建第二阶段推理引擎
+    """构建第三阶段推理引擎
+
+    使用 ChunkedPrefillExecutor + BlockAllocator + KVCacheManager。
 
     Returns:
         (engine, tokenizer_adapter) 元组
@@ -88,10 +91,16 @@ def build_engine():
     # 组装 engine 依赖组件
     tokenizer_adapter = TokenizerAdapter(tokenizer)
     model_runner = HFModelRunner(model, model_cfg.device)
-    kv_cache_manager = KVCacheManager()
+
+    # BlockAllocator + KVCacheManager
+    block_allocator = BlockAllocator(num_blocks=1024, block_size=16)
+    kv_cache_manager = KVCacheManager(block_allocator=block_allocator)
+
     sampler = Sampler()
-    prefill_executor = PrefillExecutor(model_runner, sampler, kv_cache_manager)
+    # 使用 ChunkedPrefillExecutor
+    prefill_executor = ChunkedPrefillExecutor(model_runner, sampler, kv_cache_manager)
     decode_executor = DecodeExecutor(model_runner, sampler, kv_cache_manager)
+
     request_queue = RequestQueue()
     scheduler = Scheduler(
         request_queue=request_queue,
@@ -124,7 +133,7 @@ def main():
     if tokenizer.eos_token_id is not None:
         stop_token_ids.append(tokenizer.eos_token_id)
 
-    # 构造单请求；后续由 engine.add_request() 放入 RequestQueue
+    # 构造单请求，使用 sampling_params 必填参数
     request = Request(
         request_id=str(uuid.uuid4()),
         prompt=prompt_text,
@@ -136,9 +145,11 @@ def main():
             top_p=0.9,
             stop_token_ids=stop_token_ids,
         ),
+        # chunk_size 设大一些，单请求时一次性 prefill 整个 prompt
+        chunk_size=len(prompt_token_ids),
     )
 
-    # 兼容第一阶段的单请求 generate API，内部仍走第二阶段 step loop
+    # 兼容第一阶段的单请求 generate API
     output_text = engine.generate(request)
 
     print("\nAssistant>")

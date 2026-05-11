@@ -1,12 +1,15 @@
-"""第二阶段批量调度 Demo
+"""第二阶段批量调度 Demo（第三阶段兼容版）
 
 演示多请求进入队列后，engine 通过 Scheduler 每轮选择一批请求，
 按 decode-first 策略逐 step 推进直到全部完成。
+
+第三阶段更新：使用 ChunkedPrefillExecutor + BlockAllocator。
 
 运行：python scripts/run_batch_demo.py
 """
 
 import sys
+import uuid
 from pathlib import Path
 
 import torch
@@ -20,15 +23,17 @@ from miniservellm.model_adapter.tokenizer_adapter import TokenizerAdapter
 from miniservellm.model_adapter.hf_model_runner import HFModelRunner
 
 from miniservellm.runtime.sampler import Sampler
-from miniservellm.runtime.prefill import PrefillExecutor
+from miniservellm.runtime.chunked_prefill import ChunkedPrefillExecutor
 from miniservellm.runtime.decode import DecodeExecutor
 from miniservellm.runtime.inference_engine import InferenceEngine
 
+from miniservellm.cache.block_allocator import BlockAllocator
 from miniservellm.cache.kv_cache_manager import KVCacheManager
+from miniservellm.scheduler.request import Request, SamplingParams
 from miniservellm.scheduler.request_queue import RequestQueue
 from miniservellm.scheduler.scheduler import Scheduler
 
-from miniservellm.benchmark.bench_batching import run_batch_requests
+from miniservellm.benchmark.metrics import summarize_requests
 
 
 def pick_device():
@@ -48,11 +53,12 @@ def pick_dtype(device: str):
 
 
 def build_engine():
-    """构建第二阶段 InferenceEngine
+    """构建第三阶段 InferenceEngine
 
     组装组件：
-    HFLoader -> TokenizerAdapter -> HFModelRunner -> KVCacheManager ->
-    PrefillExecutor / DecodeExecutor -> RequestQueue -> Scheduler -> InferenceEngine
+    HFLoader -> TokenizerAdapter -> HFModelRunner -> BlockAllocator ->
+    KVCacheManager -> ChunkedPrefillExecutor / DecodeExecutor ->
+    RequestQueue -> Scheduler -> InferenceEngine
 
     Returns:
         (engine, tokenizer_adapter) 元组
@@ -83,11 +89,15 @@ def build_engine():
     # 组装推理基础组件
     tokenizer_adapter = TokenizerAdapter(tokenizer)
     model_runner = HFModelRunner(model, model_cfg.device)
-    kv_cache_manager = KVCacheManager()
+
+    # BlockAllocator + KVCacheManager
+    block_allocator = BlockAllocator(num_blocks=1024, block_size=16)
+    kv_cache_manager = KVCacheManager(block_allocator=block_allocator)
+
     sampler = Sampler()
 
-    # 执行器接入 KVCacheManager
-    prefill_executor = PrefillExecutor(model_runner, sampler, kv_cache_manager)
+    # 使用 ChunkedPrefillExecutor
+    prefill_executor = ChunkedPrefillExecutor(model_runner, sampler, kv_cache_manager)
     decode_executor = DecodeExecutor(model_runner, sampler, kv_cache_manager)
 
     # 调度组件：请求队列 + decode-first scheduler
@@ -112,6 +122,7 @@ def build_engine():
 def main():
     """运行批量请求 Demo"""
     engine, tokenizer_adapter = build_engine()
+    tokenizer = tokenizer_adapter.tokenizer
 
     prompts = [
         "请用三句话解释什么是 KV Cache。",
@@ -119,22 +130,45 @@ def main():
         "为什么 decode 阶段通常比 prefill 阶段更 memory-bound？",
     ]
 
-    outputs, metrics = run_batch_requests(
-        engine,
-        tokenizer_adapter,
-        prompts=prompts,
-        max_new_tokens=10240,
-    )
+    # 构建请求
+    stop_token_ids = []
+    if tokenizer.eos_token_id is not None:
+        stop_token_ids.append(tokenizer.eos_token_id)
+
+    requests = []
+    for prompt in prompts:
+        prompt_text = tokenizer_adapter.build_prompt(prompt)
+        prompt_token_ids = tokenizer_adapter.encode(prompt_text)
+        req = Request(
+            request_id=str(uuid.uuid4()),
+            prompt=prompt_text,
+            prompt_token_ids=prompt_token_ids,
+            sampling_params=SamplingParams(
+                max_new_tokens=10240,
+                temperature=0.7,
+                top_k=20,
+                top_p=0.9,
+                stop_token_ids=stop_token_ids,
+            ),
+        )
+        requests.append(req)
+
+    # 添加请求到引擎
+    for req in requests:
+        engine.add_request(req)
+
+    # 逐 step 推进直到全部完成
+    finished_requests = engine.run_until_complete()
 
     print("\n===== OUTPUTS =====")
-    for item in outputs:
-        print(f"[{item['request_id']}]")
-        print(item["text"])
+    for req in finished_requests:
+        print(f"[{req.request_id}]")
+        print(tokenizer_adapter.decode(req.generated_token_ids))
         print("-" * 60)
 
     print("\n===== METRICS =====")
-    for metric in metrics:
-        print(metric)
+    for m in summarize_requests(finished_requests):
+        print(m)
 
 
 if __name__ == "__main__":

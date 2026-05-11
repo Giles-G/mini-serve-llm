@@ -1,11 +1,16 @@
 """Decode 执行器
 
-负责自回归解码的每一步：输入上一个 token，配合 KV Cache 产出下一个 token。
-第二阶段从 KVCacheManager 读取和更新 cache。
+第三阶段的 DecodeExecutor 适配 PagedKVCacheHandle，
+从 KVCacheManager 获取 past_key_values 时使用 .past_key_values 而非 .data。
+同时增加 sampling_params.stop_token_ids 的终止判断。
 """
+
+from __future__ import annotations
 
 import time
 import torch
+
+from miniservellm.runtime.outputs import DecodeStepResult
 
 
 class DecodeExecutor:
@@ -29,19 +34,21 @@ class DecodeExecutor:
             request: 当前请求对象
 
         Returns:
-            (next_token_id, finished)
+            DecodeStepResult
         """
-        # 优先从 KVCacheManager 获取 cache，兼容 fallback 到 request.past_key_values
+        if request.last_token_id is None:
+            raise ValueError(f"Request {request.request_id} has no last_token_id for decode.")
+
+        # 从 KVCacheManager 获取 cache
         cache_handle = self.kv_cache_manager.get(request.request_id)
-        past_key_values = cache_handle.data if cache_handle is not None else request.past_key_values
+        past_key_values = cache_handle.past_key_values if cache_handle is not None else None
 
         # 每步 decode 只输入上一个生成的 token
         input_ids = torch.tensor([[request.last_token_id]], dtype=torch.long)
 
-        # 更严谨的 attention_mask：长度覆盖 prompt + 已生成 token。
-        # HF past_key_values 已包含之前 token 的 KV，当前 input_ids 是最后一个生成 token。
-        total_len = len(request.prompt_token_ids) + len(request.generated_token_ids)
-        attention_mask = torch.ones(1, total_len, dtype=torch.long)
+        # attention_mask 长度覆盖 prompt 已处理部分 + 已生成 token
+        # HF past_key_values 已包含之前 token 的 KV，当前 input_ids 是最后一个生成 token
+        attention_mask = torch.ones(1, request.total_sequence_length(), dtype=torch.long)
 
         output = self.model_runner.forward_decode(
             input_ids=input_ids,
@@ -70,14 +77,14 @@ class DecodeExecutor:
             or next_token_id in request.sampling_params.stop_token_ids
         )
 
-        # 更新 cache manager，token_count = prompt + 已生成
+        # 更新 KVCacheManager，token_count = 已 prefill 的 token + 已生成 token
         self.kv_cache_manager.update(
             request.request_id,
             past_key_values=output.past_key_values,
-            token_count=len(request.prompt_token_ids) + len(request.generated_token_ids),
+            token_count=request.total_sequence_length(),
         )
 
-        if finished:
+        if finished and request.finish_time is None:
             request.finish_time = time.time()
 
-        return next_token_id, finished
+        return DecodeStepResult(next_token_id=next_token_id, finished=finished)
