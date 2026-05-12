@@ -23,7 +23,7 @@ class Sampler:
         """从 logits 中采样一个 token
 
         Args:
-            logits: 模型输出的 logits，形状 [1, vocab_size]
+            logits: 模型输出的 logits，形状 [vocab_size] 或 [1, vocab_size]
             temperature: 采样温度，0.0 表示贪心解码
             top_k: top-k 采样的候选数，0 表示不限制
             top_p: nucleus sampling 阈值（当前未实现）
@@ -31,9 +31,13 @@ class Sampler:
         Returns:
             采样得到的 token id
         """
+        # 统一为 1D
+        if logits.dim() > 1:
+            logits = logits.squeeze(0)
+
         # Greedy decoding：直接取 argmax
         if temperature == 0.0:
-            return torch.argmax(logits, dim=-1).item()
+            return torch.argmax(logits).item()
 
         # 带温度的 softmax 概率分布
         probs = torch.softmax(logits / temperature, dim=-1)
@@ -43,9 +47,9 @@ class Sampler:
             values, indices = torch.topk(probs, top_k, dim=-1)
             # 重新归一化，使 top-k 候选概率之和为 1
             values = values / values.sum(dim=-1, keepdim=True)
-            sampled = torch.multinomial(values[0], num_samples=1).item()
-            return indices[0, sampled].item()
+            sampled = torch.multinomial(values, num_samples=1).item()
+            return indices[sampled].item()
 
         # 无 top-k 约束，直接从全词表分布采样
-        sampled = torch.multinomial(probs[0], num_samples=1).item()
+        sampled = torch.multinomial(probs, num_samples=1).item()
         return sampled

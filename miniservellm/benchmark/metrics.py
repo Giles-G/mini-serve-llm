@@ -1,12 +1,38 @@
 """请求性能指标统计
 
-第三阶段在第二阶段基础上增加 prefill_cursor / prefill_done / chunk_size 指标，
-方便观察 chunked prefill 的效果。
+第四阶段适配新的 Request 字段（prefill_offset 替代 prefill_cursor）。
 """
 
 from __future__ import annotations
 
-from miniservellm.runtime.outputs import MetricsSummary
+from dataclasses import dataclass
+
+
+@dataclass
+class RequestMetricsSummary:
+    """请求性能指标摘要
+
+    Attributes:
+        request_id: 请求唯一标识
+        status: 请求当前状态
+        prompt_tokens: prompt token 数
+        output_tokens: 生成 token 数
+        prefill_offset: 当前 prefill 偏移量
+        prefill_done: prefill 是否完成
+        chunk_size: chunk 大小
+        ttft: 首 token 延迟（秒）
+        e2e_latency: 端到端延迟（秒）
+    """
+
+    request_id: str
+    status: str
+    prompt_tokens: int
+    output_tokens: int
+    prefill_offset: int
+    prefill_done: bool
+    chunk_size: int
+    ttft: float | None
+    e2e_latency: float | None
 
 
 class RequestMetrics:
@@ -15,44 +41,30 @@ class RequestMetrics:
     def __init__(self, request):
         self.request = request
 
-    def summary(self) -> MetricsSummary:
-        """生成单个请求的性能指标摘要
-
-        Returns:
-            MetricsSummary 包含 request_id、状态、prompt/output token 数、
-            prefill 进度、chunk_size、TTFT 和端到端延迟
-        """
+    def summary(self) -> RequestMetricsSummary:
+        """生成单个请求的性能指标摘要"""
         ttft = None
         e2e_latency = None
 
-        # TTFT = 首 token 时间 - 请求到达时间
         if self.request.first_token_time is not None:
             ttft = self.request.first_token_time - self.request.arrival_time
 
-        # E2E latency = 完成时间 - 请求到达时间
         if self.request.finish_time is not None:
             e2e_latency = self.request.finish_time - self.request.arrival_time
 
-        return MetricsSummary(
+        return RequestMetricsSummary(
             request_id=self.request.request_id,
             status=self.request.status,
             prompt_tokens=len(self.request.prompt_token_ids),
             output_tokens=len(self.request.generated_token_ids),
-            prefill_cursor=self.request.prefill_cursor,
-            prefill_done=self.request.prefill_done,
+            prefill_offset=self.request.prefill_offset,
+            prefill_done=self.request.is_prefill_done(),
             chunk_size=self.request.chunk_size,
             ttft=ttft,
             e2e_latency=e2e_latency,
         )
 
 
-def summarize_requests(requests: list):
-    """批量汇总多个请求的性能指标
-
-    Args:
-        requests: 已完成请求列表
-
-    Returns:
-        每个请求的指标摘要列表
-    """
+def summarize_requests(requests: list) -> list[RequestMetricsSummary]:
+    """批量汇总多个请求的性能指标"""
     return [RequestMetrics(req).summary() for req in requests]

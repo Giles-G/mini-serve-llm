@@ -1,12 +1,17 @@
-"""第二阶段批量调度 Demo（第四阶段兼容版）
+"""Batched Engine Demo
 
-演示多请求进入队列后，engine 通过 Scheduler 每轮选择一批请求，
-按 decode-first 策略逐 step 推进直到全部完成。
+第四阶段核心演示脚本，展示：
+- Fresh Prefill：没有历史 cache 的请求 batched forward
+- Incremental Prefill：有历史 cache 的请求逐请求 forward
+- Decode：逐请求 forward
+- Decode-first 调度
+- Step 级事件输出
 
-第四阶段更新：使用 HybridInferenceEngine + BatchedFreshPrefill + IncrementalPrefill。
-
-运行：python scripts/run_batch_demo.py
+运行方式：
+    python scripts/run_batched_engine_demo.py
 """
+
+from __future__ import annotations
 
 import sys
 import uuid
@@ -29,6 +34,7 @@ from miniservellm.runtime.batched_fresh_prefill import BatchedFreshPrefillExecut
 from miniservellm.runtime.incremental_prefill import IncrementalPrefillExecutor
 from miniservellm.runtime.decode import DecodeExecutor
 from miniservellm.runtime.inference_engine import HybridInferenceEngine
+from miniservellm.runtime.outputs import StepEventType
 
 from miniservellm.scheduler.request import Request, SamplingParams
 from miniservellm.scheduler.request_queue import RequestQueue
@@ -38,7 +44,6 @@ from miniservellm.benchmark.metrics import summarize_requests
 
 
 def pick_device():
-    """自动选择推理设备，优先级：CUDA > MPS > CPU"""
     if torch.cuda.is_available():
         return "cuda"
     if torch.backends.mps.is_available():
@@ -47,35 +52,18 @@ def pick_device():
 
 
 def pick_dtype(device: str):
-    """根据设备选择推理精度"""
     if device == "cpu":
         return "float32"
     return "float16"
 
 
 def build_engine():
-    """构建第四阶段 HybridInferenceEngine
-
-    组装组件：
-    HFLoader -> TokenizerAdapter -> HFModelRunner ->
-    BatchedPrefillTensorBuilder -> BatchedFreshPrefillExecutor ->
-    IncrementalPrefillExecutor -> DecodeExecutor ->
-    RequestQueue -> Scheduler -> HybridInferenceEngine
-
-    Returns:
-        (engine, tokenizer_adapter) 元组
-    """
     device = pick_device()
     dtype = pick_dtype(device)
 
-    model_cfg = ModelConfig(
-        device=device,
-        dtype=dtype,
-    )
-
+    model_cfg = ModelConfig(device=device, dtype=dtype)
     print(f"[INFO] device={model_cfg.device}, dtype={model_cfg.dtype}, model={model_cfg.model_name}")
 
-    # 加载 tokenizer 和模型
     loader = HFLoader()
     tokenizer = loader.load_tokenizer(
         model_cfg.model_name,
@@ -88,7 +76,6 @@ def build_engine():
         trust_remote_code=model_cfg.trust_remote_code,
     )
 
-    # 组装推理基础组件
     tokenizer_adapter = TokenizerAdapter(tokenizer)
     model_runner = HFModelRunner(model, model_cfg.device)
     sampler = Sampler()
@@ -100,11 +87,11 @@ def build_engine():
     scheduler = Scheduler(
         max_decode_batch_size=8,
         max_prefill_batch_size=8,
-        prefill_token_budget=256,
-        max_prefill_chunk_size=64,
+        prefill_token_budget=32,
+        max_prefill_chunk_size=16,
     )
 
-    # 共享 request_index
+    # request_index 共享引用
     request_index: dict = {}
 
     # BatchedPrefillTensorBuilder
@@ -145,21 +132,11 @@ def build_engine():
     engine.request_index = request_index
     fresh_prefill_executor.request_index = request_index
 
-    return engine, tokenizer_adapter
+    return engine, tokenizer_adapter, queue
 
 
-def main():
-    """运行批量请求 Demo"""
-    engine, tokenizer_adapter = build_engine()
+def build_requests(tokenizer_adapter, prompts, max_new_tokens=32, chunk_size=12):
     tokenizer = tokenizer_adapter.tokenizer
-
-    prompts = [
-        "请用三句话解释什么是 KV Cache。",
-        "介绍一下 FlashAttention 的核心思想。",
-        "为什么 decode 阶段通常比 prefill 阶段更 memory-bound？",
-    ]
-
-    # 构建请求
     stop_token_ids = []
     if tokenizer.eos_token_id is not None:
         stop_token_ids.append(tokenizer.eos_token_id)
@@ -168,29 +145,85 @@ def main():
     for prompt in prompts:
         prompt_text = tokenizer_adapter.build_prompt(prompt)
         prompt_token_ids = tokenizer_adapter.encode(prompt_text)
+
         req = Request(
             request_id=str(uuid.uuid4()),
             prompt=prompt_text,
             prompt_token_ids=prompt_token_ids,
             sampling_params=SamplingParams(
-                max_new_tokens=1024,
-                temperature=0.7,
-                top_k=20,
-                top_p=0.9,
+                max_new_tokens=max_new_tokens,
+                temperature=0.0,
+                top_k=0,
+                top_p=1.0,
                 stop_token_ids=stop_token_ids,
             ),
+            chunk_size=chunk_size,
         )
+        # 记录到达时间
         req.arrival_time = time.time()
         requests.append(req)
 
-    # 添加请求到引擎
+    return requests
+
+
+def main():
+    engine, tokenizer_adapter, queue = build_engine()
+
+    prompts = [
+        "请解释 chunked prefill 的作用，以及为什么它可以降低长 prompt 对交互式请求的影响。",
+        "请解释 continuous batching 和 static batching 的差别。",
+        "请解释为什么真实 serving 系统里 request lifecycle 和 cache lifecycle 都很重要。",
+        "请解释 batched prefill 和 batched decode 在执行层面的主要差异。",
+    ]
+
+    requests = build_requests(
+        tokenizer_adapter=tokenizer_adapter,
+        prompts=prompts,
+        max_new_tokens=1024,
+        chunk_size=12,
+    )
+
+    # 文本缓冲区
+    request_text_buffer = {}
     for req in requests:
         engine.add_request(req)
+        request_text_buffer[req.request_id] = ""
 
-    # 逐 step 推进直到全部完成
-    finished_requests = engine.run_until_complete()
+    print("\n===== STEP EXECUTION =====")
+    step_id = 0
 
-    print("\n===== OUTPUTS =====")
+    while engine.has_pending():
+        step_id += 1
+        events = engine.step()
+
+        print(
+            f"\n[STEP {step_id}] "
+            f"waiting={queue.num_waiting()} "
+            f"prefilling={queue.num_prefilling()} "
+            f"decoding={queue.num_decoding()} "
+            f"finished={queue.num_finished()}"
+        )
+
+        for event in events:
+            # 拼接 decode token 文本
+            if event.event_type == StepEventType.DECODE_TOKEN:
+                text_delta = tokenizer_adapter.decode([event.payload.token_id])
+                request_text_buffer[event.request_id] += text_delta
+            elif event.event_type == StepEventType.PREFILL_TO_DECODE:
+                text_delta = tokenizer_adapter.decode([event.payload.token_id])
+                request_text_buffer[event.request_id] += text_delta
+
+            print(event)
+
+    finished_requests = [req for req in engine.request_index.values() if req.status == "finished"]
+
+    print("\n===== STREAMED OUTPUTS =====")
+    for req in finished_requests:
+        print(f"[{req.request_id}]")
+        print(request_text_buffer.get(req.request_id, ""))
+        print("-" * 60)
+
+    print("\n===== FINAL OUTPUTS =====")
     for req in finished_requests:
         print(f"[{req.request_id}]")
         print(tokenizer_adapter.decode(req.generated_token_ids))

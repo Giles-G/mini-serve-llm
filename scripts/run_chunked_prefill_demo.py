@@ -1,9 +1,10 @@
-"""Chunked Prefill + Paged KV Cache Demo
+"""Chunked Prefill + Batched Engine Demo
 
-第三阶段核心演示脚本，展示：
-- Chunked Prefill：长 prompt 分多个 chunk 逐步 prefill
-- Paged KV Cache 元数据：BlockAllocator 管理 block 分配/扩容/回收
-- Decode-first 调度：优先推进 decode 请求，剩余 batch slot 给 prefill
+第四阶段核心演示脚本，展示：
+- Fresh Prefill：没有历史 cache 的请求 batched forward
+- Incremental Prefill：有历史 cache 的请求逐请求 forward
+- Decode：逐请求 forward
+- Decode-first 调度：优先推进 decode 请求
 - Step 级事件输出：PREFILL_PROGRESS / PREFILL_TO_DECODE / DECODE_TOKEN / FINISHED
 
 运行方式：
@@ -14,6 +15,7 @@ from __future__ import annotations
 
 import sys
 import uuid
+import time
 from pathlib import Path
 
 import torch
@@ -27,12 +29,12 @@ from miniservellm.model_adapter.tokenizer_adapter import TokenizerAdapter
 from miniservellm.model_adapter.hf_model_runner import HFModelRunner
 
 from miniservellm.runtime.sampler import Sampler
-from miniservellm.runtime.chunked_prefill import ChunkedPrefillExecutor
+from miniservellm.runtime.attention_metadata import BatchedPrefillTensorBuilder
+from miniservellm.runtime.batched_fresh_prefill import BatchedFreshPrefillExecutor
+from miniservellm.runtime.incremental_prefill import IncrementalPrefillExecutor
 from miniservellm.runtime.decode import DecodeExecutor
-from miniservellm.runtime.inference_engine import InferenceEngine
-
-from miniservellm.cache.block_allocator import BlockAllocator
-from miniservellm.cache.kv_cache_manager import KVCacheManager
+from miniservellm.runtime.inference_engine import HybridInferenceEngine
+from miniservellm.runtime.outputs import StepEventType
 
 from miniservellm.scheduler.request import Request, SamplingParams
 from miniservellm.scheduler.request_queue import RequestQueue
@@ -60,8 +62,8 @@ def pick_dtype(device: str):
 def build_engine():
     """构建推理引擎
 
-    加载模型、tokenizer，组装 ChunkedPrefillExecutor + DecodeExecutor +
-    BlockAllocator + KVCacheManager + Scheduler + InferenceEngine。
+    加载模型、tokenizer，组装 BatchedFreshPrefillExecutor +
+    IncrementalPrefillExecutor + DecodeExecutor + Scheduler + HybridInferenceEngine。
     """
     device = pick_device()
     dtype = pick_dtype(device)
@@ -90,38 +92,61 @@ def build_engine():
 
     tokenizer_adapter = TokenizerAdapter(tokenizer)
     model_runner = HFModelRunner(model, model_cfg.device)
-
-    # BlockAllocator：管理 paged KV cache 的 block 资源
-    block_allocator = BlockAllocator(
-        num_blocks=1024,
-        block_size=16,
-    )
-    kv_cache_manager = KVCacheManager(block_allocator=block_allocator)
-
     sampler = Sampler()
-    # 使用 ChunkedPrefillExecutor 替代第二阶段的 PrefillExecutor
-    prefill_executor = ChunkedPrefillExecutor(model_runner, sampler, kv_cache_manager)
-    decode_executor = DecodeExecutor(model_runner, sampler, kv_cache_manager)
 
-    request_queue = RequestQueue()
-    # max_prefill_tokens_per_step=24：每步 prefill 总预算 24 tokens
-    # 配合 chunk_size=12，两个 prefill 请求可以同时推进
+    # 请求队列
+    queue = RequestQueue()
+
+    # 调度器：prefill_token_budget=24，配合 chunk_size=12，两个请求可同时推进
     scheduler = Scheduler(
-        request_queue=request_queue,
-        max_batch_size=4,
-        decode_first=True,
-        max_prefill_tokens_per_step=24,
+        max_decode_batch_size=8,
+        max_prefill_batch_size=8,
+        prefill_token_budget=24,
+        max_prefill_chunk_size=12,
     )
 
-    engine = InferenceEngine(
-        tokenizer_adapter=tokenizer_adapter,
-        prefill_executor=prefill_executor,
-        decode_executor=decode_executor,
-        request_queue=request_queue,
-        scheduler=scheduler,
-        kv_cache_manager=kv_cache_manager,
+    # 共享 request_index
+    request_index: dict = {}
+
+    # BatchedPrefillTensorBuilder
+    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+    tensor_builder = BatchedPrefillTensorBuilder(
+        device=torch.device(model_cfg.device),
+        pad_token_id=pad_token_id,
     )
-    return engine, tokenizer_adapter, block_allocator
+
+    # 三个执行器
+    fresh_prefill_executor = BatchedFreshPrefillExecutor(
+        model_runner=model_runner,
+        sampler=sampler,
+        tensor_builder=tensor_builder,
+        request_index=request_index,
+    )
+    incremental_prefill_executor = IncrementalPrefillExecutor(
+        model_runner=model_runner,
+        sampler=sampler,
+    )
+    decode_executor = DecodeExecutor(
+        model_runner=model_runner,
+        sampler=sampler,
+    )
+
+    engine = HybridInferenceEngine(
+        tokenizer_adapter=tokenizer_adapter,
+        model_runner=model_runner,
+        sampler=sampler,
+        queue=queue,
+        scheduler=scheduler,
+        fresh_prefill_executor=fresh_prefill_executor,
+        incremental_prefill_executor=incremental_prefill_executor,
+        decode_executor=decode_executor,
+    )
+
+    # 共享 request_index
+    engine.request_index = request_index
+    fresh_prefill_executor.request_index = request_index
+
+    return engine, tokenizer_adapter, queue
 
 
 def build_requests(tokenizer_adapter, prompts, max_new_tokens=32, chunk_size=12):
@@ -161,6 +186,7 @@ def build_requests(tokenizer_adapter, prompts, max_new_tokens=32, chunk_size=12)
             ),
             chunk_size=chunk_size,
         )
+        req.arrival_time = time.time()
         requests.append(req)
 
     return requests
@@ -168,7 +194,7 @@ def build_requests(tokenizer_adapter, prompts, max_new_tokens=32, chunk_size=12)
 
 def main():
     """主流程：构建引擎 -> 添加请求 -> 逐步执行 -> 输出结果"""
-    engine, tokenizer_adapter, block_allocator = build_engine()
+    engine, tokenizer_adapter, queue = build_engine()
 
     prompts = [
         "请详细解释什么是 chunked prefill，以及它为什么能够提升长 prompt 与短交互请求混部场景下的系统体验。",
@@ -195,41 +221,33 @@ def main():
     step_id = 0
     while engine.has_pending():
         step_id += 1
-        results = engine.step()
+        events = engine.step()
 
-        # 每步打印队列状态和 block 使用情况
+        # 每步打印队列状态
         print(
             f"\n[STEP {step_id}] "
-            f"waiting={engine.request_queue.num_waiting()} "
-            f"prefilling={engine.request_queue.num_prefilling()} "
-            f"decoding={engine.request_queue.num_decoding()} "
-            f"finished={engine.request_queue.num_finished()} "
-            f"free_blocks={block_allocator.num_free_blocks()} "
-            f"used_blocks={block_allocator.num_used_blocks()}"
+            f"waiting={queue.num_waiting()} "
+            f"prefilling={queue.num_prefilling()} "
+            f"decoding={queue.num_decoding()}"
         )
 
-        for r in results:
+        for event in events:
             # 拼接文本增量
-            if r.text_delta:
-                request_text_buffer[r.request_id] += r.text_delta
+            if event.event_type == StepEventType.DECODE_TOKEN:
+                text_delta = tokenizer_adapter.decode([event.payload.token_id])
+                request_text_buffer[event.request_id] += text_delta
+            elif event.event_type == StepEventType.PREFILL_TO_DECODE:
+                text_delta = tokenizer_adapter.decode([event.payload.token_id])
+                request_text_buffer[event.request_id] += text_delta
 
-            print(
-                {
-                    "request_id": r.request_id,
-                    "event_type": r.event_type,
-                    "next_token_id": r.next_token_id,
-                    "finished": r.finished,
-                    "text_delta": r.text_delta,
-                    "metadata": r.metadata,
-                }
-            )
+            print(event)
 
-    finished_requests = engine.request_queue.all_finished_requests()
+    finished_requests = [req for req in engine.request_index.values() if req.status == "finished"]
 
     print("\n===== STREAMED OUTPUTS =====")
     for req in finished_requests:
         print(f"[{req.request_id}]")
-        print(request_text_buffer[req.request_id])
+        print(request_text_buffer.get(req.request_id, ""))
         print("-" * 60)
 
     print("\n===== FINAL OUTPUTS (DECODED FROM TOKENS) =====")

@@ -1,39 +1,93 @@
-"""Scheduler
+"""调度器
 
-第三阶段在第二阶段基础上增加 max_prefill_tokens_per_step 参数，
-传递给 BatchingStrategy 控制 chunked prefill 的每步 token 预算。
+第四阶段 Scheduler 直接从 RequestQueue 的 active_prefill / active_decode 中选择请求，
+输出 SchedulePlan（decode_requests + prefill_requests + prefill_chunk_sizes）。
+
+调度策略：decode-first + prefill token budget。
 """
 
 from __future__ import annotations
 
-from miniservellm.scheduler.batching import BatchingStrategy, BatchPlan
+from dataclasses import dataclass, field
+from miniservellm.scheduler.request import Request
+
+
+@dataclass
+class SchedulePlan:
+    """调度计划
+
+    Attributes:
+        decode_requests: 本轮要执行 decode 的请求列表
+        prefill_requests: 本轮要执行 prefill 的请求列表
+        prefill_chunk_sizes: request_id -> 本轮分配的 chunk token 数
+    """
+    decode_requests: list[Request]
+    prefill_requests: list[Request]
+    prefill_chunk_sizes: dict[str, int] = field(default_factory=dict)
 
 
 class Scheduler:
     """请求调度器
 
-    每轮调用 BatchingStrategy 生成 BatchPlan，包含 prefill/decode 请求
-    以及每个 prefill 请求的 chunk token 分配。
+    策略：
+    - decode-first：优先调度 decode 请求
+    - prefill token budget：每步给 prefill 一个总预算，在请求间分配
 
     Attributes:
-        request_queue: 请求队列
-        batching_strategy: batching 策略实例
+        max_decode_batch_size: 最大 decode batch 大小
+        max_prefill_batch_size: 最大 prefill batch 大小
+        prefill_token_budget: 每步 prefill 的总 token 预算
+        max_prefill_chunk_size: 单个请求每步最大 prefill chunk 大小
     """
 
     def __init__(
         self,
-        request_queue,
-        max_batch_size: int = 4,
-        decode_first: bool = True,
-        max_prefill_tokens_per_step: int = 128,
+        max_decode_batch_size: int = 8,
+        max_prefill_batch_size: int = 8,
+        prefill_token_budget: int = 256,
+        max_prefill_chunk_size: int = 64,
     ):
-        self.request_queue = request_queue
-        self.batching_strategy = BatchingStrategy(
-            max_batch_size=max_batch_size,
-            decode_first=decode_first,
-            max_prefill_tokens_per_step=max_prefill_tokens_per_step,
-        )
+        self.max_decode_batch_size = max_decode_batch_size
+        self.max_prefill_batch_size = max_prefill_batch_size
+        self.prefill_token_budget = prefill_token_budget
+        self.max_prefill_chunk_size = max_prefill_chunk_size
 
-    def schedule(self) -> BatchPlan:
-        """生成下一轮 engine.step() 的执行计划"""
-        return self.batching_strategy.build_batch(self.request_queue)
+    def schedule(self, queue) -> SchedulePlan:
+        """生成调度计划
+
+        Args:
+            queue: RequestQueue 实例
+
+        Returns:
+            SchedulePlan
+        """
+        # decode-first：优先取 decode 请求
+        decode_requests = queue.active_decode[:self.max_decode_batch_size]
+
+        # 在 token budget 内为 prefill 请求分配 chunk
+        remaining_budget = self.prefill_token_budget
+        prefill_requests: list[Request] = []
+        prefill_chunk_sizes: dict[str, int] = {}
+
+        candidates = queue.active_prefill[:self.max_prefill_batch_size]
+
+        for req in candidates:
+            if remaining_budget <= 0:
+                break
+
+            remaining = req.remaining_prompt_tokens()
+            # chunk 大小 = min(剩余未处理, 最大chunk, 剩余预算)
+            chunk = min(remaining, self.max_prefill_chunk_size, remaining_budget)
+
+            if chunk <= 0:
+                continue
+
+            prefill_requests.append(req)
+            prefill_chunk_sizes[req.request_id] = chunk
+            remaining_budget -= chunk
+
+        return SchedulePlan(
+            decode_requests=decode_requests,
+            prefill_requests=prefill_requests,
+            prefill_chunk_sizes=prefill_chunk_sizes,
+        )

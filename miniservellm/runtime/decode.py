@@ -1,90 +1,97 @@
 """Decode 执行器
 
-第三阶段的 DecodeExecutor 适配 PagedKVCacheHandle，
-从 KVCacheManager 获取 past_key_values 时使用 .past_key_values 而非 .data。
-同时增加 sampling_params.stop_token_ids 的终止判断。
+第四阶段：decode 仍然逐请求执行，每个请求携带各自的 past_key_values。
+
+为什么 decode 不能 batch：
+- 每个请求有自己的 past_key_values（长度、内容都不同）
+- HF 模型接口不支持把不同请求的 cache 拼成一个 batch
+- 真正的 batched decode 需要统一 paged KV backend（第五阶段）
 """
 
 from __future__ import annotations
 
-import time
 import torch
 
-from miniservellm.runtime.outputs import DecodeStepResult
+from miniservellm.runtime.outputs import StepEvent, StepEventType, TokenPayload, FinishedPayload
 
 
 class DecodeExecutor:
-    """Decode 阶段执行器
+    """Decode 执行器
+
+    逐请求执行 decode，每个请求携带各自的 past_key_values。
 
     Attributes:
-        model_runner: 模型运行器，负责实际 forward
-        sampler: 采样器，从 logits 中采样 token
-        kv_cache_manager: KV Cache 管理器
+        model_runner: 模型运行器
+        sampler: 采样器
     """
 
-    def __init__(self, model_runner, sampler, kv_cache_manager):
+    def __init__(self, model_runner, sampler):
         self.model_runner = model_runner
         self.sampler = sampler
-        self.kv_cache_manager = kv_cache_manager
 
-    def step(self, request):
-        """执行一步 decode
+    @torch.no_grad()
+    def run_one(self, req) -> list[StepEvent]:
+        """执行一个 decode 请求
 
         Args:
-            request: 当前请求对象
+            req: 当前请求
 
         Returns:
-            DecodeStepResult
+            StepEvent 列表
         """
-        if request.last_token_id is None:
-            raise ValueError(f"Request {request.request_id} has no last_token_id for decode.")
+        assert req.last_token_id is not None
 
-        # 从 KVCacheManager 获取 cache
-        cache_handle = self.kv_cache_manager.get(request.request_id)
-        past_key_values = cache_handle.past_key_values if cache_handle is not None else None
+        # 输入上一个生成的 token [1, 1]
+        input_ids = torch.tensor([[req.last_token_id]], dtype=torch.long)
 
-        # 每步 decode 只输入上一个生成的 token
-        input_ids = torch.tensor([[request.last_token_id]], dtype=torch.long)
-
-        # attention_mask 长度覆盖 prompt 已处理部分 + 已生成 token
-        # HF past_key_values 已包含之前 token 的 KV，当前 input_ids 是最后一个生成 token
-        attention_mask = torch.ones(1, request.total_sequence_length(), dtype=torch.long)
+        # attention_mask 覆盖完整序列
+        attention_mask = torch.ones(1, req.total_sequence_length(), dtype=torch.long)
 
         output = self.model_runner.forward_decode(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            past_key_values=past_key_values,
+            past_key_values=req.past_key_values,
         )
 
-        next_token_id = self.sampler.sample(
-            output.logits[:, -1, :],
-            temperature=request.sampling_params.temperature,
-            top_k=request.sampling_params.top_k,
-            top_p=request.sampling_params.top_p,
+        # 更新请求状态
+        req.past_key_values = output.past_key_values
+
+        next_token_logits = output.logits[0, -1, :]
+        next_token = self.sampler.sample(
+            next_token_logits,
+            temperature=req.sampling_params.temperature,
+            top_k=req.sampling_params.top_k,
+            top_p=req.sampling_params.top_p,
         )
 
-        # 更新 request 状态
-        request.past_key_values = output.past_key_values
-        request.last_token_id = next_token_id
-        request.generated_token_ids.append(next_token_id)
+        req.generated_token_ids.append(next_token)
+        req.last_token_id = next_token
 
-        if request.first_token_time is None:
-            request.first_token_time = time.time()
+        events: list[StepEvent] = [
+            StepEvent(
+                event_type=StepEventType.DECODE_TOKEN,
+                request_id=req.request_id,
+                payload=TokenPayload(token_id=next_token),
+            )
+        ]
 
-        # 判断终止：达到最大长度或遇到 stop token
+        # 判断终止
         finished = (
-            len(request.generated_token_ids) >= request.sampling_params.max_new_tokens
-            or next_token_id in request.sampling_params.stop_token_ids
+            len(req.generated_token_ids) >= req.sampling_params.max_new_tokens
+            or next_token in req.sampling_params.stop_token_ids
         )
 
-        # 更新 KVCacheManager，token_count = 已 prefill 的 token + 已生成 token
-        self.kv_cache_manager.update(
-            request.request_id,
-            past_key_values=output.past_key_values,
-            token_count=request.total_sequence_length(),
-        )
+        if finished:
+            req.status = "finished"
+            if req.finish_time is None:
+                import time
+                req.finish_time = time.time()
+            events.append(
+                StepEvent(
+                    event_type=StepEventType.FINISHED,
+                    request_id=req.request_id,
+                    payload=FinishedPayload(reason="eos_or_max_new_tokens"),
+                )
+            )
 
-        if finished and request.finish_time is None:
-            request.finish_time = time.time()
-
-        return DecodeStepResult(next_token_id=next_token_id, finished=finished)
+        return events

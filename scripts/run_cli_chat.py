@@ -1,14 +1,13 @@
 """CLI 对话脚本
 
-第三阶段更新：使用 ChunkedPrefillExecutor + BlockAllocator。
-由于第三阶段 Request 构造函数变更（sampling_params 必填），
-此脚本也做了相应适配。
+第四阶段更新：使用 HybridInferenceEngine + BatchedFreshPrefill + IncrementalPrefill。
 
 运行：python scripts/run_cli_chat.py
 """
 
 import sys
 import uuid
+import time
 from pathlib import Path
 
 import torch
@@ -21,14 +20,14 @@ from miniservellm.model_adapter.hf_loader import HFLoader
 from miniservellm.model_adapter.tokenizer_adapter import TokenizerAdapter
 from miniservellm.model_adapter.hf_model_runner import HFModelRunner
 from miniservellm.runtime.sampler import Sampler
-from miniservellm.runtime.chunked_prefill import ChunkedPrefillExecutor
+from miniservellm.runtime.attention_metadata import BatchedPrefillTensorBuilder
+from miniservellm.runtime.batched_fresh_prefill import BatchedFreshPrefillExecutor
+from miniservellm.runtime.incremental_prefill import IncrementalPrefillExecutor
 from miniservellm.runtime.decode import DecodeExecutor
-from miniservellm.runtime.inference_engine import InferenceEngine
+from miniservellm.runtime.inference_engine import HybridInferenceEngine
 from miniservellm.scheduler.request import Request, SamplingParams
 from miniservellm.scheduler.request_queue import RequestQueue
 from miniservellm.scheduler.scheduler import Scheduler
-from miniservellm.cache.block_allocator import BlockAllocator
-from miniservellm.cache.kv_cache_manager import KVCacheManager
 from miniservellm.benchmark.metrics import RequestMetrics
 
 
@@ -58,9 +57,9 @@ def pick_dtype(device: str):
 
 
 def build_engine():
-    """构建第三阶段推理引擎
+    """构建第四阶段推理引擎
 
-    使用 ChunkedPrefillExecutor + BlockAllocator + KVCacheManager。
+    使用 HybridInferenceEngine + BatchedFreshPrefillExecutor + IncrementalPrefillExecutor。
 
     Returns:
         (engine, tokenizer_adapter) 元组
@@ -91,31 +90,60 @@ def build_engine():
     # 组装 engine 依赖组件
     tokenizer_adapter = TokenizerAdapter(tokenizer)
     model_runner = HFModelRunner(model, model_cfg.device)
-
-    # BlockAllocator + KVCacheManager
-    block_allocator = BlockAllocator(num_blocks=1024, block_size=16)
-    kv_cache_manager = KVCacheManager(block_allocator=block_allocator)
-
     sampler = Sampler()
-    # 使用 ChunkedPrefillExecutor
-    prefill_executor = ChunkedPrefillExecutor(model_runner, sampler, kv_cache_manager)
-    decode_executor = DecodeExecutor(model_runner, sampler, kv_cache_manager)
 
-    request_queue = RequestQueue()
+    # 请求队列
+    queue = RequestQueue()
+
+    # 调度器
     scheduler = Scheduler(
-        request_queue=request_queue,
-        max_batch_size=4,
-        decode_first=True,
+        max_decode_batch_size=8,
+        max_prefill_batch_size=8,
+        prefill_token_budget=256,
+        max_prefill_chunk_size=64,
     )
 
-    engine = InferenceEngine(
-        tokenizer_adapter=tokenizer_adapter,
-        prefill_executor=prefill_executor,
-        decode_executor=decode_executor,
-        request_queue=request_queue,
-        scheduler=scheduler,
-        kv_cache_manager=kv_cache_manager,
+    # 共享 request_index
+    request_index: dict = {}
+
+    # BatchedPrefillTensorBuilder
+    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+    tensor_builder = BatchedPrefillTensorBuilder(
+        device=torch.device(model_cfg.device),
+        pad_token_id=pad_token_id,
     )
+
+    # 三个执行器
+    fresh_prefill_executor = BatchedFreshPrefillExecutor(
+        model_runner=model_runner,
+        sampler=sampler,
+        tensor_builder=tensor_builder,
+        request_index=request_index,
+    )
+    incremental_prefill_executor = IncrementalPrefillExecutor(
+        model_runner=model_runner,
+        sampler=sampler,
+    )
+    decode_executor = DecodeExecutor(
+        model_runner=model_runner,
+        sampler=sampler,
+    )
+
+    engine = HybridInferenceEngine(
+        tokenizer_adapter=tokenizer_adapter,
+        model_runner=model_runner,
+        sampler=sampler,
+        queue=queue,
+        scheduler=scheduler,
+        fresh_prefill_executor=fresh_prefill_executor,
+        incremental_prefill_executor=incremental_prefill_executor,
+        decode_executor=decode_executor,
+    )
+
+    # 共享 request_index
+    engine.request_index = request_index
+    fresh_prefill_executor.request_index = request_index
+
     return engine, tokenizer_adapter
 
 
@@ -133,13 +161,13 @@ def main():
     if tokenizer.eos_token_id is not None:
         stop_token_ids.append(tokenizer.eos_token_id)
 
-    # 构造单请求，使用 sampling_params 必填参数
+    # 构造单请求
     request = Request(
         request_id=str(uuid.uuid4()),
         prompt=prompt_text,
         prompt_token_ids=prompt_token_ids,
         sampling_params=SamplingParams(
-            max_new_tokens=10240,
+            max_new_tokens=1024,
             temperature=0.7,
             top_k=20,
             top_p=0.9,
@@ -148,8 +176,9 @@ def main():
         # chunk_size 设大一些，单请求时一次性 prefill 整个 prompt
         chunk_size=len(prompt_token_ids),
     )
+    request.arrival_time = time.time()
 
-    # 兼容第一阶段的单请求 generate API
+    # 兼容单请求 generate() API
     output_text = engine.generate(request)
 
     print("\nAssistant>")

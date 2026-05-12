@@ -1,15 +1,24 @@
 """Step 级事件输出
 
-第三阶段新增 StepResult，用于描述每次 engine.step() 中单个请求的结果。
-通过 event_type 区分不同阶段事件，便于调试和后续 streaming UI。
+第四阶段使用 StepEvent 替代第三阶段的 StepResult，
+通过 event_type 枚举区分不同阶段事件。
 
 同时定义各执行器的结构化返回类型，替代 dict / bare tuple。
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from enum import Enum, auto
 from typing import Any
+
+
+class StepEventType(Enum):
+    """Step 事件类型枚举"""
+    PREFILL_PROGRESS = auto()    # chunked prefill 进行中，未产出 token
+    PREFILL_TO_DECODE = auto()   # prefill 完成，产出首 token，进入 decode
+    DECODE_TOKEN = auto()        # decode 阶段产出一个 token
+    FINISHED = auto()            # 请求生成完毕
 
 
 @dataclass
@@ -77,24 +86,50 @@ class MetricsSummary:
 
 
 @dataclass
-class StepResult:
-    """单步单个请求的执行结果
+class PrefillProgressPayload:
+    """PREFILL_PROGRESS 事件载荷
 
     Attributes:
-        request_id: 请求唯一标识
-        next_token_id: 本步生成的 token id，未产出 token 时为 None
-        finished: 请求是否已完成
-        text_delta: 本步生成的文本增量
-        event_type: 事件类型，区分不同阶段：
-            - PREFILL_PROGRESS: chunked prefill 进行中，未产出 token
-            - PREFILL_TO_DECODE: prefill 完成，产出首 token，进入 decode
-            - DECODE_TOKEN: decode 阶段产出一个 token
-            - FINISHED: 请求生成完毕
-        metadata: 附加元数据，用于调试和监控
+        prefill_offset: 当前 prefill 偏移量
+        prompt_len: prompt 总 token 数
     """
+
+    prefill_offset: int
+    prompt_len: int
+
+
+@dataclass
+class TokenPayload:
+    """PREFILL_TO_DECODE / DECODE_TOKEN 事件载荷
+
+    Attributes:
+        token_id: 生成的 token id
+    """
+
+    token_id: int
+
+
+@dataclass
+class FinishedPayload:
+    """FINISHED 事件载荷
+
+    Attributes:
+        reason: 终止原因
+    """
+
+    reason: str
+
+
+@dataclass
+class StepEvent:
+    """单步单个请求的事件
+
+    Attributes:
+        event_type: 事件类型
+        request_id: 请求唯一标识
+        payload: 事件载荷，类型由 event_type 决定
+    """
+
+    event_type: StepEventType
     request_id: str
-    next_token_id: int | None
-    finished: bool
-    text_delta: str
-    event_type: str = "UNKNOWN"
-    metadata: dict[str, Any] = field(default_factory=dict)
+    payload: PrefillProgressPayload | TokenPayload | FinishedPayload
