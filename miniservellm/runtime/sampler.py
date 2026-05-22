@@ -1,55 +1,83 @@
 """采样器
 
-从模型输出的 logits 中采样下一个 token，支持 greedy、top-k 等策略。
+第五阶段重构：新增 top-p 采样、batch 采样接口。
 """
 
+from __future__ import annotations
+
+from typing import Dict, List
+
 import torch
+
+from miniservellm.scheduler.request import Request
+
+
+def top_k_filtering(logits: torch.Tensor, top_k: int) -> torch.Tensor:
+    if top_k <= 0 or top_k >= logits.numel():
+        return logits
+    values, _ = torch.topk(logits, top_k)
+    threshold = values[-1]
+    return logits.masked_fill(logits < threshold, float("-inf"))
+
+
+def top_p_filtering(logits: torch.Tensor, top_p: float) -> torch.Tensor:
+    if top_p >= 1.0:
+        return logits
+    if top_p <= 0.0:
+        raise ValueError(f"top_p must be in (0, 1], got {top_p}")
+
+    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+    probs = torch.softmax(sorted_logits.float(), dim=-1)
+    cumulative = torch.cumsum(probs, dim=-1)
+    keep = cumulative <= top_p
+    keep[0] = True
+    filtered_sorted = sorted_logits.masked_fill(~keep, float("-inf"))
+    filtered = torch.full_like(logits, float("-inf"))
+    filtered.scatter_(0, sorted_indices, filtered_sorted)
+    return filtered
 
 
 class Sampler:
     """Token 采样器
 
-    支持 greedy decoding 和带温度的 top-k 采样。
-    后续可扩展 top-p（nucleus）、repetition penalty 等。
+    支持 greedy、temperature、top-k、top-p 采样。
     """
 
-    def sample(
-        self,
-        logits,
-        temperature: float = 0.0,
-        top_k: int = 0,
-        top_p: float = 1.0,
-    ) -> int:
-        """从 logits 中采样一个 token
+    def sample_one(self, logits: torch.Tensor, req: Request) -> int:
+        params = req.sampling_params
+        temperature = float(params.temperature)
+        top_k = int(params.top_k)
+        top_p = float(params.top_p)
+        repetition_penalty = float(params.repetition_penalty)
 
-        Args:
-            logits: 模型输出的 logits，形状 [vocab_size] 或 [1, vocab_size]
-            temperature: 采样温度，0.0 表示贪心解码
-            top_k: top-k 采样的候选数，0 表示不限制
-            top_p: nucleus sampling 阈值（当前未实现）
+        if temperature <= 0.0:
+            return int(torch.argmax(logits).item())
 
-        Returns:
-            采样得到的 token id
-        """
-        # 统一为 1D
-        if logits.dim() > 1:
-            logits = logits.squeeze(0)
+        work = logits
+        if temperature != 1.0:
+            work = work / temperature
 
-        # Greedy decoding：直接取 argmax
-        if temperature == 0.0:
-            return torch.argmax(logits).item()
+        # Apply repetition penalty based on already generated tokens
+        if repetition_penalty != 1.0 and req.generated_token_ids:
+            seen = set(req.generated_token_ids)
+            for token_id in seen:
+                if token_id < work.numel():
+                    if work[token_id] > 0:
+                        work[token_id] /= repetition_penalty
+                    else:
+                        work[token_id] *= repetition_penalty
 
-        # 带温度的 softmax 概率分布
-        probs = torch.softmax(logits / temperature, dim=-1)
-
-        # Top-k 采样：只从概率最高的 k 个 token 中采样
         if top_k > 0:
-            values, indices = torch.topk(probs, top_k, dim=-1)
-            # 重新归一化，使 top-k 候选概率之和为 1
-            values = values / values.sum(dim=-1, keepdim=True)
-            sampled = torch.multinomial(values, num_samples=1).item()
-            return indices[sampled].item()
+            work = top_k_filtering(work, top_k)
+        if top_p < 1.0:
+            work = top_p_filtering(work, top_p)
 
-        # 无 top-k 约束，直接从全词表分布采样
-        sampled = torch.multinomial(probs, num_samples=1).item()
-        return sampled
+        probs = torch.softmax(work.float(), dim=-1)
+        token = torch.multinomial(probs, 1)
+        return int(token.item())
+
+    def sample_batch(self, logits_by_request: Dict[str, torch.Tensor], requests: List[Request]) -> Dict[str, int]:
+        out: Dict[str, int] = {}
+        for req in requests:
+            out[req.request_id] = self.sample_one(logits_by_request[req.request_id], req)
+        return out

@@ -1,140 +1,49 @@
 """HuggingFace 模型加载器
 
-负责从 HuggingFace Hub 加载 tokenizer 和模型，
-自动根据模型类型选择正确的 Auto 类（CausalLM 或 ImageTextToText）。
+第五阶段重构：使用 Adapter 模式加载模型，
+支持从 HF Hub 加载 tokenizer、config、模型，并提取权重。
 """
 
+from __future__ import annotations
+
+from typing import Optional
+
 import torch
-from transformers import AutoTokenizer, AutoConfig
 
 
-def resolve_torch_dtype(dtype: str):
-    """将字符串 dtype 转换为 torch.dtype
-
-    Args:
-        dtype: 精度名称，如 "float16", "bfloat16", "float32"
-
-    Returns:
-        对应的 torch.dtype
-
-    Raises:
-        ValueError: 不支持的 dtype 名称
-    """
-    mapping = {
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-        "float32": torch.float32,
-    }
-    if dtype not in mapping:
-        raise ValueError(f"Unsupported dtype: {dtype}")
-    return mapping[dtype]
-
-
-def _get_model_class(model_name: str, trust_remote_code: bool = True):
-    """根据模型的 model_type 自动选择正确的 Auto 加载类
-
-    Qwen3.5 等多模态模型需要 AutoModelForImageTextToText，
-    纯文本模型（如 Qwen2.5）使用 AutoModelForCausalLM。
+def load_model_bundle(
+    adapter,
+    model_name_or_path: str,
+    trust_remote_code: bool = False,
+    load_model_device: str = "cpu",
+    load_dtype: Optional[torch.dtype] = None,
+):
+    """加载模型全套资源
 
     Args:
-        model_name: Hugging Face 模型标识符
+        adapter: 模型适配器（如 Qwen2Adapter）
+        model_name_or_path: 模型名称或路径
         trust_remote_code: 是否信任远程代码
+        load_model_device: 模型加载设备
+        load_dtype: 模型加载精度
 
     Returns:
-        对应的 Auto 模型类
+        (tokenizer, hf_config, model_config, hf_model, weights)
     """
-    from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
-
-    try:
-        # 优先只读本地缓存，避免每次运行都访问 HuggingFace 网络
-        config = AutoConfig.from_pretrained(
-            model_name,
-            trust_remote_code=trust_remote_code,
-            local_files_only=True,
-        )
-    except Exception:
-        # 本地没有缓存时再允许联网下载
-        config = AutoConfig.from_pretrained(model_name, trust_remote_code=trust_remote_code)
-
-    model_type = getattr(config, "model_type", "")
-
-    # Qwen3.5 等多模态模型需要用 AutoModelForImageTextToText
-    if model_type in ("qwen3_5", "qwen2_vl", "qwen2_5_vl"):
-        return AutoModelForImageTextToText
-
-    return AutoModelForCausalLM
-
-
-class HFLoader:
-    """HuggingFace 模型加载器
-
-    封装 tokenizer 和模型的加载逻辑，自动处理 dtype 和 device 映射。
-    """
-
-    def load_tokenizer(self, model_name: str, trust_remote_code: bool = True):
-        """加载 tokenizer
-
-        Args:
-            model_name: Hugging Face 模型标识符
-            trust_remote_code: 是否信任远程代码
-
-        Returns:
-            加载好的 tokenizer 实例
-        """
-        try:
-            # 优先从本地缓存加载，避免无意义的网络 HEAD 请求
-            tokenizer = AutoTokenizer.from_pretrained(
-                model_name,
-                trust_remote_code=trust_remote_code,
-                local_files_only=True,
-            )
-        except Exception:
-            tokenizer = AutoTokenizer.from_pretrained(
-                model_name,
-                trust_remote_code=trust_remote_code,
-            )
-        return tokenizer
-
-    def load_model(
-        self,
-        model_name: str,
-        device: str = "cpu",
-        dtype: str = "float16",
-        trust_remote_code: bool = True,
-    ):
-        """加载模型到指定设备
-
-        自动根据模型类型选择 AutoModelForCausalLM 或 AutoModelForImageTextToText，
-        设置精度并移动到目标设备。
-
-        Args:
-            model_name: Hugging Face 模型标识符
-            device: 目标设备 ("cpu" / "mps" / "cuda")
-            dtype: 权重精度 ("float16" / "bfloat16" / "float32")
-            trust_remote_code: 是否信任远程代码
-
-        Returns:
-            加载好的模型实例（已设为 eval 模式并移至目标设备）
-        """
-        torch_dtype = resolve_torch_dtype(dtype)
-        # 根据模型类型自动选择正确的 Auto 类
-        model_cls = _get_model_class(model_name, trust_remote_code)
-
-        try:
-            # 优先从本地缓存加载，避免运行 demo 时因为网络问题失败
-            model = model_cls.from_pretrained(
-                model_name,
-                dtype=torch_dtype,
-                trust_remote_code=trust_remote_code,
-                local_files_only=True,
-            )
-        except Exception:
-            model = model_cls.from_pretrained(
-                model_name,
-                dtype=torch_dtype,
-                trust_remote_code=trust_remote_code,
-            )
-
-        model.eval()      # 切换到评估模式，主要是关闭dropout和batchnorm，从而能保证每次推理结果是一样的
-        model.to(device)   # 将模型移至目标设备
-        return model
+    tokenizer = adapter.load_tokenizer(
+        model_name_or_path=model_name_or_path,
+        trust_remote_code=trust_remote_code,
+    )
+    hf_config = adapter.load_hf_config(
+        model_name_or_path=model_name_or_path,
+        trust_remote_code=trust_remote_code,
+    )
+    model_config = adapter.convert_hf_config(hf_config)
+    hf_model = adapter.load_hf_model(
+        model_name_or_path=model_name_or_path,
+        device=load_model_device,
+        torch_dtype=load_dtype,
+        trust_remote_code=trust_remote_code,
+    )
+    weights = adapter.extract_weights(hf_model)
+    return tokenizer, hf_config, model_config, hf_model, weights
