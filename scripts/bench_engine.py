@@ -48,6 +48,11 @@ def main():
     parser.add_argument("--greedy", action="store_true", help="使用贪心解码（temperature=0）")
     parser.add_argument("--kv-decode-block-reserve", type=int, default=2, help="为 decode 预留的最少空闲 KV block")
     parser.add_argument("--kv-reserve-relax-after-no-progress-steps", type=int, default=8, help="连续无进展多少步后放宽一次 KV 水位")
+    parser.add_argument("--enable-compile", action="store_true", help="启用 torch.compile")
+    parser.add_argument("--compile-mode", default="default", choices=["default", "reduce-overhead", "max-autotune"], help="torch.compile mode")
+    parser.add_argument("--compile-fullgraph", action="store_true", help="torch.compile fullgraph 模式")
+    parser.add_argument("--context-bucket-multiple", type=int, default=0, help="context长度分桶粒度，0表示关闭")
+    parser.add_argument("--decode-batch-bucket-multiple", type=int, default=0, help="decode batch分桶粒度，0表示关闭")
     args = parser.parse_args()
 
     ec = EngineConfig.create(
@@ -65,11 +70,21 @@ def main():
         default_top_p=0.9,
         kv_decode_block_reserve=args.kv_decode_block_reserve,
         kv_reserve_relax_after_no_progress_steps=args.kv_reserve_relax_after_no_progress_steps,
+        enable_torch_compile=args.enable_compile,
+        torch_compile_mode=args.compile_mode,
+        torch_compile_fullgraph=args.compile_fullgraph,
+        context_bucket_multiple=args.context_bucket_multiple,
+        decode_batch_bucket_multiple=args.decode_batch_bucket_multiple,
     )
     print(
         f"[bench] device={ec.device} dtype={ec.dtype} "
         f"kv_reserve={ec.kv_decode_block_reserve} "
-        f"kv_relax_after={ec.kv_reserve_relax_after_no_progress_steps}"
+        f"kv_relax_after={ec.kv_reserve_relax_after_no_progress_steps} "
+        f"compile={ec.enable_torch_compile} "
+        f"compile_mode={ec.torch_compile_mode} "
+        f"fullgraph={ec.torch_compile_fullgraph} "
+        f"ctx_bucket={ec.context_bucket_multiple} "
+        f"decode_batch_bucket={ec.decode_batch_bucket_multiple}"
     )
 
     adapter = Qwen2Adapter()

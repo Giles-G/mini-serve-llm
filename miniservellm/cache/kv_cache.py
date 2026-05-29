@@ -334,6 +334,7 @@ class KVCacheManager:
         self,
         reqs: List[Request],
         context_lens: List[int],
+        padded_max_ctx: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """为 N 个 decode 请求构造批量 KV gather 用的索引张量
 
@@ -347,12 +348,14 @@ class KVCacheManager:
         Args:
             reqs: 长度 N 的请求列表
             context_lens: 长度 N 的真实上下文长度列表
+            padded_max_ctx: 指定 padding 后的 max_ctx（0 表示按真实 max_ctx）
 
         Returns:
             (block_ids_padded, block_offsets) 两个 LongTensor
         """
         N = len(reqs)
-        max_ctx = max(context_lens) if context_lens else 0
+        max_ctx_raw = max(context_lens) if context_lens else 0
+        max_ctx = max(max_ctx_raw, padded_max_ctx)
         device = self.engine_config.device
         block_size = self.engine_config.block_size
 

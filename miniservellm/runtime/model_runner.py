@@ -16,7 +16,7 @@ KV 直接写入 Paged KV Cache，不再依赖 HF 的 past_key_values。
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import torch
 
@@ -57,6 +57,7 @@ class DecodeBatchGatherCtx:
     block_ids: torch.Tensor          # [N, max_ctx]  gather 用 block id
     block_offsets: torch.Tensor      # [N, max_ctx]  gather 用块内偏移
     context_lens_tensor: torch.Tensor  # [N]  真实 context_len（attention mask 用）
+    valid_batch_size: int = 0        # 真实请求数（batch 分桶时 <= N）
 
 
 @dataclass
@@ -532,12 +533,14 @@ class TransformerBlockRunner:
 
         # 批量 KV 写入：N 个 token → 各自的 write_slot
         if gather_ctx is not None:
+            # batch 分桶时仅前 valid_batch_size 行对应真实请求，padding 行不写 KV。
+            valid_n = gather_ctx.valid_batch_size if gather_ctx.valid_batch_size > 0 else n
             self.kv_cache_manager.write_kv_for_tokens_indexed(
                 layer_idx=self.layer_idx,
-                block_ids=gather_ctx.write_block_ids,
-                block_offsets=gather_ctx.write_block_offsets,
-                k_values=k_new,
-                v_values=v_new,
+                block_ids=gather_ctx.write_block_ids[:valid_n],
+                block_offsets=gather_ctx.write_block_offsets[:valid_n],
+                k_values=k_new[:valid_n],
+                v_values=v_new[:valid_n],
             )
         else:
             self.kv_cache_manager.write_kv_for_tokens_batch(
@@ -670,6 +673,18 @@ class TransformerModelRunner:
                 )
             )
 
+        # 可替换的执行入口：默认 eager，开启 compile 后会被替换为编译版本
+        self._prefill_layers_fn: Callable[[torch.Tensor, PrefillBatchCtx], torch.Tensor] = (
+            self._run_prefill_layers_eager
+        )
+        self._decode_layers_fn: Callable[
+            [torch.Tensor, List[DecodeRequestMetadata], List[Request], DecodeBatchGatherCtx],
+            torch.Tensor,
+        ] = self._run_decode_layers_eager
+
+        if engine_config.enable_torch_compile:
+            self._maybe_enable_torch_compile()
+
     @property
     def device(self) -> torch.device:
         return self._device
@@ -710,6 +725,73 @@ class TransformerModelRunner:
         x = rms_norm(hidden_states, self.weights.final_norm, self.model_config.rms_norm_eps)
         return linear(x, self.weights.lm_head)
 
+    def _run_prefill_layers_eager(
+        self,
+        hidden_states: torch.Tensor,
+        ctx: "PrefillBatchCtx",
+    ) -> torch.Tensor:
+        for block in self.blocks:
+            hidden_states = block.forward_prefill_batch(hidden_states, ctx)
+        return hidden_states
+
+    def _run_decode_layers_eager(
+        self,
+        hidden_states: torch.Tensor,
+        metas: List[DecodeRequestMetadata],
+        requests: List[Request],
+        gather_ctx: "DecodeBatchGatherCtx",
+    ) -> torch.Tensor:
+        for block in self.blocks:
+            hidden_states = block.forward_decode_batch(hidden_states, metas, requests, gather_ctx)
+        return hidden_states
+
+    def _maybe_enable_torch_compile(self) -> None:
+        """按配置启用 torch.compile；失败时自动回退到 eager。"""
+        if not hasattr(torch, "compile"):
+            print("[compile] torch.compile not available, fallback to eager")
+            return
+
+        # MPS 上当前图中会触发 float64 不支持问题，先显式回退 eager。
+        if self._device.type == "mps":
+            print("[compile] disabled on mps, fallback to eager")
+            return
+
+        try:
+            self._prefill_layers_fn = torch.compile(
+                self._run_prefill_layers_eager,
+                mode=self.engine_config.torch_compile_mode,
+                fullgraph=self.engine_config.torch_compile_fullgraph,
+                dynamic=True,
+            )
+            self._decode_layers_fn = torch.compile(
+                self._run_decode_layers_eager,
+                mode=self.engine_config.torch_compile_mode,
+                fullgraph=self.engine_config.torch_compile_fullgraph,
+                dynamic=True,
+            )
+            print(
+                f"[compile] enabled mode={self.engine_config.torch_compile_mode} "
+                f"fullgraph={self.engine_config.torch_compile_fullgraph}"
+            )
+        except Exception as e:
+            print(f"[compile] failed, fallback to eager: {e}")
+            self._prefill_layers_fn = self._run_prefill_layers_eager
+            self._decode_layers_fn = self._run_decode_layers_eager
+
+    def _bucket_len(self, x: int) -> int:
+        """按配置把长度向上取整到桶边界；0 表示不分桶。"""
+        multiple = int(self.engine_config.context_bucket_multiple)
+        if multiple <= 0:
+            return x
+        return ((x + multiple - 1) // multiple) * multiple
+
+    def _bucket_batch(self, n: int) -> int:
+        """按配置把 decode batch 向上取整到桶边界；0 表示不分桶。"""
+        multiple = int(self.engine_config.decode_batch_bucket_multiple)
+        if multiple <= 0:
+            return n
+        return ((n + multiple - 1) // multiple) * multiple
+
     def _build_prefill_batch_ctx(
         self,
         requests: List[Request],
@@ -746,10 +828,12 @@ class TransformerModelRunner:
         history_lens = torch.tensor(history_lens_list, device=device, dtype=torch.long)
         max_chunk_len = max(chunk_lens_list) if chunk_lens_list else 0
         max_kv_len = max(total_kv_lens) if total_kv_lens else 0
+        max_kv_len_bucketed = self._bucket_len(max_kv_len)
 
         # 复用 KV gather 索引构造（按 total_kv_lens 当 context_len）
+        # 为提升 compile 命中率，可把 max_ctx 向上 pad 到分桶边界。
         block_ids, block_offsets = self.kv_cache_manager.build_decode_batch_indices(
-            requests, total_kv_lens,
+            requests, total_kv_lens, padded_max_ctx=max_kv_len_bucketed,
         )
 
         # 写入 slot 的 (block_ids, block_offsets) 一次性算出，跨层复用
@@ -774,7 +858,7 @@ class TransformerModelRunner:
             history_lens=history_lens,
             chunk_offsets=chunk_offsets,
             max_chunk_len=max_chunk_len,
-            max_kv_len=max_kv_len,
+            max_kv_len=max_kv_len_bucketed,
             block_ids=block_ids,
             block_offsets=block_offsets,
             last_token_indices=last_token_indices,
@@ -810,9 +894,8 @@ class TransformerModelRunner:
         # 构造跨层共享上下文
         ctx = self._build_prefill_batch_ctx(active_reqs, active_metas)
 
-        # 逐层批量前向
-        for block in self.blocks:
-            hidden_states = block.forward_prefill_batch(hidden_states, ctx)
+        # 逐层批量前向（可切换 eager / compiled）
+        hidden_states = self._prefill_layers_fn(hidden_states, ctx)
 
         # 一次 logits 投影；按 last_token_indices 选每请求最后一个 token 的 logits
         logits_full = self._project_logits(hidden_states)  # [sum_T, vocab]
@@ -886,22 +969,39 @@ class TransformerModelRunner:
         if not requests:
             return DecodeModelOutput(logits_by_request={})
 
-        # 批量 embed：[N] → [N, hidden_size]
-        input_ids = torch.tensor(
-            [m.input_token_id for m in metas], device=self._device, dtype=torch.long
-        )
+        valid_n = len(requests)
+        bucket_n = self._bucket_batch(valid_n)
+
+        # 批量 embed：[N] → [N, hidden_size]；batch 分桶时做尾部 pad
+        input_id_list = [m.input_token_id for m in metas]
+        if bucket_n > valid_n and valid_n > 0:
+            input_id_list.extend([input_id_list[-1]] * (bucket_n - valid_n))
+        input_ids = torch.tensor(input_id_list, device=self._device, dtype=torch.long)
         hidden_states = self._embed(input_ids)
 
         # 一次性构造跨层共享的批量上下文（block_ids / offsets / positions / context_lens）
-        positions = torch.tensor(
-            [m.query_position for m in metas], device=self._device, dtype=torch.long
-        )
+        pos_list = [m.query_position for m in metas]
+        if bucket_n > valid_n and valid_n > 0:
+            pos_list.extend([pos_list[-1]] * (bucket_n - valid_n))
+        positions = torch.tensor(pos_list, device=self._device, dtype=torch.long)
+
         ctx_lens_list = [m.context_len for m in metas]
+        if bucket_n > valid_n and valid_n > 0:
+            ctx_lens_list.extend([ctx_lens_list[-1]] * (bucket_n - valid_n))
+        max_ctx = max(ctx_lens_list) if ctx_lens_list else 0
+        max_ctx_bucketed = self._bucket_len(max_ctx)
+
+        reqs_for_index = requests
+        if bucket_n > valid_n and valid_n > 0:
+            reqs_for_index = requests + [requests[-1]] * (bucket_n - valid_n)
         block_ids, block_offsets = self.kv_cache_manager.build_decode_batch_indices(
-            requests, ctx_lens_list,
+            reqs_for_index, ctx_lens_list, padded_max_ctx=max_ctx_bucketed,
         )
         context_lens_tensor = torch.tensor(ctx_lens_list, device=self._device, dtype=torch.long)
+
         write_slots = [m.write_slot for m in metas]
+        if bucket_n > valid_n and valid_n > 0:
+            write_slots.extend([metas[-1].write_slot] * (bucket_n - valid_n))
         write_block_ids, write_block_offsets = self.kv_cache_manager.slot_refs_to_indices(
             write_slots,
         )
@@ -913,14 +1013,14 @@ class TransformerModelRunner:
             block_ids=block_ids,
             block_offsets=block_offsets,
             context_lens_tensor=context_lens_tensor,
+            valid_batch_size=valid_n,
         )
 
-        # 逐层批量前向（复用 gather_ctx，避免每层重复构造）
-        for block in self.blocks:
-            hidden_states = block.forward_decode_batch(hidden_states, metas, requests, gather_ctx)
+        # 逐层批量前向（可切换 eager / compiled，且复用 gather_ctx）
+        hidden_states = self._decode_layers_fn(hidden_states, metas, requests, gather_ctx)
 
-        # 批量 logits 投影：[N, hidden] → [N, vocab_size]
-        logits = self._project_logits(hidden_states)
+        # 仅对真实请求返回 logits；padding 行不参与输出
+        logits = self._project_logits(hidden_states[:valid_n])
 
         return DecodeModelOutput(
             logits_by_request={req.request_id: logits[i] for i, req in enumerate(requests)}

@@ -52,6 +52,11 @@ class EngineConfig:
         default_top_p: 默认 top-p
         kv_decode_block_reserve: 调度时为 decode 预留的最少空闲 block 数
         kv_reserve_relax_after_no_progress_steps: 连续无进展多少步后放宽一次水位
+        enable_torch_compile: 是否启用 torch.compile 图优化
+        torch_compile_mode: torch.compile mode（default/reduce-overhead/max-autotune）
+        torch_compile_fullgraph: 是否要求 fullgraph 编译
+        context_bucket_multiple: context length 分桶粒度（0 表示关闭）
+        decode_batch_bucket_multiple: decode batch 分桶粒度（0 表示关闭）
         eos_token_id: EOS token id
     """
 
@@ -72,6 +77,11 @@ class EngineConfig:
     default_top_p: float = 0.95
     kv_decode_block_reserve: int = 2
     kv_reserve_relax_after_no_progress_steps: int = 8
+    enable_torch_compile: bool = False
+    torch_compile_mode: str = "default"
+    torch_compile_fullgraph: bool = False
+    context_bucket_multiple: int = 0
+    decode_batch_bucket_multiple: int = 0
     eos_token_id: Optional[int] = None
 
     @staticmethod
@@ -90,6 +100,11 @@ class EngineConfig:
         default_top_p: float = 0.95,
         kv_decode_block_reserve: int = 2,
         kv_reserve_relax_after_no_progress_steps: int = 8,
+        enable_torch_compile: bool = False,
+        torch_compile_mode: str = "default",
+        torch_compile_fullgraph: bool = False,
+        context_bucket_multiple: int = 0,
+        decode_batch_bucket_multiple: int = 0,
         eos_token_id: Optional[int] = None,
     ) -> "EngineConfig":
         if device == "auto":
@@ -123,6 +138,11 @@ class EngineConfig:
             default_top_p=default_top_p,
             kv_decode_block_reserve=kv_decode_block_reserve,
             kv_reserve_relax_after_no_progress_steps=kv_reserve_relax_after_no_progress_steps,
+            enable_torch_compile=enable_torch_compile,
+            torch_compile_mode=torch_compile_mode,
+            torch_compile_fullgraph=torch_compile_fullgraph,
+            context_bucket_multiple=context_bucket_multiple,
+            decode_batch_bucket_multiple=decode_batch_bucket_multiple,
             eos_token_id=eos_token_id,
         )
 
