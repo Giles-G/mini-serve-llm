@@ -279,6 +279,149 @@ def causal_attention_single_query(
     return out.squeeze(1)  # [H, D]
 
 
+def gathered_paged_kv_decode_attention(
+    q: torch.Tensor,
+    k_padded: torch.Tensor,
+    v_padded: torch.Tensor,
+    context_lens: torch.Tensor,
+    num_q_heads: int,
+) -> torch.Tensor:
+    """N 个请求批量 decode attention（基于 paged KV gather 后的 padded 实现）
+
+    ⚠️ 命名澄清：这 *不是* vLLM 那种「真 paged attention」kernel。
+
+    真 paged attention 的关键是：在 attention kernel 内部直接按 block_table
+    跳着读取离散物理 block 的 KV，配合 shared memory + online softmax 完成
+    QK/softmax/PV 全流程，KV 不会被物化为连续张量。
+
+    本实现做的事情：
+      1. 上层（KVCacheManager.gather_kv_decode_batch）已经用 advanced indexing
+         把每请求的 paged KV 物化成 padded 稠密张量
+         k_padded/v_padded: [N, max_ctx, num_kv_heads, head_dim]
+      2. 本函数只是在这块 padded 稠密张量上做一次普通 batched attention，
+         用 context_lens mask 屏蔽 padding 位
+
+    所以「paged」体现在 *存储侧*（KV 物理 block 离散 + block_table 映射），
+    *计算侧* 仍是常规的 gather → batched matmul，不是 paged kernel。
+    真正的 paged kernel 留给后续 CUDA 阶段（mini-llm-kernels）实现。
+
+    GQA 不物化 repeat_kv：把 Q 的 head 维拆成 (kv_heads, group)，
+    让 KV head 维直接广播参与计算，避免 group 倍显存拷贝。
+
+    形状变换：
+        q                          [N, num_q_heads, head_dim]
+        → reshape                  [N, num_kv_heads, group, head_dim]
+        k_padded                   [N, max_ctx, num_kv_heads, head_dim]
+        → permute                  [N, num_kv_heads, max_ctx, head_dim]
+
+        scores = q_grouped @ k_p.T  [N, num_kv_heads, group, max_ctx]
+        + 上下文长度 mask
+        weights = softmax(scores)
+        out = weights @ v_p         [N, num_kv_heads, group, head_dim]
+        → reshape                  [N, num_q_heads, head_dim]
+
+    Args:
+        q: Query [N, num_q_heads, head_dim]
+        k_padded: Key, padding 后 [N, max_ctx, num_kv_heads, head_dim]
+        v_padded: Value, padding 后 [N, max_ctx, num_kv_heads, head_dim]
+        context_lens: 每请求的真实上下文长度 [N]，long
+        num_q_heads: Q 的 head 数（用于 GQA 拆分）
+
+    Returns:
+        Attention 输出 [N, num_q_heads, head_dim]
+    """
+    N, H_q, D = q.shape
+    _, max_ctx, H_kv, _ = k_padded.shape
+    assert H_q % H_kv == 0, "num_q_heads must be divisible by num_kv_heads"
+    group = H_q // H_kv
+
+    # GQA 视图：[N, H_kv, group, D]
+    q_grouped = q.view(N, H_kv, group, D)
+    # KV 转 [N, H_kv, max_ctx, D]
+    k_p = k_padded.permute(0, 2, 1, 3)
+    v_p = v_padded.permute(0, 2, 1, 3)
+
+    scale = D ** -0.5
+    # [N, H_kv, group, D] @ [N, H_kv, D, max_ctx] = [N, H_kv, group, max_ctx]
+    scores = torch.matmul(q_grouped, k_p.transpose(-1, -2)) * scale
+
+    # 长度 mask：超出真实 context 的位置置 -inf
+    pos = torch.arange(max_ctx, device=q.device).view(1, 1, 1, max_ctx)
+    valid = pos < context_lens.view(N, 1, 1, 1)
+    scores = scores.masked_fill(~valid, float("-inf"))
+
+    # softmax 在 fp32 下计算，转回原 dtype
+    weights = torch.softmax(scores.float(), dim=-1).to(q.dtype)
+    # [N, H_kv, group, max_ctx] @ [N, H_kv, max_ctx, D] = [N, H_kv, group, D]
+    out = torch.matmul(weights, v_p)
+    # 还原回 [N, num_q_heads, D]
+    return out.reshape(N, H_q, D)
+
+
+def batched_causal_attention_prefill(
+    q_padded: torch.Tensor,
+    k_padded: torch.Tensor,
+    v_padded: torch.Tensor,
+    chunk_lens: torch.Tensor,
+    history_lens: torch.Tensor,
+    num_q_heads: int,
+) -> torch.Tensor:
+    """N 个请求的批量 prefill attention（block-diagonal causal mask + GQA 不物化）
+
+    ⚠️ 同 gathered_paged_kv_decode_attention：本函数也不是 paged kernel。
+    KV 由上层从 paged 物理 block 通过 advanced indexing 物化成 padded 稠密张量
+    后才传入；本函数只在 padded 张量上做常规的 batched matmul + mask。
+
+    每个请求 i 的 chunk 长度 T_i、历史长度 history_i 各异，但已 pad 到统一形状。
+    每个 query（chunk 中位置 p）只能关注本请求的 [0, history_i + p]，
+    跨请求互不可见，且超出 chunk 真实长度的 padding query 不计入。
+
+    形状：
+        q_padded:        [N, max_chunk_len, num_q_heads, head_dim]
+        k_padded:        [N, max_kv_len,    num_kv_heads, head_dim]
+        v_padded:        [N, max_kv_len,    num_kv_heads, head_dim]
+        chunk_lens:      [N]  long, 每请求 chunk 的真实长度
+        history_lens:    [N]  long, 每请求 chunk 之前的历史长度
+        max_kv_len = max(history_i + chunk_i) for i
+
+    GQA 不物化：把 Q 的 head 维拆成 (kv_heads, group)，让 KV head 维直接广播。
+
+    返回：
+        attention 输出 [N, max_chunk_len, num_q_heads, head_dim]
+        （调用方按 chunk_lens 切回真实 token 顺序）
+    """
+    N, T, H_q, D = q_padded.shape
+    _, S, H_kv, _ = k_padded.shape
+    assert H_q % H_kv == 0
+    group = H_q // H_kv
+
+    # Q reshape 为 [N, T, H_kv, group, D] → [N, H_kv, group, T, D]
+    q_g = q_padded.view(N, T, H_kv, group, D).permute(0, 2, 3, 1, 4)
+    # K/V → [N, H_kv, S, D]
+    k_p = k_padded.permute(0, 2, 1, 3)
+    v_p = v_padded.permute(0, 2, 1, 3)
+
+    scale = D ** -0.5
+    # scores: [N, H_kv, group, T, D] @ [N, H_kv, 1, D, S] = [N, H_kv, group, T, S]
+    scores = torch.matmul(q_g, k_p.transpose(-1, -2).unsqueeze(2)) * scale
+
+    # Mask 构造：[N, T, S]，True = 保留
+    q_pos = torch.arange(T, device=q_padded.device).view(1, T, 1)
+    k_pos = torch.arange(S, device=q_padded.device).view(1, 1, S)
+    valid_q = q_pos < chunk_lens.view(N, 1, 1)                           # [N, T, 1]
+    causal_bound = history_lens.view(N, 1, 1) + q_pos + 1                # [N, T, 1]
+    valid_k = k_pos < causal_bound                                       # [N, T, S]
+    mask = valid_q & valid_k                                             # [N, T, S]
+    # 广播到 [N, 1, 1, T, S]
+    scores = scores.masked_fill(~mask.view(N, 1, 1, T, S), float("-inf"))
+
+    weights = torch.softmax(scores.float(), dim=-1).to(scores.dtype)
+    # out: [N, H_kv, group, T, S] @ [N, H_kv, 1, S, D] = [N, H_kv, group, T, D]
+    out = torch.matmul(weights, v_p.unsqueeze(2))
+    # → [N, T, H_q, D]
+    return out.permute(0, 3, 1, 2, 4).reshape(N, T, H_q, D)
+
+
 def causal_attention_prefill(
     q: torch.Tensor,
     k: torch.Tensor,

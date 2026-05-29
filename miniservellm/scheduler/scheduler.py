@@ -7,7 +7,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Optional
 
+from miniservellm.cache.kv_cache import KVCacheManager
 from miniservellm.scheduler.request import Request, RequestStatus
 
 
@@ -79,6 +81,8 @@ class Scheduler:
         max_prefill_tokens_per_step: int,
         max_decode_requests_per_step: int,
         prefill_chunk_size: int,
+        kv_cache_manager: Optional[KVCacheManager] = None,
+        kv_decode_block_reserve: int = 2,
     ) -> None:
         """初始化调度器
 
@@ -89,8 +93,14 @@ class Scheduler:
             max_prefill_tokens_per_step: 单步 prefill token 预算
             max_decode_requests_per_step: 单步最大 decode 请求数
             prefill_chunk_size: 单个请求每步 prefill chunk 大小上限
+            kv_cache_manager: KV Cache 管理器；用于调度前做容量预检查，
+                容量不足时请求留在原队列等待后续 step 重试。
+            kv_decode_block_reserve: 预留给 decode 增长的最少空闲 block 水位。
+                prefill 调度时必须保留该水位，避免 prefill 抢光 KV 导致全局卡死。
         """
         self.queue = queue
+        self.kv_cache_manager = kv_cache_manager
+        self.kv_decode_block_reserve = max(0, kv_decode_block_reserve)
         self.max_batch_size = max_batch_size
         self.max_tokens_per_step = max_tokens_per_step
         self.max_prefill_tokens_per_step = max_prefill_tokens_per_step
@@ -150,7 +160,7 @@ class Scheduler:
         if req.finish_reason.name != "NONE":
             self.queue.finished.append(req)
 
-    def schedule_step(self) -> SchedulePlan:
+    def schedule_step(self, relax_kv_reserve: bool = False) -> SchedulePlan:
         """生成本步的调度计划
 
         按以下优先级依次分配预算：
@@ -163,6 +173,11 @@ class Scheduler:
            - 请求状态从 WAITING → RUNNING_PREFILL，移入 running_prefill
            - chunk 大小计算同 incremental prefill
 
+        Args:
+            relax_kv_reserve: 是否临时放宽 prefill 的 KV 预留水位。
+                False（默认）时执行正常水位保护；True 时用于 deadlock breaker，
+                允许在单步里忽略 prefill 水位，尝试打破长期无进展状态。
+
         Returns:
             SchedulePlan 包含本步各类请求列表和 prefill chunk 分配
         """
@@ -174,9 +189,20 @@ class Scheduler:
         budget_prefill = self.max_prefill_tokens_per_step  # prefill token 预算
         budget_decode = self.max_decode_requests_per_step  # decode 请求数预算
         budget_batch = self.max_batch_size                 # 总 batch 预算
+        # KV block 预算也必须按本 step 已纳入计划的请求递减。
+        # 不能只对每个请求单独 can_allocate，否则多个请求都看到同一批 free blocks，
+        # 最终 aggregate 需求可能超过真实空闲量，Runner 里仍会触发 _allocate_block 异常。
+        budget_kv_blocks = (
+            self.kv_cache_manager.num_free_blocks()
+            if self.kv_cache_manager is not None
+            else 0
+        )
+        kv_prefill_reserve = 0 if relax_kv_reserve else self.kv_decode_block_reserve
 
         # ---- 阶段 1：decode first ----
-        # decode 每个请求每步生成 1 个 token，优先保证 decode 不被 prefill 阻塞
+        # decode 每个请求每步生成 1 个 token，优先保证 decode 不被 prefill 阻塞。
+        # 如果 KV block 不够，跳过该请求，留在 running_decode 队列中等待后续 step 重试；
+        # 不能在 KVCache 内阻塞等待，否则释放 block 的后续 step 永远无法发生。
         for req in list(self.queue.running_decode):
             if budget_batch <= 0 or budget_decode <= 0 or budget_tokens <= 0:
                 break
@@ -184,13 +210,20 @@ class Scheduler:
                 continue
             if not req.can_decode_more():
                 continue
+            need_blocks = 0
+            if self.kv_cache_manager is not None:
+                need_blocks = self.kv_cache_manager.needed_new_blocks(req, 1)
+                if need_blocks > budget_kv_blocks:
+                    continue
             plan.decode_requests.append(req)
             budget_batch -= 1   # 占一个 batch 槽位
             budget_decode -= 1  # 占一个 decode 槽位
             budget_tokens -= 1  # decode 每步消耗 1 个 token
+            budget_kv_blocks -= need_blocks
 
         # ---- 阶段 2：incremental prefill ----
-        # 处理已有部分 KV Cache 的请求，继续处理其剩余 prompt
+        # 处理已有部分 KV Cache 的请求，继续处理其剩余 prompt。
+        # 容量不足时保留在 running_prefill 队列中，下轮等其它请求释放 block 后再重试。
         for req in list(self.queue.running_prefill):
             if budget_batch <= 0 or budget_prefill <= 0 or budget_tokens <= 0:
                 break
@@ -201,16 +234,22 @@ class Scheduler:
             chunk = min(remain, self.prefill_chunk_size, budget_prefill, budget_tokens)
             if chunk <= 0:
                 continue
+            need_blocks = 0
+            if self.kv_cache_manager is not None:
+                need_blocks = self.kv_cache_manager.needed_new_blocks(req, chunk)
+                # prefill 需要遵守 decode 预留水位，避免 prefill 抢光 KV 导致全局卡死。
+                if need_blocks > budget_kv_blocks - kv_prefill_reserve:
+                    continue
             plan.incremental_prefill_requests.append(req)
             plan.prefill_chunks[req.request_id] = chunk
             budget_batch -= 1       # 占一个 batch 槽位
             budget_prefill -= chunk  # 消耗 chunk 大小的 prefill 预算
             budget_tokens -= chunk   # 消耗 chunk 大小的总 token 预算
+            budget_kv_blocks -= need_blocks
 
         # ---- 阶段 3：fresh prefill ----
-        # 从等待队列中取出新请求，首次开始 prefill
-        # 注意：fresh prefill 会改变请求状态（WAITING → RUNNING_PREFILL），
-        # 并将请求从 waiting 移到 running_prefill
+        # 从等待队列中取出新请求，首次开始 prefill。
+        # 容量不足时不要改变状态，也不要移出 waiting；这样就是非阻塞排队。
         for req in list(self.queue.waiting):
             if budget_batch <= 0 or budget_prefill <= 0 or budget_tokens <= 0:
                 break
@@ -220,6 +259,12 @@ class Scheduler:
             chunk = min(remain, self.prefill_chunk_size, budget_prefill, budget_tokens)
             if chunk <= 0:
                 continue
+            need_blocks = 0
+            if self.kv_cache_manager is not None:
+                need_blocks = self.kv_cache_manager.needed_new_blocks(req, chunk)
+                # prefill 需要遵守 decode 预留水位，避免 prefill 抢光 KV 导致全局卡死。
+                if need_blocks > budget_kv_blocks - kv_prefill_reserve:
+                    continue
             # 状态转换：WAITING → RUNNING_PREFILL，并移入 running_prefill 队列
             req.status = RequestStatus.RUNNING_PREFILL
             self.queue.remove_waiting(req)
@@ -230,6 +275,7 @@ class Scheduler:
             budget_batch -= 1
             budget_prefill -= chunk
             budget_tokens -= chunk
+            budget_kv_blocks -= need_blocks
 
         return plan
 

@@ -90,7 +90,10 @@ class Stage5Engine:
 
         # 请求队列：存储等待调度和正在执行的请求
         self.request_queue = RequestQueue()
-        # 调度器：决定每步哪些请求做 prefill、哪些做 decode
+        # Paged KV Cache 管理器：管理物理 block 的分配/释放和 block_table 映射
+        self.kv_cache_manager = model_runner.kv_cache_manager
+        # 调度器：决定每步哪些请求做 prefill、哪些做 decode；同时在调度前做 KV 容量预检查，
+        # 容量不足的请求留在队列中等待后续 step 重试，而不是让 _allocate_block 抛异常退出。
         self.scheduler = Scheduler(
             queue=self.request_queue,
             max_batch_size=engine_config.max_batch_size,
@@ -98,10 +101,9 @@ class Stage5Engine:
             max_prefill_tokens_per_step=engine_config.max_prefill_tokens_per_step,
             max_decode_requests_per_step=engine_config.max_decode_requests_per_step,
             prefill_chunk_size=engine_config.prefill_chunk_size,
+            kv_cache_manager=self.kv_cache_manager,
+            kv_decode_block_reserve=engine_config.kv_decode_block_reserve,
         )
-
-        # Paged KV Cache 管理器：管理物理 block 的分配/释放和 block_table 映射
-        self.kv_cache_manager = model_runner.kv_cache_manager
         # Attention 元数据构建器：为 batched 前向计算构造 attention mask、position ids 等
         self.metadata_builder = AttentionMetadataBuilder()
 
@@ -119,6 +121,11 @@ class Stage5Engine:
         self.requests_by_id: Dict[str, Request] = {}
         # 自增的请求编号，用于生成唯一 request_id
         self.next_request_idx = 0
+        # 连续无事件步数：用于 deadlock breaker（临时放宽 KV 预留水位）
+        self._no_progress_steps = 0
+        self._kv_reserve_relax_after_no_progress_steps = max(
+            1, int(engine_config.kv_reserve_relax_after_no_progress_steps)
+        )
 
     def _new_request_id(self) -> str:
         """生成唯一的请求 ID，格式为 req_0, req_1, req_2, ..."""
@@ -348,11 +355,17 @@ class Stage5Engine:
         这是 decode-first 策略：优先保证 decode 请求的延迟，
         因为 decode 每步只生成一个 token，延迟对用户体验影响大。
 
+        另外带一个轻量 deadlock breaker：如果连续多步没有任何进展事件，
+        就临时放宽一轮 prefill 的 KV 预留水位，尝试打破等待队列长期无进展。
+
         Returns:
             StepResult 包含本步的调度计划、事件列表和 KV Cache 状态
         """
         # 1. 调度：决定本步哪些请求做 decode、哪些做 fresh/incremental prefill
-        plan = self.scheduler.schedule_step()
+        relax_reserve = (
+            self._no_progress_steps >= self._kv_reserve_relax_after_no_progress_steps
+        )
+        plan = self.scheduler.schedule_step(relax_kv_reserve=relax_reserve)
         events: List[StepEvent] = []
 
         # 2. 执行 decode（优先级最高）
@@ -369,6 +382,12 @@ class Stage5Engine:
         if plan.fresh_prefill_requests:
             fresh_result = self.fresh_prefill_runner.run(plan)
             self._handle_prefill_result(fresh_result, events)
+
+        # 更新无进展计数器：有事件则归零，无事件则累加
+        if events:
+            self._no_progress_steps = 0
+        else:
+            self._no_progress_steps += 1
 
         return StepResult(
             step_id=plan.step_id,

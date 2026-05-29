@@ -32,9 +32,9 @@ def main():
         # 自动选择权重和计算 dtype：通常 GPU 上使用 fp16/bf16，CPU 上使用 fp32
         dtype="auto",
         # Paged KV Cache 的 block 大小：每个物理 block 能存 16 个 token 的 KV
-        block_size=16,
+        block_size=128,
         # GPU 上预分配的 KV Cache block 总数，总 token 容量 = num_gpu_blocks * block_size
-        num_gpu_blocks=32,
+        num_gpu_blocks=96,
         # 单轮 step 中最多参与计算的请求数（decode 请求 + prefill 请求总数）
         max_batch_size=8,
         # 单轮 step 最多处理的 token 总数：decode 每个请求算 1 个 token，prefill 按 chunk token 数计算
@@ -90,16 +90,28 @@ def main():
         tokenizer=tokenizer,
     )
 
-    rid1 = engine.add_request(
-        text="你好",
-        sampling_params=SamplingParams(temperature=0.7, top_k=20, top_p=0.9, repetition_penalty=1.2),
-        max_new_tokens=64,
-    )
-    rid2 = engine.add_request(
-        text="今天的星期几？",
-        sampling_params=SamplingParams(temperature=0.7, top_k=20, top_p=0.9, repetition_penalty=1.2),
-        max_new_tokens=64,
-    )
+    request_texts = [
+        "用300字给我介绍一些elasticsearch的原理和用途吧。",
+        "用300字给我介绍一下transformer中主流的kv驱逐策略吧，以及它们的优劣各是什么。",
+        "用300字解释一下大模型推理中的prefill和decode阶段分别在做什么。",
+        "用300字介绍一下PagedAttention的核心思想和它解决了什么问题。",
+        "用300字说明一下KV Cache为什么能加速大模型自回归生成。",
+        "用300字介绍一下RMSNorm和LayerNorm的区别。",
+        "用300字解释一下RoPE位置编码的基本原理。",
+        "用300字介绍一下GQA相比MHA的优势和代价。",
+        "用300字说明一下LLM服务中的continuous batching是什么。",
+        "用300字介绍一下top-k、top-p和temperature采样参数的作用。",
+    ]
+    sampling_params = SamplingParams(temperature=0.7, top_k=20, top_p=0.9, repetition_penalty=1.2)
+    request_ids = []
+    for text in request_texts:
+        request_ids.append(
+            engine.add_request(
+                text=text,
+                sampling_params=sampling_params,
+                max_new_tokens=512,
+            )
+        )
 
     step_results = engine.run_until_all_finished(max_steps=2000)
 
@@ -113,11 +125,9 @@ def main():
         print("kv_state:", s.kv_state)
 
     print("\n=== final outputs ===")
-    print("\nRID1 full:")
-    print(engine.get_full_text(rid1))
-
-    print("\nRID2 full:")
-    print(engine.get_full_text(rid2))
+    for idx, request_id in enumerate(request_ids, start=1):
+        print(f"\nRID{idx} full:")
+        print(engine.get_full_text(request_id))
 
 
 if __name__ == "__main__":

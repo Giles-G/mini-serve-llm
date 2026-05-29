@@ -22,7 +22,7 @@ import torch
 
 from miniservellm.config import EngineConfig, ModelConfig
 from miniservellm.cache.kv_cache import KVCacheManager
-from miniservellm.runtime.metadata import PrefillRequestMetadata, DecodeRequestMetadata
+from miniservellm.runtime.metadata import PrefillRequestMetadata, DecodeRequestMetadata, SlotRef
 from miniservellm.runtime.model_interface import PrefillModelOutput, DecodeModelOutput
 from miniservellm.runtime.nn_ops import (
     rms_norm,
@@ -32,6 +32,8 @@ from miniservellm.runtime.nn_ops import (
     repeat_kv,
     causal_attention_prefill,
     causal_attention_single_query,
+    gathered_paged_kv_decode_attention,
+    batched_causal_attention_prefill,
     linear,
 )
 from miniservellm.scheduler.request import Request
@@ -40,6 +42,58 @@ from miniservellm.scheduler.request import Request
 # ---------------------------------------------------------------------------
 # 通用权重数据结构
 # ---------------------------------------------------------------------------
+
+@dataclass
+class DecodeBatchGatherCtx:
+    """N 个 decode 请求一次 step 内的批量索引/位置/槽位上下文
+
+    跨 24 层共享（同一 batch 的 block_ids/offsets/context_lens/positions/write_slots
+    在所有层都一样），避免每层重复构造同样的 LongTensor。
+    """
+    positions: torch.Tensor          # [N]   每个请求的 query_position
+    write_slots: List["SlotRef"]     # 长度 N，写入新 KV 的目标 slot
+    write_block_ids: torch.Tensor    # [N]  写入用 block_id（slot_refs 预计算）
+    write_block_offsets: torch.Tensor  # [N]  写入用块内偏移
+    block_ids: torch.Tensor          # [N, max_ctx]  gather 用 block id
+    block_offsets: torch.Tensor      # [N, max_ctx]  gather 用块内偏移
+    context_lens_tensor: torch.Tensor  # [N]  真实 context_len（attention mask 用）
+
+
+@dataclass
+class PrefillBatchCtx:
+    """N 个 prefill 请求一次 step 内的批量上下文（跨层共享）
+
+    Attributes:
+        positions: 拼接后所有 chunk token 的全局位置 [sum_T]（RoPE 用）
+        write_slots: 拼接后所有 token 的写入 slot 列表，长度 sum_T
+        write_block_ids: [sum_T]  写入用 block_id（slot_refs 预计算）
+        write_block_offsets: [sum_T]  写入用块内偏移
+        chunk_lens: [N]  每请求 chunk 真实长度
+        history_lens: [N]  每请求 chunk 之前的历史长度
+        chunk_offsets: [N+1]  每请求 chunk 在 [sum_T] 中的起止偏移
+        max_chunk_len: 本批次最大 chunk 长度
+        max_kv_len: 本批次最大 (history + chunk) 长度
+        block_ids: [N, max_kv_len]  KV gather 用
+        block_offsets: [N, max_kv_len]
+        last_token_indices: [N]  每请求 chunk 最后一个 token 在 [sum_T] 中的索引（取 logits 用）
+        pad_row: [sum_T]  q [sum_T,...] → q_padded [N, T_max,...] 时每个 flat token 的请求 idx
+        pad_col: [sum_T]  对应的 chunk 内位置
+    """
+    positions: torch.Tensor
+    write_slots: List["SlotRef"]
+    write_block_ids: torch.Tensor
+    write_block_offsets: torch.Tensor
+    chunk_lens: torch.Tensor
+    history_lens: torch.Tensor
+    chunk_offsets: List[int]
+    max_chunk_len: int
+    max_kv_len: int
+    block_ids: torch.Tensor
+    block_offsets: torch.Tensor
+    last_token_indices: torch.Tensor
+    pad_row: torch.Tensor
+    pad_col: torch.Tensor
+
 
 @dataclass
 class TransformerLayerWeights:
@@ -323,6 +377,86 @@ class TransformerBlockRunner:
         act = silu_and_mul(gate, up)
         return linear(act, self.weights.down_proj)
 
+    def forward_prefill_batch(
+        self,
+        hidden_states: torch.Tensor,
+        ctx: "PrefillBatchCtx",
+    ) -> torch.Tensor:
+        """N 个 prefill 请求的批量前向（一次过一层）
+
+        所有 token 算子（rms_norm/QKV/RoPE/KV 写/O_proj/MLP）在 [sum_T, hidden] 上一次做完。
+        Attention 走 batched_causal_attention_prefill：
+        - Q 按请求 pad 到 [N, max_chunk_len, H_q, D]
+        - K/V 一次 advanced indexing 拿到 padded [N, max_kv_len, H_kv, D]
+        - block-diagonal causal mask 同时屏蔽跨请求注意和未来 token
+
+        Args:
+            hidden_states: 拼接后的隐藏状态 [sum_T, hidden_size]
+            ctx: 跨层共享的批量上下文
+
+        Returns:
+            本层输出 [sum_T, hidden_size]
+        """
+        # ---- Attention 子层 ----
+        residual = hidden_states
+        x = rms_norm(hidden_states, self.weights.input_layernorm, self.model_config.rms_norm_eps)
+
+        # 批量 QKV：[sum_T, hidden] → q [sum_T, H_q, D], k/v [sum_T, H_kv, D]
+        q, k_new, v_new = self._project_qkv(x)
+        # 批量 RoPE
+        q, k_new = apply_rope(q, k_new, ctx.positions, self.rope_cos, self.rope_sin)
+
+        # 批量 KV 写入（先写后读：写完 chunk KV 再 gather full = history + chunk）
+        self.kv_cache_manager.write_kv_for_tokens_indexed(
+            layer_idx=self.layer_idx,
+            block_ids=ctx.write_block_ids,
+            block_offsets=ctx.write_block_offsets,
+            k_values=k_new,
+            v_values=v_new,
+        )
+
+        # 批量 KV gather：[N, max_kv_len, H_kv, D]
+        k_padded = self.kv_cache_manager.k_cache[
+            self.layer_idx, ctx.block_ids, ctx.block_offsets
+        ]
+        v_padded = self.kv_cache_manager.v_cache[
+            self.layer_idx, ctx.block_ids, ctx.block_offsets
+        ]
+
+        # 把 q [sum_T, H_q, D] pack 成 [N, max_chunk_len, H_q, D]
+        # 用预计算的 (pad_row, pad_col) 索引一次散列写入，避免 Python for 循环
+        N = ctx.chunk_lens.shape[0]
+        T_max = ctx.max_chunk_len
+        H_q, D = q.shape[1], q.shape[2]
+        q_padded = torch.zeros(
+            (N, T_max, H_q, D), device=q.device, dtype=q.dtype,
+        )
+        q_padded[ctx.pad_row, ctx.pad_col] = q
+
+        # 批量 attention
+        attn_padded = batched_causal_attention_prefill(
+            q_padded=q_padded,
+            k_padded=k_padded,
+            v_padded=v_padded,
+            chunk_lens=ctx.chunk_lens,
+            history_lens=ctx.history_lens,
+            num_q_heads=self.num_q_heads,
+        )  # [N, max_chunk_len, H_q, D]
+
+        # Unpack 回 [sum_T, H_q, D]：advanced indexing 一次拿到
+        attn_flat = attn_padded[ctx.pad_row, ctx.pad_col]
+
+        # O 投影 + 残差
+        attn_out = attn_flat.reshape(-1, self.hidden_size)
+        attn_out = linear(attn_out, self.weights.o_proj, self.weights.o_proj_bias)
+        hidden_states = residual + attn_out
+
+        # ---- MLP 子层 ----
+        residual = hidden_states
+        x = rms_norm(hidden_states, self.weights.post_attention_layernorm, self.model_config.rms_norm_eps)
+        hidden_states = residual + self._mlp(x)
+        return hidden_states
+
     def forward_prefill_one(self, hidden_states: torch.Tensor, meta: PrefillRequestMetadata, req: Request):
         """单个请求的 prefill 前向（处理一个 chunk）
 
@@ -352,6 +486,95 @@ class TransformerBlockRunner:
         hidden_states = residual + self._attention_prefill(x, meta, req)
 
         # MLP 子层
+        residual = hidden_states
+        x = rms_norm(hidden_states, self.weights.post_attention_layernorm, self.model_config.rms_norm_eps)
+        hidden_states = residual + self._mlp(x)
+        return hidden_states
+
+    def forward_decode_batch(
+        self,
+        hidden_states: torch.Tensor,
+        metas: List[DecodeRequestMetadata],
+        reqs: List[Request],
+        gather_ctx: Optional["DecodeBatchGatherCtx"] = None,
+    ) -> torch.Tensor:
+        """N 个 decode 请求的批量前向（每个请求 1 个 query token）
+
+        所有按 token 的算子（rms_norm/QKV/RoPE/KV 写入/O_proj/MLP/残差）都在
+        [N, hidden] 上一次完成。Attention 走 gathered_paged_kv_decode_attention：
+        - 一次性 gather（advanced indexing）把 paged 物理 block 物化成
+          [N, max_ctx, kv_heads, D] 的 padded 稠密 KV
+        - 在 padded 张量上做常规 batched matmul + mask（不是 vLLM 那种
+          paged kernel；那是 stage 8 用 CUDA 写的事）
+        - 用 GQA 分组而非物化 repeat_kv
+        - 用 context_lens mask 屏蔽 padding 位
+
+        gather_ctx 可由调用方预先构造（同一 batch 的 N 个请求 N 层共享），避免
+        每层重复构造索引张量。
+        """
+        n = hidden_states.shape[0]
+
+        # ---- Attention 子层 ----
+        residual = hidden_states
+        x = rms_norm(hidden_states, self.weights.input_layernorm, self.model_config.rms_norm_eps)
+
+        # 批量 QKV：把 [N, hidden] 视作 seq_len=N 的输入
+        q, k_new, v_new = self._project_qkv(x)
+
+        # 批量 RoPE（每请求 query_position 不同）
+        positions = (
+            gather_ctx.positions if gather_ctx is not None
+            else torch.tensor(
+                [m.query_position for m in metas], device=x.device, dtype=torch.long
+            )
+        )
+        q, k_new = apply_rope(q, k_new, positions, self.rope_cos, self.rope_sin)
+
+        # 批量 KV 写入：N 个 token → 各自的 write_slot
+        if gather_ctx is not None:
+            self.kv_cache_manager.write_kv_for_tokens_indexed(
+                layer_idx=self.layer_idx,
+                block_ids=gather_ctx.write_block_ids,
+                block_offsets=gather_ctx.write_block_offsets,
+                k_values=k_new,
+                v_values=v_new,
+            )
+        else:
+            self.kv_cache_manager.write_kv_for_tokens_batch(
+                layer_idx=self.layer_idx,
+                slot_refs=[m.write_slot for m in metas],
+                k_values=k_new,
+                v_values=v_new,
+            )
+
+        # 批量 paged-attention：一次 gather + 一次 batched matmul
+        if gather_ctx is not None:
+            # 复用预构造的 block_ids/offsets，仅做 advanced indexing
+            k_padded = self.kv_cache_manager.k_cache[
+                self.layer_idx, gather_ctx.block_ids, gather_ctx.block_offsets
+            ]
+            v_padded = self.kv_cache_manager.v_cache[
+                self.layer_idx, gather_ctx.block_ids, gather_ctx.block_offsets
+            ]
+            ctx_lens_t = gather_ctx.context_lens_tensor
+        else:
+            k_padded, v_padded, ctx_lens_t = self.kv_cache_manager.gather_kv_decode_batch(
+                layer_idx=self.layer_idx,
+                reqs=reqs,
+                context_lens=[m.context_len for m in metas],
+            )
+        attn_out = gathered_paged_kv_decode_attention(
+            q=q,
+            k_padded=k_padded,
+            v_padded=v_padded,
+            context_lens=ctx_lens_t,
+            num_q_heads=self.num_q_heads,
+        )  # [N, num_q_heads, head_dim]
+        attn_out = attn_out.reshape(n, self.hidden_size)
+        attn_out = linear(attn_out, self.weights.o_proj, self.weights.o_proj_bias)
+        hidden_states = residual + attn_out
+
+        # ---- MLP 子层 ----
         residual = hidden_states
         x = rms_norm(hidden_states, self.weights.post_attention_layernorm, self.model_config.rms_norm_eps)
         hidden_states = residual + self._mlp(x)
@@ -487,39 +710,119 @@ class TransformerModelRunner:
         x = rms_norm(hidden_states, self.weights.final_norm, self.model_config.rms_norm_eps)
         return linear(x, self.weights.lm_head)
 
+    def _build_prefill_batch_ctx(
+        self,
+        requests: List[Request],
+        metas: List[PrefillRequestMetadata],
+    ) -> "PrefillBatchCtx":
+        """为一批 prefill 请求构造跨层共享的批量上下文。
+
+        约定：调用前 metas 中的 chunk_token_ids 都已通过 ensure_slots_for_request
+        分配好 write_slots（runner 路径已经做这件事），所以 cache 里历史 KV 完整、
+        新 chunk 的 slot 也已经预留。
+        """
+        device = self._device
+        chunk_lens_list = [len(m.chunk_token_ids) for m in metas]
+        history_lens_list = [m.context_len_before_chunk for m in metas]
+        # KV 总长 = history + chunk
+        total_kv_lens = [h + t for h, t in zip(history_lens_list, chunk_lens_list)]
+
+        # 拼接所有 token 的位置和 write_slots
+        positions_flat: List[int] = []
+        write_slots_flat: List[SlotRef] = []
+        chunk_offsets: List[int] = [0]
+        pad_row_list: List[int] = []
+        pad_col_list: List[int] = []
+        for i, m in enumerate(metas):
+            positions_flat.extend(m.positions)
+            write_slots_flat.extend(m.write_slots)
+            t = len(m.chunk_token_ids)
+            chunk_offsets.append(chunk_offsets[-1] + t)
+            pad_row_list.extend([i] * t)
+            pad_col_list.extend(range(t))
+
+        positions = torch.tensor(positions_flat, device=device, dtype=torch.long)
+        chunk_lens = torch.tensor(chunk_lens_list, device=device, dtype=torch.long)
+        history_lens = torch.tensor(history_lens_list, device=device, dtype=torch.long)
+        max_chunk_len = max(chunk_lens_list) if chunk_lens_list else 0
+        max_kv_len = max(total_kv_lens) if total_kv_lens else 0
+
+        # 复用 KV gather 索引构造（按 total_kv_lens 当 context_len）
+        block_ids, block_offsets = self.kv_cache_manager.build_decode_batch_indices(
+            requests, total_kv_lens,
+        )
+
+        # 写入 slot 的 (block_ids, block_offsets) 一次性算出，跨层复用
+        write_block_ids, write_block_offsets = self.kv_cache_manager.slot_refs_to_indices(
+            write_slots_flat,
+        )
+
+        # 每请求 chunk 最后一个 token 在拼接序列中的索引
+        last_idx_list = [chunk_offsets[i + 1] - 1 for i in range(len(metas))]
+        last_token_indices = torch.tensor(last_idx_list, device=device, dtype=torch.long)
+
+        # pad_row / pad_col：把 q [sum_T] 散列写入 q_padded [N, T_max] 用
+        pad_row = torch.tensor(pad_row_list, device=device, dtype=torch.long)
+        pad_col = torch.tensor(pad_col_list, device=device, dtype=torch.long)
+
+        return PrefillBatchCtx(
+            positions=positions,
+            write_slots=write_slots_flat,
+            write_block_ids=write_block_ids,
+            write_block_offsets=write_block_offsets,
+            chunk_lens=chunk_lens,
+            history_lens=history_lens,
+            chunk_offsets=chunk_offsets,
+            max_chunk_len=max_chunk_len,
+            max_kv_len=max_kv_len,
+            block_ids=block_ids,
+            block_offsets=block_offsets,
+            last_token_indices=last_token_indices,
+            pad_row=pad_row,
+            pad_col=pad_col,
+        )
+
     def _forward_prefill_impl(
         self,
         requests: List[Request],
         metas: List[PrefillRequestMetadata],
     ) -> PrefillModelOutput:
-        """Prefill 前向的统一实现（fresh 和 incremental 共用）
+        """Prefill 前向（批量）：N 个请求的 chunk 拼成一条长序列一次跑完
 
-        逐请求处理（非 batched），每个请求独立计算前向。
-        取每个请求最后一个 token 的 logits 用于采样下一个 token。
-
-        Args:
-            requests: 请求列表
-            metas: 对应的 prefill 元数据列表
-
-        Returns:
-            PrefillModelOutput: request_id → logits[-1] 的映射
-                logits[-1] 是 chunk 最后一个 token 的预测，用于采样下一个生成 token
+        - 所有 chunk token 拼接为 [sum_T, hidden]，一次 embed
+        - 每层走 forward_prefill_batch（block-diagonal causal mask 处理跨请求隔离）
+        - 最后只取每请求 chunk 末尾 token 的 logits（用于采样下一个 token）
         """
-        logits_by_request: Dict[str, torch.Tensor] = {}
-        for req, meta in zip(requests, metas):
-            if not meta.chunk_token_ids:
-                continue
-            # Token Embedding
-            input_ids = torch.tensor(meta.chunk_token_ids, device=self._device, dtype=torch.long)
-            hidden_states = self._embed(input_ids)
-            # 逐层前向：每一层都会将 K/V 写入 Paged KV Cache
-            for block in self.blocks:
-                hidden_states = block.forward_prefill_one(hidden_states, meta, req)
-            # 最终投影到词表
-            logits = self._project_logits(hidden_states)
-            # 只取最后一个 token 的 logits：因为自回归模型中，位置 t 的输出预测 t+1 的 token
-            logits_by_request[req.request_id] = logits[-1]
-        return PrefillModelOutput(logits_by_request=logits_by_request)
+        # 过滤掉 chunk 为空的请求（理论上 scheduler 不会发空 chunk，但保险起见）
+        nonempty = [(req, m) for req, m in zip(requests, metas) if m.chunk_token_ids]
+        if not nonempty:
+            return PrefillModelOutput(logits_by_request={})
+        active_reqs = [x[0] for x in nonempty]
+        active_metas = [x[1] for x in nonempty]
+
+        # 拼接 token ids → 一次 embed
+        flat_token_ids: List[int] = []
+        for m in active_metas:
+            flat_token_ids.extend(m.chunk_token_ids)
+        input_ids = torch.tensor(flat_token_ids, device=self._device, dtype=torch.long)
+        hidden_states = self._embed(input_ids)  # [sum_T, hidden]
+
+        # 构造跨层共享上下文
+        ctx = self._build_prefill_batch_ctx(active_reqs, active_metas)
+
+        # 逐层批量前向
+        for block in self.blocks:
+            hidden_states = block.forward_prefill_batch(hidden_states, ctx)
+
+        # 一次 logits 投影；按 last_token_indices 选每请求最后一个 token 的 logits
+        logits_full = self._project_logits(hidden_states)  # [sum_T, vocab]
+        last_logits = logits_full.index_select(0, ctx.last_token_indices)  # [N, vocab]
+
+        return PrefillModelOutput(
+            logits_by_request={
+                req.request_id: last_logits[i] for i, req in enumerate(active_reqs)
+            }
+        )
 
     def forward_fresh_prefill(
         self,
@@ -564,28 +867,61 @@ class TransformerModelRunner:
         requests: List[Request],
         metas: List[DecodeRequestMetadata],
     ) -> DecodeModelOutput:
-        """Decode 前向（每个请求生成 1 个 token）
+        """Decode 前向（批量：N 个请求并行生成 1 个 token）
 
-        逐请求处理。每个请求输入上一步采样的 token ID，
-        经过所有层后投影为 logits，用于采样下一个 token。
+        将 N 个请求的 input_token_id 堆叠成 [N] 一次 embed 得到 [N, hidden]，
+        再依次过每一层的 forward_decode_batch，最后批量 logits 投影。
+        相比逐请求循环：
+        - Embed/Norm/QKV/MLP/O_proj/lm_head 都从 N 次 kernel 启动降为 1 次
+        - KV 写入从 N 次 advanced indexing 合为 1 次
+        - 仅 attention 仍按请求循环（context_len 不同，先不做 paged-attention）
 
         Args:
             requests: 请求列表
-            metas: decode 元数据列表（包含 input_token_id、query_position 等）
+            metas: decode 元数据列表（输入 token、query_position 等）
 
         Returns:
-            DecodeModelOutput: request_id → logits[0] 的映射
+            DecodeModelOutput: request_id → logits[i] 的映射
         """
-        logits_by_request: Dict[str, torch.Tensor] = {}
-        for req, meta in zip(requests, metas):
-            # 输入为单个 token（上一步采样的结果）
-            input_ids = torch.tensor([meta.input_token_id], device=self._device, dtype=torch.long)
-            hidden_state = self._embed(input_ids)
-            # 逐层前向：每层将新 K/V 写入 Paged KV Cache，并读取全部历史 KV
-            for block in self.blocks:
-                hidden_state = block.forward_decode_one(hidden_state, meta, req)
-            # 最终投影到词表
-            logits = self._project_logits(hidden_state)
-            # decode 只有 1 个 token，取 logits[0]
-            logits_by_request[req.request_id] = logits[0]
-        return DecodeModelOutput(logits_by_request=logits_by_request)
+        if not requests:
+            return DecodeModelOutput(logits_by_request={})
+
+        # 批量 embed：[N] → [N, hidden_size]
+        input_ids = torch.tensor(
+            [m.input_token_id for m in metas], device=self._device, dtype=torch.long
+        )
+        hidden_states = self._embed(input_ids)
+
+        # 一次性构造跨层共享的批量上下文（block_ids / offsets / positions / context_lens）
+        positions = torch.tensor(
+            [m.query_position for m in metas], device=self._device, dtype=torch.long
+        )
+        ctx_lens_list = [m.context_len for m in metas]
+        block_ids, block_offsets = self.kv_cache_manager.build_decode_batch_indices(
+            requests, ctx_lens_list,
+        )
+        context_lens_tensor = torch.tensor(ctx_lens_list, device=self._device, dtype=torch.long)
+        write_slots = [m.write_slot for m in metas]
+        write_block_ids, write_block_offsets = self.kv_cache_manager.slot_refs_to_indices(
+            write_slots,
+        )
+        gather_ctx = DecodeBatchGatherCtx(
+            positions=positions,
+            write_slots=write_slots,
+            write_block_ids=write_block_ids,
+            write_block_offsets=write_block_offsets,
+            block_ids=block_ids,
+            block_offsets=block_offsets,
+            context_lens_tensor=context_lens_tensor,
+        )
+
+        # 逐层批量前向（复用 gather_ctx，避免每层重复构造）
+        for block in self.blocks:
+            hidden_states = block.forward_decode_batch(hidden_states, metas, requests, gather_ctx)
+
+        # 批量 logits 投影：[N, hidden] → [N, vocab_size]
+        logits = self._project_logits(hidden_states)
+
+        return DecodeModelOutput(
+            logits_by_request={req.request_id: logits[i] for i, req in enumerate(requests)}
+        )

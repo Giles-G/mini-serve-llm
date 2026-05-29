@@ -132,10 +132,36 @@ class KVCacheManager:
 
         Raises:
             RuntimeError: 没有空闲 block 可分配（KV Cache 容量不足）
+
+        注意：正常服务路径不应该依赖这里抛异常来做流控。
+        Scheduler 会先调用 can_allocate_slots() 做容量预检查；这里的异常只是
+        防止调用方绕过调度器导致 KV Cache 状态损坏的最后防线。
         """
         if not self.free_block_ids:
             raise RuntimeError("Out of KV cache blocks.")
         return self.free_block_ids.pop()
+
+    def num_free_blocks(self) -> int:
+        """返回当前空闲物理 block 数。"""
+        return len(self.free_block_ids)
+
+    def needed_new_blocks(self, req: Request, num_new_tokens: int) -> int:
+        """计算为 req 追加 num_new_tokens 个 slot 还需要新分配多少个 block。
+
+        只做纯计算，不修改 block_table / total_slots_reserved / free_block_ids。
+        Scheduler 用它在生成执行计划前做容量预检查，避免运行到一半才发现KV block 不够然后直接抛异常退出。
+        """
+        if num_new_tokens <= 0:
+            return 0
+        block_size = self.engine_config.block_size
+        table = self.req_block_tables.get(req.request_id, req.block_table)
+        needed_total_slots = req.total_slots_reserved + num_new_tokens
+        needed_total_blocks = (needed_total_slots + block_size - 1) // block_size
+        return max(0, needed_total_blocks - len(table))
+
+    def can_allocate_slots(self, req: Request, num_new_tokens: int) -> bool:
+        """判断当前空闲 block 是否足够为 req 追加 num_new_tokens 个 slot。"""
+        return self.needed_new_blocks(req, num_new_tokens) <= self.num_free_blocks()
 
     def _ensure_block_table(self, req: Request) -> List[int]:
         """确保请求在 req_block_tables 中有 block_table 缓存
@@ -224,23 +250,17 @@ class KVCacheManager:
         k_values: torch.Tensor,
         v_values: torch.Tensor,
     ) -> None:
-        """将计算出的 K/V 值写入物理 KV Cache
+        """将计算出的 K/V 值写入物理 KV Cache（向量化版本）
 
-        在 Transformer 每一层的前向中调用，将新 token 的 K/V 写入对应的物理 slot。
-        写入位置由 ensure_slots_for_request() 返回的 SlotRef 指定。
+        将一批 token 的 K/V 一次性写入指定的物理 slot，避免 Python for-loop 调度开销。
 
-        写入过程（对每个 token）：
-            k_cache[layer_idx, slot.block_id, slot.block_offset] = k_values[i]
-            v_cache[layer_idx, slot.block_id, slot.block_offset] = v_values[i]
+        写入过程（向量化等价于）：
+            for i, slot in enumerate(slot_refs):
+                k_cache[layer_idx, slot.block_id, slot.block_offset] = k_values[i]
+                v_cache[layer_idx, slot.block_id, slot.block_offset] = v_values[i]
 
-        使用示例：
-            # 在 TransformerBlockRunner._attention_prefill() 中
-            self.kv_cache_manager.write_kv_for_tokens(
-                layer_idx=self.layer_idx,
-                slot_refs=meta.write_slots,
-                k_values=k_new,   # [chunk_len, n_kv_heads, head_dim]
-                v_values=v_new,   # [chunk_len, n_kv_heads, head_dim]
-            )
+        实现：先把 (block_id, block_offset) 提取成两个 LongTensor，
+        通过 advanced indexing 一次完成 N 个 token 的散列写入。
 
         Args:
             layer_idx: Transformer 层编号（0 ~ n_layers-1）
@@ -249,9 +269,150 @@ class KVCacheManager:
             v_values: Value 值 [T, n_kv_heads, head_dim]
         """
         assert len(slot_refs) == k_values.shape[0] == v_values.shape[0]
-        for i, slot in enumerate(slot_refs):
-            self.k_cache[layer_idx, slot.block_id, slot.block_offset].copy_(k_values[i])
-            self.v_cache[layer_idx, slot.block_id, slot.block_offset].copy_(v_values[i])
+        if len(slot_refs) == 0:
+            return
+        device = self.engine_config.device
+        block_ids = torch.tensor(
+            [s.block_id for s in slot_refs], device=device, dtype=torch.long
+        )
+        block_offsets = torch.tensor(
+            [s.block_offset for s in slot_refs], device=device, dtype=torch.long
+        )
+        # 一次性 advanced indexing 写入：避免 N 次 kernel launch
+        self.k_cache[layer_idx, block_ids, block_offsets] = k_values
+        self.v_cache[layer_idx, block_ids, block_offsets] = v_values
+
+    def write_kv_for_tokens_batch(
+        self,
+        layer_idx: int,
+        slot_refs: List[SlotRef],
+        k_values: torch.Tensor,
+        v_values: torch.Tensor,
+    ) -> None:
+        """语义同 write_kv_for_tokens，专门用于 batch decode/prefill 的 N 个 token 一起写
+
+        与 write_kv_for_tokens 实现相同（已经是向量化的），保留单独命名以便上层语义清晰。
+        """
+        self.write_kv_for_tokens(layer_idx, slot_refs, k_values, v_values)
+
+    def slot_refs_to_indices(
+        self,
+        slot_refs: List[SlotRef],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """将 SlotRef 列表转换为 (block_ids, block_offsets) 两个 LongTensor。
+
+        用于跨层共享：上层在一个 step 中构造一次后传入 write_kv_for_tokens_indexed，
+        避免每层重复构造同样的 host→device 张量（24 层 × 2 = 48 次）。
+        """
+        device = self.engine_config.device
+        if not slot_refs:
+            empty = torch.zeros(0, device=device, dtype=torch.long)
+            return empty, empty
+        block_ids = torch.tensor(
+            [s.block_id for s in slot_refs], device=device, dtype=torch.long
+        )
+        block_offsets = torch.tensor(
+            [s.block_offset for s in slot_refs], device=device, dtype=torch.long
+        )
+        return block_ids, block_offsets
+
+    def write_kv_for_tokens_indexed(
+        self,
+        layer_idx: int,
+        block_ids: torch.Tensor,
+        block_offsets: torch.Tensor,
+        k_values: torch.Tensor,
+        v_values: torch.Tensor,
+    ) -> None:
+        """使用预计算的 (block_ids, block_offsets) 写入 KV，避免每层重建索引张量。"""
+        if k_values.shape[0] == 0:
+            return
+        self.k_cache[layer_idx, block_ids, block_offsets] = k_values
+        self.v_cache[layer_idx, block_ids, block_offsets] = v_values
+
+    def build_decode_batch_indices(
+        self,
+        reqs: List[Request],
+        context_lens: List[int],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """为 N 个 decode 请求构造批量 KV gather 用的索引张量
+
+        返回：
+          - block_ids_padded: [N, max_ctx]  每个 token 的物理 block id（无效位补 0）
+          - block_offsets:    [N, max_ctx]  每个 token 的块内偏移
+
+        无效位（pos >= context_len[i]）填 (0, 0)，对应一个合法但内容无关的位置；
+        attention 计算时会通过 context_lens mask 屏蔽这些位置。
+
+        Args:
+            reqs: 长度 N 的请求列表
+            context_lens: 长度 N 的真实上下文长度列表
+
+        Returns:
+            (block_ids_padded, block_offsets) 两个 LongTensor
+        """
+        N = len(reqs)
+        max_ctx = max(context_lens) if context_lens else 0
+        device = self.engine_config.device
+        block_size = self.engine_config.block_size
+
+        if max_ctx == 0:
+            empty = torch.zeros((N, 0), device=device, dtype=torch.long)
+            return empty, empty
+
+        # 每行 [0, 1, ..., max_ctx-1]
+        pos_grid = torch.arange(max_ctx, device=device, dtype=torch.long)
+        pos_grid = pos_grid.unsqueeze(0).expand(N, max_ctx)              # [N, max_ctx]
+        block_idx = pos_grid // block_size                                # [N, max_ctx]
+        block_offsets = pos_grid % block_size                             # [N, max_ctx]
+
+        # 构造 padding 后的 block_table: [N, max_blocks]，无效位填 0
+        max_blocks = (max_ctx + block_size - 1) // block_size
+        block_table_padded = torch.zeros((N, max_blocks), device=device, dtype=torch.long)
+        for i, req in enumerate(reqs):
+            table = self.req_block_tables.get(req.request_id, req.block_table)
+            if table:
+                t = torch.tensor(table[:max_blocks], device=device, dtype=torch.long)
+                block_table_padded[i, : t.shape[0]] = t
+
+        # 用 block_idx 在 block_table_padded 上 gather 得到物理 block_id
+        # block_idx 在无效位也会取到 (max_blocks-1) 之前的某个值，但因为 block_table_padded
+        # 末尾填 0，且无效位会被 attention mask 屏蔽，所以即便取到 0 号 block 也无害。
+        # 但为了安全，clamp 到 max_blocks-1
+        block_idx_safe = block_idx.clamp(max=max_blocks - 1)
+        block_ids_padded = torch.gather(block_table_padded, 1, block_idx_safe)  # [N, max_ctx]
+
+        return block_ids_padded, block_offsets
+
+    def gather_kv_decode_batch(
+        self,
+        layer_idx: int,
+        reqs: List[Request],
+        context_lens: List[int],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """N 个 decode 请求一次性批量 gather padded KV。
+
+        把每请求的 paged 物理 block（按 block_table 离散存放）通过一次
+        advanced indexing **物化** 成 [N, max_ctx, kv_heads, head_dim] 的
+        padded 稠密张量，供上层走常规 batched attention。
+
+        注意：这一步等价于「把 paged 存储 flatten 回连续布局」，并不是
+        vLLM 风格的 paged-attention kernel（那种 kernel 不会物化、直接
+        在 attention 内沿 block 跳读）。本实现是 stage 6 纯 Python/PyTorch
+        路线下的折中：存储侧 paged，计算侧 gather → padded → batched matmul。
+
+        Returns:
+            k_padded: [N, max_ctx, kv_heads, head_dim]
+            v_padded: [N, max_ctx, kv_heads, head_dim]
+            ctx_lens_t: [N] long，真实上下文长度（供 attention mask 用）
+        """
+        device = self.engine_config.device
+        ctx_lens_t = torch.tensor(context_lens, device=device, dtype=torch.long)
+        block_ids, block_offsets = self.build_decode_batch_indices(reqs, context_lens)
+        # advanced indexing 一次拿到 [N, max_ctx, kv_heads, head_dim]
+        k_padded = self.k_cache[layer_idx, block_ids, block_offsets]
+        v_padded = self.v_cache[layer_idx, block_ids, block_offsets]
+        return k_padded, v_padded, ctx_lens_t
 
     def gather_kv_for_request(
         self,
@@ -309,18 +470,19 @@ class KVCacheManager:
             empty = torch.empty((0, kv_heads, head_dim), device=device, dtype=dtype)
             return empty, empty
 
-        # 逐 token 读取：逻辑位置 → 查 block_table → 读取物理 block 中的数据
-        k_list = []
-        v_list = []
-        for logical_pos in range(upto_logical_length):
-            block_idx = logical_pos // block_size
-            block_offset = logical_pos % block_size
-            block_id = table[block_idx]
-            k_list.append(self.k_cache[layer_idx, block_id, block_offset])
-            v_list.append(self.v_cache[layer_idx, block_id, block_offset])
+        # 向量化读取：一次性算出每个 logical_pos 对应的物理 (block_id, block_offset)，
+        # 通过 advanced indexing 一次拿到全部 KV，避免 Python for-loop。
+        logical_positions = torch.arange(upto_logical_length, device=device, dtype=torch.long)
+        block_idx = logical_positions // block_size           # [L]
+        block_offsets = logical_positions % block_size        # [L]
+        # block_table 转 tensor 后用 logical block_idx 查表得到物理 block_id
+        block_table_tensor = torch.tensor(table, device=device, dtype=torch.long)
+        block_ids = block_table_tensor[block_idx]             # [L]
 
-        # stack 成连续 tensor: [upto_logical_length, n_kv_heads, head_dim]
-        return torch.stack(k_list, dim=0), torch.stack(v_list, dim=0)
+        # 一次 advanced indexing 拿到 [L, n_kv_heads, head_dim]
+        k = self.k_cache[layer_idx, block_ids, block_offsets]
+        v = self.v_cache[layer_idx, block_ids, block_offsets]
+        return k, v
 
     def free_request(self, req: Request) -> None:
         """释放请求占用的所有 KV Cache block

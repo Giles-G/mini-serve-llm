@@ -50,6 +50,8 @@ class EngineConfig:
         default_temperature: 默认采样温度
         default_top_k: 默认 top-k
         default_top_p: 默认 top-p
+        kv_decode_block_reserve: 调度时为 decode 预留的最少空闲 block 数
+        kv_reserve_relax_after_no_progress_steps: 连续无进展多少步后放宽一次水位
         eos_token_id: EOS token id
     """
 
@@ -68,6 +70,8 @@ class EngineConfig:
     default_temperature: float = 0.8
     default_top_k: int = 50
     default_top_p: float = 0.95
+    kv_decode_block_reserve: int = 2
+    kv_reserve_relax_after_no_progress_steps: int = 8
     eos_token_id: Optional[int] = None
 
     @staticmethod
@@ -84,6 +88,8 @@ class EngineConfig:
         default_temperature: float = 0.8,
         default_top_k: int = 50,
         default_top_p: float = 0.95,
+        kv_decode_block_reserve: int = 2,
+        kv_reserve_relax_after_no_progress_steps: int = 8,
         eos_token_id: Optional[int] = None,
     ) -> "EngineConfig":
         if device == "auto":
@@ -115,6 +121,8 @@ class EngineConfig:
             default_temperature=default_temperature,
             default_top_k=default_top_k,
             default_top_p=default_top_p,
+            kv_decode_block_reserve=kv_decode_block_reserve,
+            kv_reserve_relax_after_no_progress_steps=kv_reserve_relax_after_no_progress_steps,
             eos_token_id=eos_token_id,
         )
 
