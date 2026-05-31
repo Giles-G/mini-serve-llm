@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -17,10 +18,15 @@ import torch.nn.functional as F
 # --------------------------------------------------------------------------- #
 # Stage 8: 自定义 CUDA kernel（可选）
 # 在有编译好的 mini_llm_kernels 扩展时启用，否则退回纯 PyTorch 实现。
+# 设置环境变量 MINI_LLM_NO_CUSTOM_KERNELS=1 可在运行时强制关闭，
+# 用于 A/B 性能对比或 fallback 路径验证。
 # --------------------------------------------------------------------------- #
 try:
     import mini_llm_kernels as _mkl
-    _HAS_CUSTOM_KERNELS: bool = _mkl._HAS_CUDA_OPS
+    _HAS_CUSTOM_KERNELS: bool = (
+        _mkl._HAS_CUDA_OPS
+        and os.environ.get("MINI_LLM_NO_CUSTOM_KERNELS", "0") != "1"
+    )
 except ImportError:
     _mkl = None  # type: ignore[assignment]
     _HAS_CUSTOM_KERNELS: bool = False

@@ -53,7 +53,15 @@ def main():
     parser.add_argument("--compile-fullgraph", action="store_true", help="torch.compile fullgraph 模式")
     parser.add_argument("--context-bucket-multiple", type=int, default=0, help="context长度分桶粒度，0表示关闭")
     parser.add_argument("--decode-batch-bucket-multiple", type=int, default=0, help="decode batch分桶粒度，0表示关闭")
+    # Stage 8 M5：kernel A/B 对比开关
+    parser.add_argument("--no-custom-kernels", action="store_true",
+                        help="禁用 mini_llm_kernels 自定义 CUDA kernel，强制走 PyTorch fallback（Stage 8 A/B 对比用）")
     args = parser.parse_args()
+
+    # 必须在 import miniservellm 之前设置，否则 nn_ops.py 已经完成初始化
+    if args.no_custom_kernels:
+        import os
+        os.environ["MINI_LLM_NO_CUSTOM_KERNELS"] = "1"
 
     ec = EngineConfig.create(
         device="auto",
@@ -76,6 +84,8 @@ def main():
         context_bucket_multiple=args.context_bucket_multiple,
         decode_batch_bucket_multiple=args.decode_batch_bucket_multiple,
     )
+
+    from miniservellm.runtime.nn_ops import _HAS_CUSTOM_KERNELS
     print(
         f"[bench] device={ec.device} dtype={ec.dtype} "
         f"kv_reserve={ec.kv_decode_block_reserve} "
@@ -84,7 +94,8 @@ def main():
         f"compile_mode={ec.torch_compile_mode} "
         f"fullgraph={ec.torch_compile_fullgraph} "
         f"ctx_bucket={ec.context_bucket_multiple} "
-        f"decode_batch_bucket={ec.decode_batch_bucket_multiple}"
+        f"decode_batch_bucket={ec.decode_batch_bucket_multiple} "
+        f"custom_kernels={_HAS_CUSTOM_KERNELS}"
     )
 
     adapter = Qwen2Adapter()

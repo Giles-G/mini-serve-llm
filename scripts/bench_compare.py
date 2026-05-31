@@ -1,15 +1,17 @@
 """A/B 对比 benchmark 脚本。
 
-用途：在同一组测试口径下，快速比较两套参数（例如 kv reserve）的 tok/s 差异。
+用途：在同一组测试口径下，快速比较两套参数的 tok/s 差异。
+Stage 8 新增：支持 --kernel-ab 模式，对比 custom kernel on vs off 的吞吐。
 
 示例：
-  python scripts/bench_compare.py \
-    --batch-list 1,4,8 \
-    --max-new 48 \
-    --runs 2 \
-    --greedy \
-    --base-kv-reserve 0 \
-    --cand-kv-reserve 2
+  # 原有：kv reserve 参数对比
+  python scripts/bench_compare.py \\
+    --batch-list 1,4,8 --max-new 48 --runs 2 --greedy \\
+    --base-kv-reserve 0 --cand-kv-reserve 2
+
+  # Stage 8 新增：kernel on vs off
+  python scripts/bench_compare.py \\
+    --batch-list 1,4,8 --max-new 64 --runs 2 --greedy --kernel-ab
 """
 
 from __future__ import annotations
@@ -35,25 +37,22 @@ def run_bench(
     greedy: bool,
     kv_reserve: int,
     kv_relax_after: int,
+    no_custom_kernels: bool = False,
 ) -> Tuple[str, Dict[int, float]]:
     cmd = [
         python_bin,
         "scripts/bench_engine.py",
-        "--batch-list",
-        batch_list,
-        "--max-new",
-        str(max_new),
-        "--runs",
-        str(runs),
-        "--prompt",
-        prompt,
-        "--kv-decode-block-reserve",
-        str(kv_reserve),
-        "--kv-reserve-relax-after-no-progress-steps",
-        str(kv_relax_after),
+        "--batch-list", batch_list,
+        "--max-new", str(max_new),
+        "--runs", str(runs),
+        "--prompt", prompt,
+        "--kv-decode-block-reserve", str(kv_reserve),
+        "--kv-reserve-relax-after-no-progress-steps", str(kv_relax_after),
     ]
     if greedy:
         cmd.append("--greedy")
+    if no_custom_kernels:
+        cmd.append("--no-custom-kernels")
 
     out = subprocess.check_output(cmd, cwd=str(repo_root), text=True, stderr=subprocess.STDOUT)
     toks_by_n: Dict[int, float] = {}
@@ -80,11 +79,20 @@ def main() -> None:
     parser.add_argument("--cand-kv-reserve", type=int, default=2)
     parser.add_argument("--cand-kv-relax-after", type=int, default=8)
     parser.add_argument("--print-raw", action="store_true", help="打印两组完整原始输出")
+    # Stage 8 M5：kernel A/B 对比模式
+    parser.add_argument("--kernel-ab", action="store_true",
+                        help="Stage 8 A/B: baseline=custom kernel OFF，candidate=custom kernel ON")
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parent.parent
 
-    print("[compare] 运行 baseline...")
+    # kernel-ab 模式：baseline=no kernel，candidate=with kernel
+    base_no_kernel = args.kernel_ab
+    cand_no_kernel = False
+    base_label = "kernel=OFF (PyTorch fallback)" if args.kernel_ab else f"kv_reserve={args.base_kv_reserve}"
+    cand_label = "kernel=ON  (custom CUDA)"      if args.kernel_ab else f"kv_reserve={args.cand_kv_reserve}"
+
+    print(f"[compare] 运行 baseline ({base_label})...")
     base_raw, base = run_bench(
         python_bin=args.python_bin,
         repo_root=repo_root,
@@ -95,9 +103,10 @@ def main() -> None:
         greedy=args.greedy,
         kv_reserve=args.base_kv_reserve,
         kv_relax_after=args.base_kv_relax_after,
+        no_custom_kernels=base_no_kernel,
     )
 
-    print("[compare] 运行 candidate...")
+    print(f"[compare] 运行 candidate ({cand_label})...")
     cand_raw, cand = run_bench(
         python_bin=args.python_bin,
         repo_root=repo_root,
@@ -108,6 +117,7 @@ def main() -> None:
         greedy=args.greedy,
         kv_reserve=args.cand_kv_reserve,
         kv_relax_after=args.cand_kv_relax_after,
+        no_custom_kernels=cand_no_kernel,
     )
 
     if args.print_raw:
@@ -117,7 +127,7 @@ def main() -> None:
         print(cand_raw)
 
     ns = sorted(set(base.keys()) | set(cand.keys()))
-    print("\n[compare] tok/s 对比")
+    print(f"\n[compare] tok/s 对比  baseline={base_label}  candidate={cand_label}")
     print(f"{'N':>3} | {'base':>10} | {'cand':>10} | {'delta':>10} | {'delta%':>8}")
     print("-" * 56)
     for n in ns:
