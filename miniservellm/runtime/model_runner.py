@@ -104,9 +104,8 @@ class TransformerLayerWeights:
     bias 字段为 Optional，不同模型可能没有。
 
     Attention 部分（GQA）：
-        q_proj: Query 投影权重  [num_q_heads * head_dim, hidden_size]
-        k_proj: Key 投影权重    [num_kv_heads * head_dim, hidden_size]
-        v_proj: Value 投影权重  [num_kv_heads * head_dim, hidden_size]
+        qkv_proj: QKV 合并投影权重 [(num_q_heads + 2*num_kv_heads) * head_dim, hidden_size]
+                  由 q_proj/k_proj/v_proj 在 dim=0 concat 而来（M2 优化三：减少 kernel launch）
         o_proj: Output 投影权重 [hidden_size, num_q_heads * head_dim]
 
     MLP 部分（SwiGLU）：
@@ -118,18 +117,14 @@ class TransformerLayerWeights:
         input_layernorm: Attention 前的 RMSNorm 权重 [hidden_size]
         post_attention_layernorm: MLP 前的 RMSNorm 权重 [hidden_size]
     """
-    q_proj: torch.Tensor
-    k_proj: torch.Tensor
-    v_proj: torch.Tensor
+    qkv_proj: torch.Tensor
     o_proj: torch.Tensor
     gate_proj: torch.Tensor
     up_proj: torch.Tensor
     down_proj: torch.Tensor
     input_layernorm: torch.Tensor
     post_attention_layernorm: torch.Tensor
-    q_proj_bias: Optional[torch.Tensor] = None
-    k_proj_bias: Optional[torch.Tensor] = None
-    v_proj_bias: Optional[torch.Tensor] = None
+    qkv_proj_bias: Optional[torch.Tensor] = None
     o_proj_bias: Optional[torch.Tensor] = None
 
 
@@ -201,28 +196,25 @@ class TransformerBlockRunner:
         self.head_dim = model_config.head_dim
 
     def _project_qkv(self, x: torch.Tensor):
-        """QKV 线性投影
+        """QKV 线性投影（M2 优化：单次大 GEMM + split）
 
-        将输入 x 分别投影为 Query、Key、Value，并 reshape 为多头格式。
+        将 q/k/v 三个独立 GEMM 合并为一次：
+            qkv = x @ W_qkv.T + b_qkv
+        再按维度 split 回 Q/K/V，split 几乎零开销（共享存储）。
 
-        公式：
-            Q = x @ W_q.T + b_q    →  reshape to [seq_len, num_q_heads, head_dim]
-            K = x @ W_k.T + b_k    →  reshape to [seq_len, num_kv_heads, head_dim]
-            V = x @ W_v.T + b_v    →  reshape to [seq_len, num_kv_heads, head_dim]
-
-        GQA 模型中 num_q_heads > num_kv_heads，所以 K/V 的 head 数少于 Q。
-        例如 Qwen2.5-0.5B: num_q_heads=14, num_kv_heads=2
+        W_qkv 在权重加载时由 cat([W_q, W_k, W_v], dim=0) 构造，
+        bias 同理（若存在）。
 
         Args:
             x: 输入隐藏状态 [seq_len, hidden_size]
 
         Returns:
-            (q, k, v) 三元组，分别 reshape 为多头格式
+            (q, k, v) 三元组，reshape 为多头格式
         """
-        q = linear(x, self.weights.q_proj, self.weights.q_proj_bias)
-        k = linear(x, self.weights.k_proj, self.weights.k_proj_bias)
-        v = linear(x, self.weights.v_proj, self.weights.v_proj_bias)
-        # 将 [seq_len, num_heads * head_dim] reshape 为 [seq_len, num_heads, head_dim]
+        q_dim = self.num_q_heads * self.head_dim
+        kv_dim = self.num_kv_heads * self.head_dim
+        qkv = linear(x, self.weights.qkv_proj, self.weights.qkv_proj_bias)
+        q, k, v = qkv.split([q_dim, kv_dim, kv_dim], dim=-1)
         q = q.view(x.shape[0], self.num_q_heads, self.head_dim)
         k = k.view(x.shape[0], self.num_kv_heads, self.head_dim)
         v = v.view(x.shape[0], self.num_kv_heads, self.head_dim)

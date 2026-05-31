@@ -190,13 +190,9 @@ class Qwen2Adapter:
 
         每层权重（TransformerLayerWeights）：
         Attention 部分（self_attn）：
-        - q_proj [num_heads*head_dim, hidden_size]: Query 投影
-        - k_proj [num_kv_heads*head_dim, hidden_size]: Key 投影
-        - v_proj [num_kv_heads*head_dim, hidden_size]: Value 投影
+        - qkv_proj [(q+2kv)*head_dim, hidden_size]: Q/K/V 合并投影（M2 优化）
         - o_proj [hidden_size, num_heads*head_dim]: Output 投影
-        - q_proj_bias [num_heads*head_dim]: Query 偏置（可选）
-        - k_proj_bias [num_kv_heads*head_dim]: Key 偏置（可选）
-        - v_proj_bias [num_kv_heads*head_dim]: Value 偏置（可选）
+        - qkv_proj_bias [(q+2kv)*head_dim]: QKV 偏置（可选，Qwen2 有）
 
         MLP 部分（SwiGLU FFN）：
         - gate_proj [intermediate_size, hidden_size]: SwiGLU 门控分支
@@ -217,21 +213,20 @@ class Qwen2Adapter:
             self_attn = _require_attr(layer, "self_attn")
             mlp = _require_attr(layer, "mlp")
 
-            # Attention 投影：Q/K/V 提取 weight + bias，O 只提取 weight
+            # Attention 投影：Q/K/V cat 为单个 qkv_proj，O 只提取 weight
+            # M2 优化：3次独立 GEMM → 1次大 GEMM
             q_w, q_b = _extract_proj(_require_attr(self_attn, "q_proj"))
             k_w, k_b = _extract_proj(_require_attr(self_attn, "k_proj"))
             v_w, v_b = _extract_proj(_require_attr(self_attn, "v_proj"))
+            qkv_w = torch.cat([q_w, k_w, v_w], dim=0)
+            qkv_b = torch.cat([q_b, k_b, v_b], dim=0) if q_b is not None else None
             o_w, _ = _extract_proj(_require_attr(self_attn, "o_proj"))
 
             layers.append(
                 TransformerLayerWeights(
-                    q_proj=q_w,
-                    k_proj=k_w,
-                    v_proj=v_w,
+                    qkv_proj=qkv_w,
+                    qkv_proj_bias=qkv_b,
                     o_proj=o_w,
-                    q_proj_bias=q_b,
-                    k_proj_bias=k_b,
-                    v_proj_bias=v_b,
                     # SwiGLU MLP：gate/up/down 三个投影，只有 weight 没有 bias
                     gate_proj=_clone_to_cpu_contiguous(_require_attr(mlp, "gate_proj").weight),
                     up_proj=_clone_to_cpu_contiguous(_require_attr(mlp, "up_proj").weight),
@@ -289,13 +284,9 @@ class Qwen2Adapter:
         for layer in weights.layers:
             moved_layers.append(
                 TransformerLayerWeights(
-                    q_proj=move(layer.q_proj),
-                    k_proj=move(layer.k_proj),
-                    v_proj=move(layer.v_proj),
+                    qkv_proj=move(layer.qkv_proj),
+                    qkv_proj_bias=move_optional(layer.qkv_proj_bias),
                     o_proj=move(layer.o_proj),
-                    q_proj_bias=move_optional(layer.q_proj_bias),
-                    k_proj_bias=move_optional(layer.k_proj_bias),
-                    v_proj_bias=move_optional(layer.v_proj_bias),
                     gate_proj=move(layer.gate_proj),
                     up_proj=move(layer.up_proj),
                     down_proj=move(layer.down_proj),
