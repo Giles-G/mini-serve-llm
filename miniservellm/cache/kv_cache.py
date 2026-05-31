@@ -330,6 +330,36 @@ class KVCacheManager:
         self.k_cache[layer_idx, block_ids, block_offsets] = k_values
         self.v_cache[layer_idx, block_ids, block_offsets] = v_values
 
+    def build_decode_block_table(
+        self,
+        reqs: List[Request],
+        max_ctx: int,
+    ) -> torch.Tensor:
+        """构造 decode 批次的 block_table 张量 [N, max_blocks]（供 CUDA kernel 使用）
+
+        M4 优化：decode_paged_attention CUDA kernel 直接按 block_table 跳读 KV，
+        不需要先 gather 成连续 tensor。
+
+        Args:
+            reqs: 长度 N 的请求列表
+            max_ctx: 本批次最大上下文长度（用于计算 max_blocks）
+
+        Returns:
+            block_table_tensor: [N, max_blocks]  int32，不足位补 0
+        """
+        N = len(reqs)
+        block_size = self.engine_config.block_size
+        device = self.engine_config.device
+        max_blocks = (max_ctx + block_size - 1) // block_size if max_ctx > 0 else 1
+
+        bt = torch.zeros((N, max_blocks), device=device, dtype=torch.int32)
+        for i, req in enumerate(reqs):
+            table = self.req_block_tables.get(req.request_id, req.block_table)
+            if table:
+                t = torch.tensor(table[:max_blocks], device=device, dtype=torch.int32)
+                bt[i, : t.shape[0]] = t
+        return bt
+
     def build_decode_batch_indices(
         self,
         reqs: List[Request],

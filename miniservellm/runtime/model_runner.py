@@ -27,6 +27,7 @@ from miniservellm.runtime.model_interface import PrefillModelOutput, DecodeModel
 from miniservellm.runtime.nn_ops import (
     rms_norm,
     fused_add_rms_norm,
+    decode_paged_attention,
     silu_and_mul,
     build_rope_cache,
     apply_rope,
@@ -59,6 +60,8 @@ class DecodeBatchGatherCtx:
     block_offsets: torch.Tensor      # [N, max_ctx]  gather 用块内偏移
     context_lens_tensor: torch.Tensor  # [N]  真实 context_len（attention mask 用）
     valid_batch_size: int = 0        # 真实请求数（batch 分桶时 <= N）
+    # M4: CUDA kernel 使用紧凑 block_table [N, max_blocks]，None 表示未初始化
+    block_table_tensor: "Optional[torch.Tensor]" = None  # [N, max_blocks] int32
 
 
 @dataclass
@@ -548,9 +551,19 @@ class TransformerBlockRunner:
                 v_values=v_new,
             )
 
-        # 批量 paged-attention：一次 gather + 一次 batched matmul
-        if gather_ctx is not None:
-            # 复用预构造的 block_ids/offsets，仅做 advanced indexing
+        # 批量 paged-attention：M4 优先走 decode_paged_attention（block-aware kernel/fallback）
+        # 否则退回 gather + batched matmul
+        if gather_ctx is not None and gather_ctx.block_table_tensor is not None:
+            # M4 路径：直接传 block_table + context_lens 给 kernel/fallback
+            attn_out = decode_paged_attention(
+                q=q,
+                k_cache=self.kv_cache_manager.k_cache[self.layer_idx],
+                v_cache=self.kv_cache_manager.v_cache[self.layer_idx],
+                block_table=gather_ctx.block_table_tensor,
+                context_lens=gather_ctx.context_lens_tensor.to(torch.int32),
+            )  # [N, num_q_heads, head_dim]
+        elif gather_ctx is not None:
+            # 原 gather 路径（fallback for M1/no-kernel）
             k_padded = self.kv_cache_manager.k_cache[
                 self.layer_idx, gather_ctx.block_ids, gather_ctx.block_offsets
             ]
@@ -558,19 +571,26 @@ class TransformerBlockRunner:
                 self.layer_idx, gather_ctx.block_ids, gather_ctx.block_offsets
             ]
             ctx_lens_t = gather_ctx.context_lens_tensor
+            attn_out = gathered_paged_kv_decode_attention(
+                q=q,
+                k_padded=k_padded,
+                v_padded=v_padded,
+                context_lens=ctx_lens_t,
+                num_q_heads=self.num_q_heads,
+            )  # [N, num_q_heads, head_dim]
         else:
             k_padded, v_padded, ctx_lens_t = self.kv_cache_manager.gather_kv_decode_batch(
                 layer_idx=self.layer_idx,
                 reqs=reqs,
                 context_lens=[m.context_len for m in metas],
             )
-        attn_out = gathered_paged_kv_decode_attention(
-            q=q,
-            k_padded=k_padded,
-            v_padded=v_padded,
-            context_lens=ctx_lens_t,
-            num_q_heads=self.num_q_heads,
-        )  # [N, num_q_heads, head_dim]
+            attn_out = gathered_paged_kv_decode_attention(
+                q=q,
+                k_padded=k_padded,
+                v_padded=v_padded,
+                context_lens=ctx_lens_t,
+                num_q_heads=self.num_q_heads,
+            )  # [N, num_q_heads, head_dim]
         attn_out = attn_out.reshape(n, self.hidden_size)
         attn_out = linear(attn_out, self.weights.o_proj, self.weights.o_proj_bias)
         # 融合残差 add + MLP norm（M3 优化）
@@ -1002,6 +1022,14 @@ class TransformerModelRunner:
         )
         context_lens_tensor = torch.tensor(ctx_lens_list, device=self._device, dtype=torch.long)
 
+        # M4: 为 CUDA kernel 构造紧凑 block_table [N, max_blocks]
+        from miniservellm.runtime.nn_ops import _HAS_CUSTOM_KERNELS
+        block_table_tensor = None
+        if _HAS_CUSTOM_KERNELS and max_ctx > 0:
+            block_table_tensor = self.kv_cache_manager.build_decode_block_table(
+                reqs_for_index, max_ctx_bucketed if max_ctx_bucketed > 0 else max_ctx,
+            )
+
         write_slots = [m.write_slot for m in metas]
         if bucket_n > valid_n and valid_n > 0:
             write_slots.extend([metas[-1].write_slot] * (bucket_n - valid_n))
@@ -1017,6 +1045,7 @@ class TransformerModelRunner:
             block_offsets=block_offsets,
             context_lens_tensor=context_lens_tensor,
             valid_batch_size=valid_n,
+            block_table_tensor=block_table_tensor,
         )
 
         # 逐层批量前向（可切换 eager / compiled，且复用 gather_ctx）

@@ -63,6 +63,82 @@ def fused_add_rms_norm(
     return x_normed, residual_out
 
 
+def decode_paged_attention(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    context_lens: torch.Tensor,
+) -> torch.Tensor:
+    """Block-aware Paged Decode Attention（M4 优化）
+
+    直接按 block_table 跳着读 KV，配合 online softmax，
+    消除 gather 拷贝 + 全量 score 矩阵写回。
+
+    有 CUDA kernel 时调用 mini_llm_kernels.decode_paged_attention，
+    否则退回等价 PyTorch 实现（gather + batched GQA matmul）。
+
+    Args:
+        q:            [N, H_q, D]
+        k_cache:      [num_blocks, block_size, H_kv, D]
+        v_cache:      [num_blocks, block_size, H_kv, D]
+        block_table:  [N, max_blocks]  int32/int64
+        context_lens: [N]              int32/int64
+
+    Returns:
+        out: [N, H_q, D]
+    """
+    if _HAS_CUSTOM_KERNELS and _mkl is not None:
+        return _mkl.decode_paged_attention(
+            q, k_cache, v_cache,
+            block_table.to(torch.int32),
+            context_lens.to(torch.int32),
+        )
+    # PyTorch fallback（等价于原 gather + gathered_paged_kv_decode_attention）
+    return _decode_paged_attention_fallback(q, k_cache, v_cache, block_table, context_lens)
+
+
+def _decode_paged_attention_fallback(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    context_lens: torch.Tensor,
+) -> torch.Tensor:
+    """PyTorch fallback：gather + batched GQA attention"""
+    N, H_q, D = q.shape
+    block_size = k_cache.size(1)
+    H_kv = k_cache.size(2)
+    max_ctx = int(context_lens.max().item())
+    max_blocks = block_table.size(1)
+
+    pos = torch.arange(max_ctx, device=q.device, dtype=torch.long)
+    blk_idx = pos // block_size
+    blk_off  = pos % block_size
+
+    bt = block_table[:, :max_blocks].long()
+    bt_expanded = bt[:, blk_idx]                         # [N, max_ctx]
+
+    k_padded = k_cache[bt_expanded, blk_off]             # [N, max_ctx, H_kv, D]
+    v_padded = v_cache[bt_expanded, blk_off]
+
+    group = H_q // H_kv
+    q_grouped = q.view(N, H_kv, group, D)
+    k_p = k_padded.permute(0, 2, 1, 3)
+    v_p = v_padded.permute(0, 2, 1, 3)
+
+    scale = D ** -0.5
+    scores = torch.matmul(q_grouped, k_p.transpose(-1, -2)) * scale
+
+    pos_idx = torch.arange(max_ctx, device=q.device).view(1, 1, 1, max_ctx)
+    valid = pos_idx < context_lens.view(N, 1, 1, 1)
+    scores = scores.masked_fill(~valid, float("-inf"))
+
+    weights = torch.softmax(scores.float(), dim=-1).to(q.dtype)
+    out = torch.matmul(weights, v_p)
+    return out.reshape(N, H_q, D)
+
+
 def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
     """线性变换（全连接层）
 
