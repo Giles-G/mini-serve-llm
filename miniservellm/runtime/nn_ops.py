@@ -2,6 +2,9 @@
 
 第五阶段新增：手写模型前向所需的底层算子，
 包括 RMSNorm、SiLU+Mul、RoPE、Causal Attention 等。
+
+第八阶段新增：尝试加载 mini_llm_kernels 自定义 CUDA kernel，
+失败时自动退回原有 PyTorch 实现，MPS/CPU 环境透明降级。
 """
 
 from __future__ import annotations
@@ -10,6 +13,17 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+
+# --------------------------------------------------------------------------- #
+# Stage 8: 自定义 CUDA kernel（可选）
+# 在有编译好的 mini_llm_kernels 扩展时启用，否则退回纯 PyTorch 实现。
+# --------------------------------------------------------------------------- #
+try:
+    import mini_llm_kernels as _mkl
+    _HAS_CUSTOM_KERNELS: bool = _mkl._HAS_CUDA_OPS
+except ImportError:
+    _mkl = None  # type: ignore[assignment]
+    _HAS_CUSTOM_KERNELS: bool = False
 
 
 def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
