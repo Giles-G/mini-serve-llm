@@ -26,6 +26,43 @@ except ImportError:
     _HAS_CUSTOM_KERNELS: bool = False
 
 
+def fused_add_rms_norm(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    gamma: torch.Tensor,
+    eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """融合 RMSNorm + Residual Add（M3 优化）
+
+    一次 kernel 完成：
+        residual_out = x + residual
+        x_normed     = RMSNorm(residual_out, gamma, eps)
+
+    有 CUDA kernel 时调用 mini_llm_kernels.fused_add_rms_norm，
+    否则退回等价的 PyTorch 实现（M1/CPU 透明降级）。
+
+    Args:
+        x:        [N, H]  attention/mlp 输出（delta）
+        residual: [N, H]  上一子层的残差流
+        gamma:    [H]     RMSNorm 可学习缩放参数
+        eps:      float   防除零小量
+
+    Returns:
+        (x_normed, residual_out)
+        x_normed:     [N, H]  归一化结果，供下一算子（QKV/MLP）使用
+        residual_out: [N, H]  x + residual，作为下一子层的残差输入
+    """
+    if _HAS_CUSTOM_KERNELS and _mkl is not None:
+        return _mkl.fused_add_rms_norm(x, residual, gamma, eps)
+    # PyTorch fallback
+    orig_dtype = x.dtype
+    residual_out = x + residual
+    x_fp32 = residual_out.float()
+    rms = torch.rsqrt(x_fp32.pow(2).mean(dim=-1, keepdim=True) + eps)
+    x_normed = (x_fp32 * rms).to(orig_dtype) * gamma
+    return x_normed, residual_out
+
+
 def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
     """线性变换（全连接层）
 

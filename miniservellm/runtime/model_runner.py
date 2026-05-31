@@ -26,6 +26,7 @@ from miniservellm.runtime.metadata import PrefillRequestMetadata, DecodeRequestM
 from miniservellm.runtime.model_interface import PrefillModelOutput, DecodeModelOutput
 from miniservellm.runtime.nn_ops import (
     rms_norm,
+    fused_add_rms_norm,
     silu_and_mul,
     build_rope_cache,
     apply_rope,
@@ -439,15 +440,16 @@ class TransformerBlockRunner:
         # Unpack 回 [sum_T, H_q, D]：advanced indexing 一次拿到
         attn_flat = attn_padded[ctx.pad_row, ctx.pad_col]
 
-        # O 投影 + 残差
+        # O 投影 + 融合残差 add + MLP norm（M3 优化）
         attn_out = attn_flat.reshape(-1, self.hidden_size)
         attn_out = linear(attn_out, self.weights.o_proj, self.weights.o_proj_bias)
-        hidden_states = residual + attn_out
+        x, hidden_states = fused_add_rms_norm(
+            attn_out, residual,
+            self.weights.post_attention_layernorm, self.model_config.rms_norm_eps,
+        )
 
         # ---- MLP 子层 ----
-        residual = hidden_states
-        x = rms_norm(hidden_states, self.weights.post_attention_layernorm, self.model_config.rms_norm_eps)
-        hidden_states = residual + self._mlp(x)
+        hidden_states = hidden_states + self._mlp(x)
         return hidden_states
 
     def forward_prefill_one(self, hidden_states: torch.Tensor, meta: PrefillRequestMetadata, req: Request):
@@ -476,12 +478,16 @@ class TransformerBlockRunner:
         # Attention 子层
         residual = hidden_states
         x = rms_norm(hidden_states, self.weights.input_layernorm, self.model_config.rms_norm_eps)
-        hidden_states = residual + self._attention_prefill(x, meta, req)
+        attn_out = self._attention_prefill(x, meta, req)
+
+        # 融合残差 add + MLP norm（M3 优化）
+        x, hidden_states = fused_add_rms_norm(
+            attn_out, residual,
+            self.weights.post_attention_layernorm, self.model_config.rms_norm_eps,
+        )
 
         # MLP 子层
-        residual = hidden_states
-        x = rms_norm(hidden_states, self.weights.post_attention_layernorm, self.model_config.rms_norm_eps)
-        hidden_states = residual + self._mlp(x)
+        hidden_states = hidden_states + self._mlp(x)
         return hidden_states
 
     def forward_decode_batch(
@@ -567,12 +573,14 @@ class TransformerBlockRunner:
         )  # [N, num_q_heads, head_dim]
         attn_out = attn_out.reshape(n, self.hidden_size)
         attn_out = linear(attn_out, self.weights.o_proj, self.weights.o_proj_bias)
-        hidden_states = residual + attn_out
+        # 融合残差 add + MLP norm（M3 优化）
+        x, hidden_states = fused_add_rms_norm(
+            attn_out, residual,
+            self.weights.post_attention_layernorm, self.model_config.rms_norm_eps,
+        )
 
         # ---- MLP 子层 ----
-        residual = hidden_states
-        x = rms_norm(hidden_states, self.weights.post_attention_layernorm, self.model_config.rms_norm_eps)
-        hidden_states = residual + self._mlp(x)
+        hidden_states = hidden_states + self._mlp(x)
         return hidden_states
 
     def forward_decode_one(self, hidden_state: torch.Tensor, meta: DecodeRequestMetadata, req: Request):
@@ -591,11 +599,14 @@ class TransformerBlockRunner:
         """
         residual = hidden_state
         x = rms_norm(hidden_state, self.weights.input_layernorm, self.model_config.rms_norm_eps)
-        hidden_state = residual + self._attention_decode(x, meta, req)
+        attn_out = self._attention_decode(x, meta, req)
 
-        residual = hidden_state
-        x = rms_norm(hidden_state, self.weights.post_attention_layernorm, self.model_config.rms_norm_eps)
-        hidden_state = residual + self._mlp(x)
+        # 融合残差 add + MLP norm（M3 优化）
+        x, hidden_state = fused_add_rms_norm(
+            attn_out, residual,
+            self.weights.post_attention_layernorm, self.model_config.rms_norm_eps,
+        )
+        hidden_state = hidden_state + self._mlp(x)
         return hidden_state
 
 
