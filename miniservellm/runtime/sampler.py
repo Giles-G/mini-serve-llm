@@ -36,9 +36,10 @@ def top_p_filtering(logits: torch.Tensor, top_p: float) -> torch.Tensor:
     sorted_logits, sorted_indices = torch.sort(logits, descending=True)
     probs = torch.softmax(sorted_logits.float(), dim=-1)
     cumulative = torch.cumsum(probs, dim=-1)
-    keep = cumulative <= top_p
-    keep[0] = True
-    filtered_sorted = sorted_logits.masked_fill(~keep, float("-inf"))
+    remove = cumulative > top_p
+    remove[1:] = remove[:-1].clone()
+    remove[0] = False
+    filtered_sorted = sorted_logits.masked_fill(remove, float("-inf"))
     filtered = torch.full_like(logits, float("-inf"))
     filtered.scatter_(0, sorted_indices, filtered_sorted)
     return filtered
@@ -102,6 +103,12 @@ class Sampler:
         N = len(requests)
         # 堆叠为 [N, V]
         logits = torch.stack([logits_by_request[r.request_id] for r in requests], dim=0)
+
+        # 全 greedy 是性能基准和确定性推理的常见路径，直接 argmax。
+        if all(float(r.sampling_params.temperature) <= 0.0 for r in requests):
+            tokens = torch.argmax(logits, dim=-1).tolist()
+            return {requests[i].request_id: int(tokens[i]) for i in range(N)}
+
         V = logits.shape[-1]
         device = logits.device
 
@@ -164,12 +171,12 @@ class Sampler:
             sorted_logits, sorted_indices = torch.sort(work, descending=True, dim=-1)
             sorted_probs = torch.softmax(sorted_logits.float(), dim=-1)
             cumulative = torch.cumsum(sorted_probs, dim=-1)
-            keep = cumulative <= top_ps.unsqueeze(-1)
-            keep[:, 0] = True
+            remove = cumulative > top_ps.unsqueeze(-1)
+            remove[:, 1:] = remove[:, :-1].clone()
+            remove[:, 0] = False
             # top_p>=1.0 的行全部保留
-            full_keep = (top_ps >= 1.0).unsqueeze(-1)
-            keep = keep | full_keep
-            filtered_sorted = sorted_logits.masked_fill(~keep, float("-inf"))
+            remove = remove & (top_ps < 1.0).unsqueeze(-1)
+            filtered_sorted = sorted_logits.masked_fill(remove, float("-inf"))
             work = torch.full_like(work, float("-inf"))
             work.scatter_(1, sorted_indices, filtered_sorted.to(work.dtype))
 

@@ -9,3 +9,4 @@ build/
 requirements.txt
 ~/.cache/
 .vscode
+docs

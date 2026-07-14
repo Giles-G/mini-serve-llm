@@ -12,7 +12,7 @@ def run_one_trial(engine, prompts: List[str], sp, max_new: int, timer: PhaseTime
     timer.reset()
     maybe_sync(engine.model_runner.device)
     t0 = time.perf_counter()
-    engine.run_until_all_finished(max_steps=10000)
+    engine.run_until_all_finished(max_steps=1000000, collect_results=False)
     maybe_sync(engine.model_runner.device)
     elapsed = time.perf_counter() - t0
 

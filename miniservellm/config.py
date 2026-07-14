@@ -103,7 +103,7 @@ class EngineConfig:
         enable_torch_compile: bool = False,
         torch_compile_mode: str = "default",
         torch_compile_fullgraph: bool = False,
-        context_bucket_multiple: int = 0,
+        context_bucket_multiple: Optional[int] = None,
         decode_batch_bucket_multiple: int = 0,
         eos_token_id: Optional[int] = None,
     ) -> "EngineConfig":
@@ -123,6 +123,10 @@ class EngineConfig:
         else:
             raise ValueError(f"Unsupported dtype: {dtype}")
 
+        # MPS 对逐 token 变化的动态 context shape 很敏感；32 桶在 M4 实测中
+        # 显著优于关闭分桶。调用方显式传 0 时仍可关闭用于 A/B。
+        context_bucket = 32 if context_bucket_multiple is None and dev.type == "mps" else int(context_bucket_multiple or 0)
+
         return EngineConfig(
             device=dev,
             dtype=dt,
@@ -141,7 +145,7 @@ class EngineConfig:
             enable_torch_compile=enable_torch_compile,
             torch_compile_mode=torch_compile_mode,
             torch_compile_fullgraph=torch_compile_fullgraph,
-            context_bucket_multiple=context_bucket_multiple,
+            context_bucket_multiple=context_bucket,
             decode_batch_bucket_multiple=decode_batch_bucket_multiple,
             eos_token_id=eos_token_id,
         )

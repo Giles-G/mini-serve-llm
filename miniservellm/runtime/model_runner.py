@@ -15,7 +15,7 @@ KV 直接写入 Paged KV Cache，不再依赖 HF 的 past_key_values。
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
 import torch
@@ -52,16 +52,15 @@ class DecodeBatchGatherCtx:
     跨 24 层共享（同一 batch 的 block_ids/offsets/context_lens/positions/write_slots
     在所有层都一样），避免每层重复构造同样的 LongTensor。
     """
-    positions: torch.Tensor          # [N]   每个请求的 query_position
-    write_slots: List["SlotRef"]     # 长度 N，写入新 KV 的目标 slot
-    write_block_ids: torch.Tensor    # [N]  写入用 block_id（slot_refs 预计算）
-    write_block_offsets: torch.Tensor  # [N]  写入用块内偏移
-    block_ids: torch.Tensor          # [N, max_ctx]  gather 用 block id
-    block_offsets: torch.Tensor      # [N, max_ctx]  gather 用块内偏移
-    context_lens_tensor: torch.Tensor  # [N]  真实 context_len（attention mask 用）
-    valid_batch_size: int = 0        # 真实请求数（batch 分桶时 <= N）
-    # M4: CUDA kernel 使用紧凑 block_table [N, max_blocks]，None 表示未初始化
-    block_table_tensor: "Optional[torch.Tensor]" = None  # [N, max_blocks] int32
+    positions: torch.Tensor = field(default_factory=lambda: torch.empty(0))
+    write_slots: List[SlotRef] = field(default_factory=list)
+    write_block_ids: torch.Tensor = field(default_factory=lambda: torch.empty(0))
+    write_block_offsets: torch.Tensor = field(default_factory=lambda: torch.empty(0))
+    block_ids: torch.Tensor = field(default_factory=lambda: torch.empty(0))
+    block_offsets: torch.Tensor = field(default_factory=lambda: torch.empty(0))
+    context_lens_tensor: torch.Tensor = field(default_factory=lambda: torch.empty(0))
+    valid_batch_size: int = 0
+    block_table_tensor: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -84,20 +83,20 @@ class PrefillBatchCtx:
         pad_row: [sum_T]  q [sum_T,...] → q_padded [N, T_max,...] 时每个 flat token 的请求 idx
         pad_col: [sum_T]  对应的 chunk 内位置
     """
-    positions: torch.Tensor
-    write_slots: List["SlotRef"]
-    write_block_ids: torch.Tensor
-    write_block_offsets: torch.Tensor
-    chunk_lens: torch.Tensor
-    history_lens: torch.Tensor
-    chunk_offsets: List[int]
-    max_chunk_len: int
-    max_kv_len: int
-    block_ids: torch.Tensor
-    block_offsets: torch.Tensor
-    last_token_indices: torch.Tensor
-    pad_row: torch.Tensor
-    pad_col: torch.Tensor
+    positions: torch.Tensor = field(default_factory=lambda: torch.empty(0))
+    write_slots: List[SlotRef] = field(default_factory=list)
+    write_block_ids: torch.Tensor = field(default_factory=lambda: torch.empty(0))
+    write_block_offsets: torch.Tensor = field(default_factory=lambda: torch.empty(0))
+    chunk_lens: torch.Tensor = field(default_factory=lambda: torch.empty(0))
+    history_lens: torch.Tensor = field(default_factory=lambda: torch.empty(0))
+    chunk_offsets: List[int] = field(default_factory=list)
+    max_chunk_len: int = 0
+    max_kv_len: int = 0
+    block_ids: torch.Tensor = field(default_factory=lambda: torch.empty(0))
+    block_offsets: torch.Tensor = field(default_factory=lambda: torch.empty(0))
+    last_token_indices: torch.Tensor = field(default_factory=lambda: torch.empty(0))
+    pad_row: torch.Tensor = field(default_factory=lambda: torch.empty(0))
+    pad_col: torch.Tensor = field(default_factory=lambda: torch.empty(0))
 
 
 @dataclass
@@ -113,9 +112,8 @@ class TransformerLayerWeights:
         o_proj: Output 投影权重 [hidden_size, num_q_heads * head_dim]
 
     MLP 部分（SwiGLU）：
-        gate_proj: Gate 投影权重  [intermediate_size, hidden_size]
-        up_proj:   Up 投影权重    [intermediate_size, hidden_size]
-        down_proj: Down 投影权重  [hidden_size, intermediate_size]
+        gate_up_proj: Gate/Up 合并投影权重 [2 * intermediate_size, hidden_size]
+        down_proj: Down 投影权重 [hidden_size, intermediate_size]
 
     Norm 部分：
         input_layernorm: Attention 前的 RMSNorm 权重 [hidden_size]
@@ -123,8 +121,7 @@ class TransformerLayerWeights:
     """
     qkv_proj: torch.Tensor
     o_proj: torch.Tensor
-    gate_proj: torch.Tensor
-    up_proj: torch.Tensor
+    gate_up_proj: torch.Tensor
     down_proj: torch.Tensor
     input_layernorm: torch.Tensor
     post_attention_layernorm: torch.Tensor
@@ -369,8 +366,8 @@ class TransformerBlockRunner:
         Returns:
             MLP 输出 [seq_len, hidden_size]
         """
-        gate = linear(x, self.weights.gate_proj)
-        up = linear(x, self.weights.up_proj)
+        gate_up = linear(x, self.weights.gate_up_proj)
+        gate, up = gate_up.chunk(2, dim=-1)
         act = silu_and_mul(gate, up)
         return linear(act, self.weights.down_proj)
 
@@ -708,6 +705,16 @@ class TransformerModelRunner:
         if engine_config.enable_torch_compile:
             self._maybe_enable_torch_compile()
 
+        # ---- 预分配 metadata 索引 buffer（避免每 step 重复创建小 tensor） ----
+        max_bs = engine_config.max_batch_size
+        self._decode_input_ids_buf = torch.empty(max_bs, device=self._device, dtype=torch.long)
+        self._decode_positions_buf = torch.empty(max_bs, device=self._device, dtype=torch.long)
+        self._decode_ctx_lens_buf = torch.empty(max_bs, device=self._device, dtype=torch.long)
+        self._decode_wbids_buf = torch.empty(max_bs, device=self._device, dtype=torch.long)
+        self._decode_wboff_buf = torch.empty(max_bs, device=self._device, dtype=torch.long)
+        self._max_batch_size = max_bs
+        self._arange_cache: Dict[int, torch.Tensor] = {}
+
     @property
     def device(self) -> torch.device:
         return self._device
@@ -715,6 +722,27 @@ class TransformerModelRunner:
     @property
     def dtype(self) -> torch.dtype:
         return self._dtype
+
+    def _cached_arange(self, length: int) -> torch.Tensor:
+        """缓存常用 torch.arange。"""
+        if length not in self._arange_cache:
+            self._arange_cache[length] = torch.arange(length, device=self._device, dtype=torch.long)
+        return self._arange_cache[length]
+
+    def _copy_to_buf(self, buf: torch.Tensor, src: list, n: int) -> torch.Tensor:
+        """把 Python list 拷贝到预分配 buffer 并返回 [n] slice。"""
+        if n > buf.shape[0]:
+            buf = torch.empty(max(n, buf.shape[0] * 2), device=self._device, dtype=buf.dtype)
+        if n > 0:
+            buf[:n] = torch.tensor(src[:n], device=self._device, dtype=buf.dtype)
+        return buf[:n]
+
+    # 保持 _decode_*_buf 可变，_copy_to_buf 可能扩容
+    _decode_input_ids_buf: torch.Tensor
+    _decode_positions_buf: torch.Tensor
+    _decode_ctx_lens_buf: torch.Tensor
+    _decode_wbids_buf: torch.Tensor
+    _decode_wboff_buf: torch.Tensor
 
     def _embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Token Embedding 查表
@@ -920,13 +948,27 @@ class TransformerModelRunner:
         # 逐层批量前向（可切换 eager / compiled）
         hidden_states = self._prefill_layers_fn(hidden_states, ctx)
 
-        # 一次 logits 投影；按 last_token_indices 选每请求最后一个 token 的 logits
-        logits_full = self._project_logits(hidden_states)  # [sum_T, vocab]
-        last_logits = logits_full.index_select(0, ctx.last_token_indices)  # [N, vocab]
+        # 只有本 chunk 结束后完成全部 prompt 的请求才需要首 token logits。
+        # 先选末 hidden 再做 LM Head，避免构造 [sum_T, vocab] 的大临时张量。
+        final_request_indices = [
+            i
+            for i, (req, meta) in enumerate(zip(active_reqs, active_metas))
+            if meta.chunk_end == req.total_prompt_tokens()
+        ]
+        if not final_request_indices:
+            return PrefillModelOutput(logits_by_request={})
+
+        final_rows = ctx.last_token_indices.index_select(
+            0,
+            torch.tensor(final_request_indices, device=self._device, dtype=torch.long),
+        )
+        final_hidden = hidden_states.index_select(0, final_rows)
+        final_logits = self._project_logits(final_hidden)
 
         return PrefillModelOutput(
             logits_by_request={
-                req.request_id: last_logits[i] for i, req in enumerate(active_reqs)
+                active_reqs[request_idx].request_id: final_logits[output_idx]
+                for output_idx, request_idx in enumerate(final_request_indices)
             }
         )
 

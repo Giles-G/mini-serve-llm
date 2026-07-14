@@ -195,8 +195,7 @@ class Qwen2Adapter:
         - qkv_proj_bias [(q+2kv)*head_dim]: QKV 偏置（可选，Qwen2 有）
 
         MLP 部分（SwiGLU FFN）：
-        - gate_proj [intermediate_size, hidden_size]: SwiGLU 门控分支
-        - up_proj [intermediate_size, hidden_size]: SwiGLU 上行分支
+        - gate_up_proj [2 * intermediate_size, hidden_size]: Gate/Up 合并投影
         - down_proj [hidden_size, intermediate_size]: SwiGLU 下行投影
 
         Norm 部分：
@@ -222,14 +221,15 @@ class Qwen2Adapter:
             qkv_b = torch.cat([q_b, k_b, v_b], dim=0) if q_b is not None else None
             o_w, _ = _extract_proj(_require_attr(self_attn, "o_proj"))
 
+            gate_w = _clone_to_cpu_contiguous(_require_attr(mlp, "gate_proj").weight)
+            up_w = _clone_to_cpu_contiguous(_require_attr(mlp, "up_proj").weight)
             layers.append(
                 TransformerLayerWeights(
                     qkv_proj=qkv_w,
                     qkv_proj_bias=qkv_b,
                     o_proj=o_w,
-                    # SwiGLU MLP：gate/up/down 三个投影，只有 weight 没有 bias
-                    gate_proj=_clone_to_cpu_contiguous(_require_attr(mlp, "gate_proj").weight),
-                    up_proj=_clone_to_cpu_contiguous(_require_attr(mlp, "up_proj").weight),
+                    # Gate/Up 合并为一次 GEMM，降低 batch=1 decode 的 kernel launch 开销。
+                    gate_up_proj=torch.cat([gate_w, up_w], dim=0).contiguous(),
                     down_proj=_clone_to_cpu_contiguous(_require_attr(mlp, "down_proj").weight),
                     # 两个 RMSNorm：Attention 前 和 FFN 前，只有 weight 没有 bias
                     input_layernorm=_clone_to_cpu_contiguous(_require_attr(layer, "input_layernorm").weight),
@@ -287,8 +287,7 @@ class Qwen2Adapter:
                     qkv_proj=move(layer.qkv_proj),
                     qkv_proj_bias=move_optional(layer.qkv_proj_bias),
                     o_proj=move(layer.o_proj),
-                    gate_proj=move(layer.gate_proj),
-                    up_proj=move(layer.up_proj),
+                    gate_up_proj=move(layer.gate_up_proj),
                     down_proj=move(layer.down_proj),
                     input_layernorm=move(layer.input_layernorm),
                     post_attention_layernorm=move(layer.post_attention_layernorm),

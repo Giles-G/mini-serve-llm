@@ -10,6 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any
 
+import torch
+
 from miniservellm.config import EngineConfig, ModelConfig
 from miniservellm.cache.kv_cache import KVCacheManager
 from miniservellm.runtime.metadata import AttentionMetadataBuilder
@@ -246,9 +248,15 @@ class Stage5Engine:
             run_result: Runner 的执行结果，包含 output（含 logits）、requests、metas
             events: 事件列表，用于追加事件
         """
-        # 批量采样：对所有请求的 logits 进行采样，返回 request_id → token_id 映射
-        # 注意：只有 prefill 完成（即处理了全部 prompt tokens）的请求才有有效的 logits
-        sampled = self.sampler.sample_batch(run_result.output.logits_by_request, run_result.requests)
+        # 仅最后一个 prefill chunk 会产生 logits；中间 chunk 不应执行采样或推进 RNG。
+        sampled_requests = [
+            req for req in run_result.requests
+            if req.request_id in run_result.output.logits_by_request
+        ]
+        sampled = self.sampler.sample_batch(
+            run_result.output.logits_by_request,
+            sampled_requests,
+        )
 
         for req, meta in zip(run_result.requests, run_result.metas):
             # 更新该请求已处理的 prompt token 数量
@@ -348,6 +356,7 @@ class Stage5Engine:
                 self._finish_request(req, events)
                 continue
 
+    @torch.inference_mode()
     def step(self) -> StepResult:
         """执行引擎的一步调度和推理
 
@@ -404,18 +413,30 @@ class Stage5Engine:
         """
         return self.scheduler.has_pending_work()
 
-    def run_until_all_finished(self, max_steps: int = 10000) -> List[StepResult]:
+    def run_until_all_finished(self, max_steps: int = 50000, *, collect_results: bool = True) -> Any:
         """循环执行 step() 直到所有请求完成
 
         Args:
             max_steps: 最大执行步数，防止死循环或异常情况无限运行
+            collect_results: 是否收集每一步的 StepResult。
+                False 时仅运行到所有请求结束，大幅降低长 decode 的
+                Python list 分配和内存。Benchmark 或纯吞吐测试设置 False。
 
         Returns:
-            所有步骤的结果列表
+            collect_results=True 时返回 List[StepResult]，否则返回 None
 
         Raises:
             RuntimeError: 超过 max_steps 仍未完成所有请求
         """
+        if not collect_results:
+            n = 0
+            while self.has_pending_work():
+                if n >= max_steps:
+                    raise RuntimeError(f"Exceeded max_steps={max_steps}")
+                self.step()
+                n += 1
+            return None
+
         results = []
         n = 0
         while self.has_pending_work():

@@ -466,6 +466,22 @@ def gathered_paged_kv_decode_attention(
     N, H_q, D = q.shape
     _, max_ctx, H_kv, _ = k_padded.shape
     assert H_q % H_kv == 0, "num_q_heads must be divisible by num_kv_heads"
+
+    if q.device.type == "mps":
+        q_sdpa = q.unsqueeze(2)  # [N, H_q, 1, D]
+        k_sdpa = k_padded.permute(0, 2, 1, 3)  # [N, H_kv, S, D]
+        v_sdpa = v_padded.permute(0, 2, 1, 3)
+        positions = torch.arange(max_ctx, device=q.device).view(1, 1, 1, max_ctx)
+        valid = positions < context_lens.view(N, 1, 1, 1)
+        return F.scaled_dot_product_attention(
+            q_sdpa,
+            k_sdpa,
+            v_sdpa,
+            attn_mask=valid,
+            dropout_p=0.0,
+            enable_gqa=H_q != H_kv,
+        ).squeeze(2)
+
     group = H_q // H_kv
 
     # GQA 视图：[N, H_kv, group, D]
@@ -526,6 +542,26 @@ def batched_causal_attention_prefill(
     N, T, H_q, D = q_padded.shape
     _, S, H_kv, _ = k_padded.shape
     assert H_q % H_kv == 0
+
+    if q_padded.device.type == "mps":
+        q_sdpa = q_padded.permute(0, 2, 1, 3)  # [N, H_q, T, D]
+        k_sdpa = k_padded.permute(0, 2, 1, 3)  # [N, H_kv, S, D]
+        v_sdpa = v_padded.permute(0, 2, 1, 3)
+        q_pos = torch.arange(T, device=q_padded.device).view(1, T, 1)
+        k_pos = torch.arange(S, device=q_padded.device).view(1, 1, S)
+        valid_q = q_pos < chunk_lens.view(N, 1, 1)
+        causal_bound = history_lens.view(N, 1, 1) + q_pos + 1
+        valid = (valid_q & (k_pos < causal_bound)).view(N, 1, T, S)
+        out = F.scaled_dot_product_attention(
+            q_sdpa,
+            k_sdpa,
+            v_sdpa,
+            attn_mask=valid,
+            dropout_p=0.0,
+            enable_gqa=H_q != H_kv,
+        )
+        return out.permute(0, 2, 1, 3)
+
     group = H_q // H_kv
 
     # Q reshape 为 [N, T, H_kv, group, D] → [N, H_kv, group, T, D]
