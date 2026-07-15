@@ -41,6 +41,7 @@ class MLXQwen2Runner:
         max_new_tokens: int,
         eos_token_id: int | None = None,
         disable_eos: bool = False,
+        compiled_decode: bool = False,
     ) -> List[MLXGenerationResult]:
         """Same-length batch greedy baseline for MLX throughput experiments."""
         if not prompt_token_ids:
@@ -52,6 +53,8 @@ class MLXQwen2Runner:
             return [MLXGenerationResult([], 0.0, 0.0) for _ in prompt_token_ids]
 
         batch_size = len(prompt_token_ids)
+        if compiled_decode and batch_size != 1:
+            raise ValueError("compiled_decode currently supports batch_size=1 only")
         capacity = next(iter(lengths)) + max_new_tokens
         cache = MLXKVCache(self.model_config, capacity, batch_size=batch_size)
         prompt = mx.array(prompt_token_ids, dtype=mx.uint32)
@@ -62,14 +65,25 @@ class MLXQwen2Runner:
         mx.eval(next_tokens)
         prefill_seconds = time.perf_counter() - prefill_start
 
+        compiled_step = None
+        if compiled_decode:
+            compiled_step = self.model.get_compiled_decode_fn()
+
         generated = [[int(token)] for token in next_tokens.tolist()]
         decode_start = time.perf_counter()
         while len(generated[0]) < max_new_tokens:
             if not disable_eos and eos_token_id is not None:
                 if all(tokens[-1] == eos_token_id for tokens in generated):
                     break
-            logits = self.model.forward(next_tokens.reshape(batch_size, 1), cache)
-            next_tokens = mx.argmax(logits[:, -1, :], axis=-1)
+            if compiled_decode:
+                assert compiled_step is not None
+                next_tokens, cache.k, cache.v = compiled_step(
+                    next_tokens.reshape(1, 1), mx.array(cache.offset, dtype=mx.int32), cache.k, cache.v
+                )
+                cache.advance(1)
+            else:
+                logits = self.model.forward(next_tokens.reshape(batch_size, 1), cache)
+                next_tokens = mx.argmax(logits[:, -1, :], axis=-1)
             mx.eval(next_tokens)
             for index, token in enumerate(next_tokens.tolist()):
                 if disable_eos or eos_token_id is None or generated[index][-1] != eos_token_id:
@@ -86,6 +100,7 @@ class MLXQwen2Runner:
         max_new_tokens: int,
         eos_token_id: int | None = None,
         disable_eos: bool = False,
+        compiled_decode: bool = False,
     ) -> MLXGenerationResult:
         if not prompt_token_ids:
             raise ValueError("prompt_token_ids must not be empty")
@@ -102,13 +117,24 @@ class MLXQwen2Runner:
         mx.eval(next_token)
         prefill_seconds = time.perf_counter() - prefill_start
 
+        compiled_step = None
+        if compiled_decode:
+            compiled_step = self.model.get_compiled_decode_fn()
+
         generated = [int(next_token.item())]
         decode_start = time.perf_counter()
         while len(generated) < max_new_tokens:
             if not disable_eos and eos_token_id is not None and generated[-1] == eos_token_id:
                 break
-            logits = self.model.forward(next_token.reshape(1, 1), cache)
-            next_token = mx.argmax(logits[:, -1, :], axis=-1)
+            if compiled_decode:
+                assert compiled_step is not None
+                next_token, cache.k, cache.v = compiled_step(
+                    next_token.reshape(1, 1), mx.array(cache.offset, dtype=mx.int32), cache.k, cache.v
+                )
+                cache.advance(1)
+            else:
+                logits = self.model.forward(next_token.reshape(1, 1), cache)
+                next_token = mx.argmax(logits[:, -1, :], axis=-1)
             mx.eval(next_token)
             generated.append(int(next_token.item()))
         decode_seconds = time.perf_counter() - decode_start

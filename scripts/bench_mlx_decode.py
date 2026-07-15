@@ -20,7 +20,7 @@ from miniservellm.mlx.runner import MLXQwen2Runner
 def build_fixed_context(tokenizer, context_len: int) -> list[int]:
     if context_len <= 0:
         raise ValueError("--context-len must be greater than 0")
-    seed = tokenizer.encode("请用至少500字来介绍机器学习", add_special_tokens=False)
+    seed = tokenizer.encode("请用至少1000字来介绍机器学习", add_special_tokens=False)
     if not seed:
         raise RuntimeError("Tokenizer returned an empty sequence")
     return (seed * ((context_len + len(seed) - 1) // len(seed)))[:context_len]
@@ -33,6 +33,7 @@ def main() -> None:
     parser.add_argument("--max-new", type=int, default=256)
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=1, help="同长度 MLX greedy batch size")
+    parser.add_argument("--compiled-decode", action="store_true", help="Use mx.compile Tensor-only batch=1 greedy Decode")
     parser.add_argument("--ollama-reference", type=float, default=90.0)
     args = parser.parse_args()
 
@@ -52,16 +53,32 @@ def main() -> None:
     runner = MLXQwen2Runner(model_config, safetensors_path)
     if args.batch_size <= 0:
         raise ValueError("--batch-size must be greater than 0")
+    if args.compiled_decode and args.batch_size != 1:
+        raise ValueError("--compiled-decode currently requires --batch-size 1")
     prompt = build_fixed_context(tokenizer, args.context_len)
     prompts = [prompt] * args.batch_size
     print(f"[mlx] prompt = {prompt}")
 
-    print("[mlx] warmup...")
-    runner.generate_greedy_batch(prompts, min(args.max_new, 16), disable_eos=True)
+    mode = "compiled" if args.compiled_decode else "eager"
+    print(f"[mlx] warmup mode={mode}...")
+    # Compiled decode needs full max_new for warmup so mx.compile traces the
+    # exact capacity used in measured runs; eager only needs a short warmup.
+    warmup_tokens = args.max_new if args.compiled_decode else min(args.max_new, 16)
+    runner.generate_greedy_batch(
+        prompts,
+        warmup_tokens,
+        disable_eos=True,
+        compiled_decode=args.compiled_decode,
+    )
 
     rates = []
     for index in range(args.runs):
-        results = runner.generate_greedy_batch(prompts, args.max_new, disable_eos=True)
+        results = runner.generate_greedy_batch(
+            prompts,
+            args.max_new,
+            disable_eos=True,
+            compiled_decode=args.compiled_decode,
+        )
         result = results[0]
         aggregate_rate = result.decode_tok_s * args.batch_size
         rates.append(aggregate_rate)
@@ -74,8 +91,8 @@ def main() -> None:
 
     median_rate = statistics.median(rates)
     print("\n[mlx decode-only summary]")
-    print(f"backend=mlx dtype=fp16 batch={args.batch_size} greedy=True")
-    print(f"context_len={args.context_len} max_new={args.max_new}")
+    print(f"backend=mlx dtype=fp16 batch={args.batch_size} greedy=True compiled_decode={args.compiled_decode}")
+    print(f"context_len={args.context_len} max_new={args.max_new} kv_capacity={args.context_len + args.max_new}")
     print(f"median_decode_tok/s={median_rate:.2f} min={min(rates):.2f} max={max(rates):.2f}")
     if args.ollama_reference > 0 and args.batch_size == 1:
         print(f"relative_to_ollama={median_rate / args.ollama_reference * 100.0:.1f}%")

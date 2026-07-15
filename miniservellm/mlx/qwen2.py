@@ -87,6 +87,7 @@ class MLXQwen2:
         self.scale = config.head_dim ** -0.5
         self.q_dim = config.num_attention_heads * config.head_dim
         self.kv_dim = config.num_key_value_heads * config.head_dim
+        self._compiled_decode: Optional[object] = None
 
     def _linear(self, x: mx.array, weight: mx.array, bias: Optional[mx.array] = None) -> mx.array:
         y = mx.matmul(x, weight.T)
@@ -143,6 +144,69 @@ class MLXQwen2:
     def project_last_hidden(self, hidden_states: mx.array) -> mx.array:
         """Project only the final token state to vocabulary logits."""
         return self._linear(hidden_states[:, -1:, :], self.weights.lm_head)
+
+    def _decode_greedy_step(
+        self,
+        token_ids: mx.array,
+        position: mx.array,
+        k_cache: mx.array,
+        v_cache: mx.array,
+    ) -> tuple[mx.array, mx.array, mx.array]:
+        """Single batch=1 decode step returning (next_token, k_cache_new, v_cache_new)."""
+        x = self.weights.embed_tokens[token_ids]
+        capacity = k_cache.shape[3]
+        valid_kv = mx.arange(capacity) <= position
+        attention_mask = valid_kv.reshape(1, 1, 1, capacity)
+
+        for layer_idx, layer in enumerate(self.weights.layers):
+            residual = x
+            x_norm = self._rms_norm(x, layer.input_layernorm)
+            qkv = self._linear(x_norm, layer.qkv_proj, layer.qkv_bias)
+            q, k, v = mx.split(qkv, [self.q_dim, self.q_dim + self.kv_dim], axis=-1)
+
+            q = q.reshape(1, 1, self.config.num_attention_heads, self.config.head_dim)
+            k = k.reshape(1, 1, self.config.num_key_value_heads, self.config.head_dim)
+            v = v.reshape(1, 1, self.config.num_key_value_heads, self.config.head_dim)
+            q = mx.transpose(q, (0, 2, 1, 3))
+            k = mx.transpose(k, (0, 2, 1, 3))
+            v = mx.transpose(v, (0, 2, 1, 3))
+            q = mx.fast.rope(q, self.config.head_dim, traditional=False, base=self.config.rope_theta, scale=1.0, offset=position)
+            k = mx.fast.rope(k, self.config.head_dim, traditional=False, base=self.config.rope_theta, scale=1.0, offset=position)
+
+            start = mx.concatenate([
+                mx.array([layer_idx, 0, 0], dtype=mx.uint32),
+                position.astype(mx.uint32).reshape(1),
+                mx.array([0], dtype=mx.uint32),
+            ])
+            k_cache = mx.slice_update(k_cache, k[None], start, axes=(0, 1, 2, 3, 4))
+            v_cache = mx.slice_update(v_cache, v[None], start, axes=(0, 1, 2, 3, 4))
+            attention = mx.fast.scaled_dot_product_attention(
+                q, k_cache[layer_idx], v_cache[layer_idx], scale=self.scale, mask=attention_mask
+            )
+            attention = mx.transpose(attention, (0, 2, 1, 3)).reshape(1, 1, self.config.hidden_size)
+            x = residual + self._linear(attention, layer.o_proj)
+
+            residual = x
+            x_norm = self._rms_norm(x, layer.post_attention_layernorm)
+            gate_up = self._linear(x_norm, layer.gate_up_proj)
+            gate, up = mx.split(gate_up, 2, axis=-1)
+            x = residual + self._linear(nn.silu(gate) * up, layer.down_proj)
+
+        hidden = self._rms_norm(x, self.weights.final_norm)
+        logits = self._linear(hidden, self.weights.lm_head)
+        next_token = mx.argmax(logits[:, -1, :], axis=-1)
+        return next_token, k_cache, v_cache
+
+    def get_compiled_decode_fn(self):
+        """Return a cached mx.compile'd batch=1 decode step.
+
+        The compiled function is created once and reused across calls.
+        KV cache arrays are passed as arguments (not captured state),
+        so the same compiled graph works for any cache of the same shape.
+        """
+        if self._compiled_decode is None:
+            self._compiled_decode = mx.compile(self._decode_greedy_step)
+        return self._compiled_decode
 
     def forward(self, token_ids: mx.array, cache: MLXKVCache) -> mx.array:
         """Compatibility helper returning logits for the final input position only."""
