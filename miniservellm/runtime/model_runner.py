@@ -1099,3 +1099,58 @@ class TransformerModelRunner:
         return DecodeModelOutput(
             logits_by_request={req.request_id: logits[i] for i, req in enumerate(requests)}
         )
+
+    def _forward_decode_tensor_step(
+        self,
+        request: Request,
+        input_token: torch.Tensor,
+        write_slot: SlotRef,
+    ) -> torch.Tensor:
+        """单请求 Tensor-only Decode step，返回设备端 greedy token。"""
+        meta = DecodeRequestMetadata(
+            request_id=request.request_id,
+            input_token_id=0,  # input_token 保持在设备端；该字段不参与本方法的前向。
+            query_position=write_slot.logical_pos,
+            context_len=write_slot.logical_pos + 1,
+            write_slot=write_slot,
+        )
+        context_len = meta.context_len
+        max_ctx = self._bucket_len(context_len)
+        block_ids, block_offsets = self.kv_cache_manager.build_decode_batch_indices(
+            [request], [context_len], padded_max_ctx=max_ctx,
+        )
+        write_block_ids, write_block_offsets = self.kv_cache_manager.slot_refs_to_indices([write_slot])
+        gather_ctx = DecodeBatchGatherCtx(
+            positions=torch.tensor([meta.query_position], device=self._device, dtype=torch.long),
+            write_slots=[write_slot],
+            write_block_ids=write_block_ids,
+            write_block_offsets=write_block_offsets,
+            block_ids=block_ids,
+            block_offsets=block_offsets,
+            context_lens_tensor=torch.tensor([context_len], device=self._device, dtype=torch.long),
+            valid_batch_size=1,
+            block_table_tensor=None,
+        )
+        hidden_states = self._embed(input_token)
+        hidden_states = self._decode_layers_fn(hidden_states, [meta], [request], gather_ctx)
+        return torch.argmax(self._project_logits(hidden_states), dim=-1)
+
+    @torch.inference_mode()
+    def forward_decode_greedy_unrolled(
+        self,
+        request: Request,
+        input_token_id: int,
+        write_slots: List[SlotRef],
+    ) -> torch.Tensor:
+        """实验性 batch=1 greedy Decode：连续提交 K 步，末尾才同步 token。"""
+        if self._device.type != "mps":
+            raise RuntimeError("Unrolled greedy decode currently supports MPS only.")
+        if not write_slots:
+            return torch.empty(0, device=self._device, dtype=torch.long)
+
+        input_token = torch.tensor([input_token_id], device=self._device, dtype=torch.long)
+        output_tokens: List[torch.Tensor] = []
+        for slot in write_slots:
+            input_token = self._forward_decode_tensor_step(request, input_token, slot)
+            output_tokens.append(input_token)
+        return torch.cat(output_tokens, dim=0)

@@ -70,7 +70,7 @@ def release_engine(engine) -> None:
         torch.mps.empty_cache()
 
 
-def run_decode_only_trial(engine, prompt_token_ids, max_new: int):
+def run_decode_only_trial(engine, prompt_token_ids, max_new: int, unrolled_steps: int = 0):
     """完成 prefill 后，仅计量首 token 之后的 decode。"""
     sp = SamplingParams(temperature=0.0, top_k=0, top_p=1.0, repetition_penalty=1.0)
     rid = engine.add_request(
@@ -89,7 +89,10 @@ def run_decode_only_trial(engine, prompt_token_ids, max_new: int):
     decode_start_count = request.total_generated_tokens()
     sync_device(engine.model_runner.device)
     decode_start = time.perf_counter()
-    engine.run_until_all_finished(collect_results=False)
+    if unrolled_steps:
+        _run_unrolled_decode_only(engine, request, unrolled_steps)
+    else:
+        engine.run_until_all_finished(collect_results=False)
     sync_device(engine.model_runner.device)
     decode_elapsed = time.perf_counter() - decode_start
 
@@ -102,13 +105,37 @@ def run_decode_only_trial(engine, prompt_token_ids, max_new: int):
     }
 
 
+def _run_unrolled_decode_only(engine, request, unrolled_steps: int) -> None:
+    """仅供 decode-only benchmark 使用的隔离 unrolled greedy decode。"""
+    while request.can_decode_more():
+        num_steps = min(unrolled_steps, request.max_new_tokens - request.total_generated_tokens())
+        write_slots = engine.kv_cache_manager.ensure_slots_for_request(request, num_steps)
+        input_token_id = request.pending_prefill_sample_token_id
+        if input_token_id is None:
+            input_token_id = request.last_token_id_for_decode_input()
+        request.pending_prefill_sample_token_id = None
+
+        # 只在 K 步都提交到 MPS 后才同步并取回 token。
+        token_ids = engine.model_runner.forward_decode_greedy_unrolled(
+            request=request,
+            input_token_id=input_token_id,
+            write_slots=write_slots,
+        )
+        sync_device(engine.model_runner.device)
+        for token_id in token_ids.tolist():
+            request.append_generated_token(int(token_id))
+
+    request.mark_finished_max_new_tokens()
+    engine._finish_request(request, [])
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="Qwen/Qwen2.5-0.5B-Instruct")
     parser.add_argument("--batch-list", default="1,4,8")
     parser.add_argument("--max-new", type=int, default=512)
     parser.add_argument("--runs", type=int, default=1)
-    parser.add_argument("--prompt", default="请用至少500字来介绍机器学习，")
+    parser.add_argument("--prompt", default="请用至少500字来介绍机器学习")
     parser.add_argument("--greedy", action="store_true", help="使用贪心解码（temperature=0）")
     parser.add_argument("--decode-only", action="store_true", help="batch=1，仅统计首 token 之后的 decode 吞吐")
     parser.add_argument("--context-len", type=int, default=None, help="decode-only 模式的精确 prompt token 数；不指定时用 --prompt 的真实 token 长度")
@@ -120,6 +147,12 @@ def main():
     parser.add_argument("--compile-fullgraph", action="store_true", help="torch.compile fullgraph 模式")
     parser.add_argument("--context-bucket-multiple", type=int, default=None, help="context长度分桶粒度；MPS默认32，显式传0关闭")
     parser.add_argument("--decode-batch-bucket-multiple", type=int, default=0, help="decode batch分桶粒度，0表示关闭")
+    parser.add_argument(
+        "--unrolled-decode-steps",
+        type=int,
+        default=0,
+        help="实验：decode-only MPS greedy 每次连续提交 K 步；0 表示关闭",
+    )
     # Stage 8 M5：kernel A/B 对比开关
     parser.add_argument("--no-custom-kernels", action="store_true",
                         help="禁用 mini_llm_kernels 自定义 CUDA kernel，强制走 PyTorch fallback（Stage 8 A/B 对比用）")
@@ -188,6 +221,12 @@ def main():
     if args.decode_only:
         if args.max_new < 2:
             raise ValueError("--max-new must be at least 2 in --decode-only mode")
+        if args.unrolled_decode_steps < 0:
+            raise ValueError("--unrolled-decode-steps must be non-negative")
+        if args.unrolled_decode_steps == 1:
+            raise ValueError("--unrolled-decode-steps must be 0 or >= 2")
+        if args.unrolled_decode_steps and ec.device.type != "mps":
+            raise ValueError("unrolled decode experiment currently supports MPS only")
 
         # 构建 prompt token ids：指定 context_len 时用固定长度填充，否则用 --prompt 的真实 token
         if args.context_len is not None:
@@ -217,15 +256,20 @@ def main():
 
         print(
             f"\n[decode-only] model={args.model} device={ec.device} dtype={ec.dtype} "
-            f"batch=1 context_len={context_len} max_new={args.max_new} greedy=True"
+            f"batch=1 context_len={context_len} max_new={args.max_new} greedy=True "
+            f"unrolled_steps={args.unrolled_decode_steps}"
         )
         engine = make_engine()
         print("[decode-only] warmup...")
-        run_decode_only_trial(engine, prompt_token_ids, min(args.max_new, 16))
+        run_decode_only_trial(
+            engine, prompt_token_ids, min(args.max_new, 16), args.unrolled_decode_steps
+        )
 
         results = []
         for run_idx in range(args.runs):
-            result = run_decode_only_trial(engine, prompt_token_ids, args.max_new)
+            result = run_decode_only_trial(
+                engine, prompt_token_ids, args.max_new, args.unrolled_decode_steps
+            )
             results.append(result)
             print(
                 f"run={run_idx + 1} prefill_s={result['prefill_elapsed']:.3f} "
