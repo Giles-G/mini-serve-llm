@@ -35,6 +35,51 @@ class MLXQwen2Runner:
         self.model = MLXQwen2(model_config, self.weights)
         mx.eval(self.weights.embed_tokens)
 
+    def generate_greedy_batch(
+        self,
+        prompt_token_ids: List[List[int]],
+        max_new_tokens: int,
+        eos_token_id: int | None = None,
+        disable_eos: bool = False,
+    ) -> List[MLXGenerationResult]:
+        """Same-length batch greedy baseline for MLX throughput experiments."""
+        if not prompt_token_ids:
+            return []
+        lengths = {len(prompt) for prompt in prompt_token_ids}
+        if len(lengths) != 1:
+            raise ValueError("generate_greedy_batch requires prompts with equal token length")
+        if max_new_tokens <= 0:
+            return [MLXGenerationResult([], 0.0, 0.0) for _ in prompt_token_ids]
+
+        batch_size = len(prompt_token_ids)
+        capacity = next(iter(lengths)) + max_new_tokens
+        cache = MLXKVCache(self.model_config, capacity, batch_size=batch_size)
+        prompt = mx.array(prompt_token_ids, dtype=mx.uint32)
+
+        prefill_start = time.perf_counter()
+        logits = self.model.forward(prompt, cache)
+        next_tokens = mx.argmax(logits[:, -1, :], axis=-1)
+        mx.eval(next_tokens)
+        prefill_seconds = time.perf_counter() - prefill_start
+
+        generated = [[int(token)] for token in next_tokens.tolist()]
+        decode_start = time.perf_counter()
+        while len(generated[0]) < max_new_tokens:
+            if not disable_eos and eos_token_id is not None:
+                if all(tokens[-1] == eos_token_id for tokens in generated):
+                    break
+            logits = self.model.forward(next_tokens.reshape(batch_size, 1), cache)
+            next_tokens = mx.argmax(logits[:, -1, :], axis=-1)
+            mx.eval(next_tokens)
+            for index, token in enumerate(next_tokens.tolist()):
+                if disable_eos or eos_token_id is None or generated[index][-1] != eos_token_id:
+                    generated[index].append(int(token))
+        decode_seconds = time.perf_counter() - decode_start
+        return [
+            MLXGenerationResult(tokens, prefill_seconds, decode_seconds)
+            for tokens in generated
+        ]
+
     def generate_greedy(
         self,
         prompt_token_ids: List[int],

@@ -32,6 +32,7 @@ def main() -> None:
     parser.add_argument("--context-len", type=int, default=128)
     parser.add_argument("--max-new", type=int, default=256)
     parser.add_argument("--runs", type=int, default=5)
+    parser.add_argument("--batch-size", type=int, default=1, help="同长度 MLX greedy batch size")
     parser.add_argument("--ollama-reference", type=float, default=90.0)
     args = parser.parse_args()
 
@@ -49,29 +50,37 @@ def main() -> None:
 
     print(f"[mlx] loading {args.model} from {safetensors_path}")
     runner = MLXQwen2Runner(model_config, safetensors_path)
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be greater than 0")
     prompt = build_fixed_context(tokenizer, args.context_len)
+    prompts = [prompt] * args.batch_size
     print(f"[mlx] prompt = {prompt}")
 
     print("[mlx] warmup...")
-    runner.generate_greedy(prompt, min(args.max_new, 16), disable_eos=True)
+    runner.generate_greedy_batch(prompts, min(args.max_new, 16), disable_eos=True)
 
     rates = []
     for index in range(args.runs):
-        result = runner.generate_greedy(prompt, args.max_new, disable_eos=True)
-        rates.append(result.decode_tok_s)
+        results = runner.generate_greedy_batch(prompts, args.max_new, disable_eos=True)
+        result = results[0]
+        aggregate_rate = result.decode_tok_s * args.batch_size
+        rates.append(aggregate_rate)
         print(
             f"run={index + 1} prefill_s={result.prefill_seconds:.3f} "
-            f"decode_tokens={len(result.generated_token_ids) - 1} "
-            f"decode_s={result.decode_seconds:.3f} decode_tok/s={result.decode_tok_s:.2f}"
+            f"decode_tokens/request={len(result.generated_token_ids) - 1} "
+            f"decode_s={result.decode_seconds:.3f} aggregate_tok/s={aggregate_rate:.2f} "
+            f"per_request_tok/s={result.decode_tok_s:.2f}"
         )
 
     median_rate = statistics.median(rates)
     print("\n[mlx decode-only summary]")
-    print("backend=mlx dtype=fp16 batch=1 greedy=True")
+    print(f"backend=mlx dtype=fp16 batch={args.batch_size} greedy=True")
     print(f"context_len={args.context_len} max_new={args.max_new}")
     print(f"median_decode_tok/s={median_rate:.2f} min={min(rates):.2f} max={max(rates):.2f}")
-    if args.ollama_reference > 0:
+    if args.ollama_reference > 0 and args.batch_size == 1:
         print(f"relative_to_ollama={median_rate / args.ollama_reference * 100.0:.1f}%")
+    elif args.batch_size > 1:
+        print("note=aggregate throughput; do not compare directly with single-request Ollama eval rate")
 
 
 if __name__ == "__main__":

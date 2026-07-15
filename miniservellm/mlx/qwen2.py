@@ -33,12 +33,19 @@ class MLXWeights:
 class MLXKVCache:
     """Continuous per-layer KV cache for single-request MLX decode."""
 
-    def __init__(self, config: ModelConfig, max_context: int, dtype: mx.Dtype = mx.float16):
+    def __init__(
+        self,
+        config: ModelConfig,
+        max_context: int,
+        batch_size: int = 1,
+        dtype: mx.Dtype = mx.float16,
+    ):
         self.max_context = max_context
+        self.batch_size = batch_size
         self.offset = 0
         shape = (
             config.num_hidden_layers,
-            1,
+            batch_size,
             config.num_key_value_heads,
             max_context,
             config.head_dim,
@@ -61,6 +68,16 @@ class MLXKVCache:
 
     def advance(self, length: int) -> None:
         self.offset += length
+
+    def clone(self) -> "MLXKVCache":
+        """Create a cheap functional snapshot; later slice_update calls do not mutate this cache."""
+        clone = object.__new__(MLXKVCache)
+        clone.max_context = self.max_context
+        clone.batch_size = self.batch_size
+        clone.offset = self.offset
+        clone.k = self.k
+        clone.v = self.v
+        return clone
 
 
 class MLXQwen2:
@@ -105,8 +122,8 @@ class MLXQwen2:
         out = mx.transpose(out, (0, 2, 1, 3)).reshape(batch, length, self.config.hidden_size)
         return self._linear(out, layer.o_proj)
 
-    def forward(self, token_ids: mx.array, cache: MLXKVCache) -> mx.array:
-        """Forward [1, T] tokens and update the KV cache."""
+    def forward_hidden(self, token_ids: mx.array, cache: MLXKVCache) -> mx.array:
+        """Forward [B, T] tokens and return final hidden states after KV update."""
         x = self.weights.embed_tokens[token_ids]
         offset = cache.offset
         for layer_idx, layer in enumerate(self.weights.layers):
@@ -121,4 +138,12 @@ class MLXQwen2:
             x = residual + self._linear(nn.silu(gate) * up, layer.down_proj)
 
         cache.advance(token_ids.shape[1])
-        return self._linear(self._rms_norm(x, self.weights.final_norm), self.weights.lm_head)
+        return self._rms_norm(x, self.weights.final_norm)
+
+    def project_last_hidden(self, hidden_states: mx.array) -> mx.array:
+        """Project only the final token state to vocabulary logits."""
+        return self._linear(hidden_states[:, -1:, :], self.weights.lm_head)
+
+    def forward(self, token_ids: mx.array, cache: MLXKVCache) -> mx.array:
+        """Compatibility helper returning logits for the final input position only."""
+        return self.project_last_hidden(self.forward_hidden(token_ids, cache))
