@@ -42,6 +42,7 @@ class MLXQwen2Runner:
         eos_token_id: int | None = None,
         disable_eos: bool = False,
         compiled_decode: bool = False,
+        use_custom_attn: bool = False,
     ) -> List[MLXGenerationResult]:
         """Same-length batch greedy baseline for MLX throughput experiments."""
         if not prompt_token_ids:
@@ -53,8 +54,10 @@ class MLXQwen2Runner:
             return [MLXGenerationResult([], 0.0, 0.0) for _ in prompt_token_ids]
 
         batch_size = len(prompt_token_ids)
-        if compiled_decode and batch_size != 1:
-            raise ValueError("compiled_decode currently supports batch_size=1 only")
+        if (compiled_decode or use_custom_attn) and batch_size != 1:
+            raise ValueError("compiled_decode/use_custom_attn currently supports batch_size=1 only")
+        if compiled_decode and use_custom_attn:
+            raise ValueError("compiled_decode and use_custom_attn are mutually exclusive")
         capacity = next(iter(lengths)) + max_new_tokens
         cache = MLXKVCache(self.model_config, capacity, batch_size=batch_size)
         prompt = mx.array(prompt_token_ids, dtype=mx.uint32)
@@ -75,10 +78,15 @@ class MLXQwen2Runner:
             if not disable_eos and eos_token_id is not None:
                 if all(tokens[-1] == eos_token_id for tokens in generated):
                     break
-            if compiled_decode:
+            if use_custom_attn:
+                next_tokens, cache.k_layers, cache.v_layers = self.model._decode_greedy_step(
+                    next_tokens.reshape(1, 1), mx.array(cache.offset, dtype=mx.int32), cache.k_layers, cache.v_layers, use_custom_attn=True
+                )
+                cache.advance(1)
+            elif compiled_decode:
                 assert compiled_step is not None
-                next_tokens, cache.k, cache.v = compiled_step(
-                    next_tokens.reshape(1, 1), mx.array(cache.offset, dtype=mx.int32), cache.k, cache.v
+                next_tokens, cache.k_layers, cache.v_layers = compiled_step(
+                    next_tokens.reshape(1, 1), mx.array(cache.offset, dtype=mx.int32), cache.k_layers, cache.v_layers
                 )
                 cache.advance(1)
             else:
@@ -101,9 +109,12 @@ class MLXQwen2Runner:
         eos_token_id: int | None = None,
         disable_eos: bool = False,
         compiled_decode: bool = False,
+        use_custom_attn: bool = False,
     ) -> MLXGenerationResult:
         if not prompt_token_ids:
             raise ValueError("prompt_token_ids must not be empty")
+        if compiled_decode and use_custom_attn:
+            raise ValueError("compiled_decode and use_custom_attn are mutually exclusive")
         if max_new_tokens <= 0:
             return MLXGenerationResult([], 0.0, 0.0)
 
@@ -126,10 +137,15 @@ class MLXQwen2Runner:
         while len(generated) < max_new_tokens:
             if not disable_eos and eos_token_id is not None and generated[-1] == eos_token_id:
                 break
-            if compiled_decode:
+            if use_custom_attn:
+                next_token, cache.k_layers, cache.v_layers = self.model._decode_greedy_step(
+                    next_token.reshape(1, 1), mx.array(cache.offset, dtype=mx.int32), cache.k_layers, cache.v_layers, use_custom_attn=True
+                )
+                cache.advance(1)
+            elif compiled_decode:
                 assert compiled_step is not None
-                next_token, cache.k, cache.v = compiled_step(
-                    next_token.reshape(1, 1), mx.array(cache.offset, dtype=mx.int32), cache.k, cache.v
+                next_token, cache.k_layers, cache.v_layers = compiled_step(
+                    next_token.reshape(1, 1), mx.array(cache.offset, dtype=mx.int32), cache.k_layers, cache.v_layers
                 )
                 cache.advance(1)
             else:
