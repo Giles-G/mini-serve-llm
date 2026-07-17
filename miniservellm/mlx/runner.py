@@ -35,6 +35,193 @@ class MLXQwen2Runner:
         self.model = MLXQwen2(model_config, self.weights)
         mx.eval(self.weights.embed_tokens)
 
+    def prefill_batch(
+        self,
+        prompt_token_ids: List[List[int]],
+        max_new_tokens: int,
+    ) -> tuple[MLXKVCache, mx.array]:
+        """Prefill an equal-length request batch and return cache plus [B, vocab] logits.
+
+        The serving engine owns request lifecycle and sampling; this primitive only
+        performs the model-side operation needed to admit one fixed batch.
+        """
+        if not prompt_token_ids:
+            raise ValueError("prompt_token_ids must not be empty")
+        lengths = {len(prompt) for prompt in prompt_token_ids}
+        if len(lengths) != 1:
+            raise ValueError("prefill_batch requires prompts with equal token length")
+        if max_new_tokens <= 0:
+            raise ValueError("max_new_tokens must be greater than 0")
+
+        batch_size = len(prompt_token_ids)
+        capacity = next(iter(lengths)) + max_new_tokens
+        cache = MLXKVCache(self.model_config, capacity, batch_size=batch_size)
+        prompt = mx.array(prompt_token_ids, dtype=mx.uint32)
+        logits = self.model.forward(prompt, cache)[:, -1, :]
+        return cache, logits
+
+    def decode_batch(self, token_ids: mx.array, cache: MLXKVCache) -> mx.array:
+        """Decode one token for every row of an existing fixed MLX batch."""
+        if token_ids.ndim != 1 or token_ids.shape[0] != cache.batch_size:
+            raise ValueError("token_ids must have shape [batch_size]")
+        return self.model.forward(token_ids.reshape(cache.batch_size, 1), cache)[:, -1, :]
+
+    def prefill_dynamic_batch(
+        self,
+        prompt_token_ids: List[List[int]],
+        max_new_tokens: int,
+    ) -> tuple[MLXKVCache, mx.array]:
+        """Prefill unequal prompts into one per-slot-offset cache.
+
+        Each row is prefetched independently to preserve its true causal length,
+        then copied into its row of a shared batch cache. Decode thereafter is
+        batched. This is the correctness-first phase-2 path; phase 5 will replace
+        these row copies with masked padded prefill and batched KV scatter.
+        """
+        if not prompt_token_ids:
+            raise ValueError("prompt_token_ids must not be empty")
+        if max_new_tokens <= 0:
+            raise ValueError("max_new_tokens must be greater than 0")
+        if any(not prompt for prompt in prompt_token_ids):
+            raise ValueError("prompt_token_ids must not contain empty prompts")
+
+        batch_size = len(prompt_token_ids)
+        capacity = max(len(prompt) for prompt in prompt_token_ids) + max_new_tokens
+        batch_cache = MLXKVCache(self.model_config, capacity, batch_size=batch_size)
+        logits_rows: List[mx.array] = []
+        for row, prompt_ids in enumerate(prompt_token_ids):
+            row_cache = MLXKVCache(self.model_config, capacity)
+            logits = self.model.forward(mx.array([prompt_ids], dtype=mx.uint32), row_cache)[:, -1, :]
+            logits_rows.append(logits)
+            for layer_idx in range(self.model_config.num_hidden_layers):
+                start = mx.array([row, 0, 0, 0], dtype=mx.uint32)
+                batch_cache.k_layers[layer_idx] = mx.slice_update(
+                    batch_cache.k_layers[layer_idx], row_cache.k_layers[layer_idx], start, axes=(0, 1, 2, 3)
+                )
+                batch_cache.v_layers[layer_idx] = mx.slice_update(
+                    batch_cache.v_layers[layer_idx], row_cache.v_layers[layer_idx], start, axes=(0, 1, 2, 3)
+                )
+        batch_cache.set_slot_offsets([len(prompt) for prompt in prompt_token_ids])
+        return batch_cache, mx.concatenate(logits_rows, axis=0)
+
+    def prefill_dynamic_slots(
+        self,
+        cache: MLXKVCache,
+        slot_indices: List[int],
+        prompt_token_ids: List[List[int]],
+    ) -> mx.array:
+        """Prefill requests independently and install their state in existing slots.
+
+        The shared cache keeps a fixed batch shape. Only the supplied rows are
+        replaced, which lets the serving engine refill a completed slot without
+        disturbing other requests that are still decoding.
+        """
+        if len(slot_indices) != len(prompt_token_ids) or not slot_indices:
+            raise ValueError("slot_indices and prompt_token_ids must be non-empty and equally sized")
+        if len(set(slot_indices)) != len(slot_indices):
+            raise ValueError("slot_indices must be unique")
+        if any(slot < 0 or slot >= cache.batch_size for slot in slot_indices):
+            raise ValueError("slot index is outside cache batch size")
+        if any(not prompt for prompt in prompt_token_ids):
+            raise ValueError("prompt_token_ids must not contain empty prompts")
+        if any(len(prompt) >= cache.max_context for prompt in prompt_token_ids):
+            raise ValueError("prompt leaves no decode capacity in the shared cache")
+
+        logits_rows: List[mx.array] = []
+        for slot, prompt_ids in zip(slot_indices, prompt_token_ids):
+            row_cache = MLXKVCache(self.model_config, cache.max_context)
+            logits = self.model.forward(
+                mx.array([prompt_ids], dtype=mx.uint32), row_cache
+            )[:, -1, :]
+            logits_rows.append(logits)
+            for layer_idx in range(self.model_config.num_hidden_layers):
+                start = mx.array([slot, 0, 0, 0], dtype=mx.uint32)
+                cache.k_layers[layer_idx] = mx.slice_update(
+                    cache.k_layers[layer_idx],
+                    row_cache.k_layers[layer_idx],
+                    start,
+                    axes=(0, 1, 2, 3),
+                )
+                cache.v_layers[layer_idx] = mx.slice_update(
+                    cache.v_layers[layer_idx],
+                    row_cache.v_layers[layer_idx],
+                    start,
+                    axes=(0, 1, 2, 3),
+                )
+            cache.slot_offsets[slot] = len(prompt_ids)
+        return mx.concatenate(logits_rows, axis=0)
+
+    def decode_static_batch(
+        self,
+        token_ids: mx.array,
+        cache: MLXKVCache,
+        compiled_decode: bool = False,
+        greedy: bool = False,
+    ) -> mx.array:
+        """Decode a full batch sharing one KV cursor without dynamic masking.
+
+        When ``greedy=True`` and ``compiled_decode=True``, uses an argmax-fused
+        compiled graph that returns ``[batch]`` token ids instead of
+        ``[batch, vocab]`` logits, avoiding logits materialisation.
+        """
+        if token_ids.ndim != 1 or token_ids.shape[0] != cache.batch_size:
+            raise ValueError("token_ids must have shape [batch_size]")
+        if len(set(cache.slot_offsets)) != 1:
+            raise ValueError("decode_static_batch requires equal slot offsets")
+        if compiled_decode:
+            if greedy:
+                compiled_step = self.model.get_compiled_static_decode_greedy_fn(
+                    cache.batch_size, cache.max_context, cache.k_layers[0].dtype
+                )
+                next_tokens, cache.k_layers, cache.v_layers = compiled_step(
+                    token_ids.reshape(cache.batch_size, 1),
+                    mx.array(cache.offset, dtype=mx.int32),
+                    cache.k_layers,
+                    cache.v_layers,
+                )
+                cache.advance(1)
+                return next_tokens
+            compiled_step = self.model.get_compiled_static_decode_fn(
+                cache.batch_size, cache.max_context, cache.k_layers[0].dtype
+            )
+            logits, cache.k_layers, cache.v_layers = compiled_step(
+                token_ids.reshape(cache.batch_size, 1),
+                mx.array(cache.offset, dtype=mx.int32),
+                cache.k_layers,
+                cache.v_layers,
+            )
+            cache.advance(1)
+            return logits
+        return self.decode_batch(token_ids, cache)
+
+    def decode_dynamic_batch(
+        self,
+        token_ids: mx.array,
+        cache: MLXKVCache,
+        active_rows: List[bool],
+        compiled_decode: bool = False,
+    ) -> mx.array:
+        """Decode one token using each active row's independent KV offset."""
+        if token_ids.ndim != 1 or token_ids.shape[0] != cache.batch_size:
+            raise ValueError("token_ids must have shape [batch_size]")
+        if compiled_decode:
+            compiled_step = self.model.get_compiled_dynamic_decode_fn(
+                cache.batch_size, cache.max_context, cache.k_layers[0].dtype
+            )
+            logits, cache.k_layers, cache.v_layers = compiled_step(
+                token_ids.reshape(cache.batch_size, 1),
+                mx.array(cache.slot_offsets, dtype=mx.uint32),
+                mx.array(active_rows, dtype=mx.bool_),
+                cache.k_layers,
+                cache.v_layers,
+            )
+            cache.advance_slots(active_rows)
+            return logits
+        hidden = self.model.forward_hidden_dynamic_decode(
+            token_ids.reshape(cache.batch_size, 1), cache, active_rows
+        )
+        return self.model.project_last_hidden(hidden)[:, -1, :]
+
     def generate_greedy_batch(
         self,
         prompt_token_ids: List[List[int]],

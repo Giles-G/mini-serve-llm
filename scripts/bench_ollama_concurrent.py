@@ -41,6 +41,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from miniservellm.model_adapter.adapters.qwen2_adapter import Qwen2Adapter
+
 
 @dataclass(frozen=True)
 class RequestResult:
@@ -53,6 +55,7 @@ class RequestResult:
     prompt_eval_seconds: float
     eval_seconds: float
     total_seconds: float
+    response: str
 
     @property
     def decode_tok_s(self) -> float:
@@ -89,6 +92,10 @@ def post_generate(
         "model": model,
         "prompt": prompt,
         "stream": False,
+        # Match the direct raw token-ID inputs used by HF/MLX parity checks.
+        # Without this, Ollama applies the model chat template and runs a
+        # different token sequence despite receiving the same prompt string.
+        "raw": True,
         # Keep sampling deterministic and avoid EOS shortening the measured decode.
         "options": {"num_predict": max_new, "temperature": 0, "seed": 0},
     }
@@ -119,6 +126,7 @@ def post_generate(
         prompt_eval_seconds=float(body.get("prompt_eval_duration", 0)) / 1e9,
         eval_seconds=float(body.get("eval_duration", 0)) / 1e9,
         total_seconds=float(body.get("total_duration", 0)) / 1e9,
+        response=str(body.get("response", "")),
     )
 
 
@@ -126,9 +134,8 @@ def run_round(
     *,
     base_url: str,
     model: str,
-    prompt: str,
-    max_new: int,
-    requests: int,
+    prompts: list[str],
+    max_new_list: list[int],
     concurrency: int,
     timeout: float,
 ) -> tuple[list[RequestResult], float]:
@@ -140,12 +147,12 @@ def run_round(
                 post_generate,
                 base_url,
                 model,
-                prompt,
-                max_new,
+                prompts[request_index],
+                max_new_list[request_index],
                 timeout,
                 request_index,
             )
-            for request_index in range(requests)
+            for request_index in range(len(prompts))
         ]
         results = [future.result() for future in futures]
     return results, time.perf_counter() - started
@@ -173,6 +180,16 @@ def main() -> None:
         default=None,
         help="Exact prompt text. When omitted, a synthetic prompt is built from --context-len.",
     )
+    parser.add_argument(
+        "--chat-template",
+        action="store_true",
+        help="Render --prompt with the HF Qwen tokenizer template before sending it as raw Ollama input.",
+    )
+    parser.add_argument(
+        "--template-model",
+        default="Qwen/Qwen2.5-0.5B-Instruct",
+        help="HF tokenizer used by --chat-template; must match the Ollama model family.",
+    )
     parser.add_argument("--context-len", type=int, default=128, help="Approximate synthetic prompt word count")
     parser.add_argument("--max-new", type=int, default=256, help="Requested generated tokens per request")
     parser.add_argument("--concurrency", type=int, default=1, help="Maximum requests in flight")
@@ -180,6 +197,16 @@ def main() -> None:
     parser.add_argument("--runs", type=int, default=3, help="Measured rounds; median aggregate throughput is reported")
     parser.add_argument("--warmup-requests", type=int, default=1, help="Requests sent before measurement (0 disables warmup)")
     parser.add_argument("--timeout", type=float, default=300.0, help="Per-request HTTP timeout in seconds")
+    parser.add_argument(
+        "--heterogeneous-prompts",
+        action="store_true",
+        help="Vary prompt lengths within the batch (synthetic prompts only).",
+    )
+    parser.add_argument(
+        "--heterogeneous-max-new",
+        action="store_true",
+        help="Vary max_new_tokens per request to simulate heterogeneous generation.",
+    )
     args = parser.parse_args()
 
     if args.max_new <= 0:
@@ -195,29 +222,62 @@ def main() -> None:
     if args.timeout <= 0:
         raise ValueError("--timeout must be greater than 0")
 
+    if args.chat_template and args.prompt is None:
+        raise ValueError("--chat-template requires --prompt")
+    if args.heterogeneous_prompts and args.prompt is not None:
+        raise ValueError("--heterogeneous-prompts requires synthetic prompts (omit --prompt)")
     if args.prompt is not None:
         if not args.prompt.strip():
             raise ValueError("--prompt must not be empty")
-        prompt = args.prompt
-        prompt_source = "explicit"
+        if args.chat_template:
+            tokenizer = Qwen2Adapter().load_tokenizer(args.template_model, trust_remote_code=False)
+            prompt = tokenizer.apply_chat_template(
+                [{"role": "user", "content": args.prompt}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            prompt_source = f"qwen_chat_template:{args.template_model}"
+        else:
+            prompt = args.prompt
+            prompt_source = "explicit_raw"
     else:
         prompt = build_fixed_prompt(args.context_len)
         prompt_source = f"synthetic_context_len={args.context_len}"
 
+    # Build per-request prompt and max_new lists for heterogeneous mode.
+    def build_request_params(count: int) -> tuple[list[str], list[int]]:
+        if args.heterogeneous_prompts:
+            prompts = [
+                build_fixed_prompt(max(1, args.context_len - (index % min(4, args.context_len))))
+                for index in range(count)
+            ]
+        else:
+            prompts = [prompt] * count
+        if args.heterogeneous_max_new:
+            max_new_list = [
+                max(1, args.max_new - (index % min(4, args.max_new)))
+                for index in range(count)
+            ]
+        else:
+            max_new_list = [args.max_new] * count
+        return prompts, max_new_list
+
     print(
         f"[ollama] model={args.model} base_url={args.base_url} "
         f"concurrency={args.concurrency} requests/run={args.requests} "
-        f"max_new={args.max_new} prompt_source={prompt_source}"
+        f"max_new={args.max_new} prompt_source={prompt_source} "
+        f"heterogeneous_prompts={args.heterogeneous_prompts} "
+        f"heterogeneous_max_new={args.heterogeneous_max_new}"
     )
 
     if args.warmup_requests:
         print(f"[ollama] warmup requests={args.warmup_requests}...")
+        warmup_prompts, warmup_max_new = build_request_params(args.warmup_requests)
         run_round(
             base_url=args.base_url,
             model=args.model,
-            prompt=prompt,
-            max_new=args.max_new,
-            requests=args.warmup_requests,
+            prompts=warmup_prompts,
+            max_new_list=warmup_max_new,
             concurrency=min(args.concurrency, args.warmup_requests),
             timeout=args.timeout,
         )
@@ -225,17 +285,18 @@ def main() -> None:
     aggregate_rates: list[float] = []
     request_p50_latencies: list[float] = []
     request_p95_latencies: list[float] = []
-    server_decode_rates: list[float] = []
+    active_decode_rate_p50s: list[float] = []
     prompt_token_counts: list[int] = []
     output_token_counts: list[int] = []
+    final_request_outputs: list[str] = []
 
     for run_index in range(args.runs):
+        run_prompts, run_max_new = build_request_params(args.requests)
         results, round_seconds = run_round(
             base_url=args.base_url,
             model=args.model,
-            prompt=prompt,
-            max_new=args.max_new,
-            requests=args.requests,
+            prompts=run_prompts,
+            max_new_list=run_max_new,
             concurrency=args.concurrency,
             timeout=args.timeout,
         )
@@ -247,13 +308,15 @@ def main() -> None:
         aggregate_rates.append(aggregate_rate)
         request_p50_latencies.append(percentile(latencies, 0.50))
         request_p95_latencies.append(percentile(latencies, 0.95))
-        server_decode_rates.extend(per_request_server_rates)
+        active_decode_rate_p50s.append(statistics.median(per_request_server_rates))
         prompt_token_counts.extend(result.prompt_eval_count for result in results)
         output_token_counts.extend(result.eval_count for result in results)
+        final_request_outputs.append(max(results, key=lambda result: result.request_index).response)
 
         print(
             f"run={run_index + 1} wall_s={round_seconds:.3f} output_tokens={total_output_tokens} "
             f"aggregate_tok/s={aggregate_rate:.2f} "
+            f"active_decode_tok/s_p50={statistics.median(per_request_server_rates):.2f} "
             f"request_latency_p50_s={percentile(latencies, 0.50):.3f} "
             f"request_latency_p95_s={percentile(latencies, 0.95):.3f}"
         )
@@ -261,7 +324,9 @@ def main() -> None:
     print("\n[ollama concurrent summary]")
     print(
         f"model={args.model} concurrency={args.concurrency} requests/run={args.requests} "
-        f"runs={args.runs} stream=false"
+        f"runs={args.runs} stream=false raw=true "
+        f"heterogeneous_prompts={args.heterogeneous_prompts} "
+        f"heterogeneous_max_new={args.heterogeneous_max_new}"
     )
     print(
         f"actual_prompt_tokens_median={statistics.median(prompt_token_counts):.0f} "
@@ -275,8 +340,9 @@ def main() -> None:
         f"request_latency_p50_s_median={statistics.median(request_p50_latencies):.3f} "
         f"request_latency_p95_s_median={statistics.median(request_p95_latencies):.3f}"
     )
-    if server_decode_rates:
-        print(f"server_decode_tok/s_per_request_median={statistics.median(server_decode_rates):.2f}")
+    if active_decode_rate_p50s:
+        print(f"active_decode_tok/s_p50_median={statistics.median(active_decode_rate_p50s):.2f}")
+    print(f"final_request_output_run_{args.runs}={final_request_outputs[-1]!r}")
 
 
 if __name__ == "__main__":

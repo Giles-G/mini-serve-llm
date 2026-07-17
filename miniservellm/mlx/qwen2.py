@@ -48,33 +48,90 @@ class MLXKVCache:
     ):
         self.max_context = max_context
         self.batch_size = batch_size
-        self.offset = 0
+        # Every batch row owns an independent KV write cursor. Equal-length
+        # static batches keep these values identical; continuous serving does not.
+        self.slot_offsets = [0] * batch_size
         shape = (batch_size, config.num_key_value_heads, max_context, config.head_dim)
         self.k_layers = [mx.zeros(shape, dtype=dtype) for _ in range(config.num_hidden_layers)]
         self.v_layers = [mx.zeros(shape, dtype=dtype) for _ in range(config.num_hidden_layers)]
 
+    @property
+    def offset(self) -> int:
+        """Shared cursor compatibility accessor for legacy equal-length callers."""
+        if len(set(self.slot_offsets)) != 1:
+            raise ValueError("MLXKVCache has per-slot offsets; use slot_offsets instead of offset")
+        return self.slot_offsets[0]
+
+    def set_slot_offsets(self, offsets: List[int]) -> None:
+        if len(offsets) != self.batch_size:
+            raise ValueError("offset count must match batch_size")
+        if any(offset < 0 or offset > self.max_context for offset in offsets):
+            raise ValueError("slot offset is outside cache capacity")
+        self.slot_offsets = list(offsets)
+
     def update(self, layer_idx: int, k_new: mx.array, v_new: mx.array) -> Tuple[mx.array, mx.array]:
-        """Append [B, Hkv, T, D] KV and return the active continuous prefix."""
+        """Append equal-length KV to all rows at their shared cursor."""
+        if len(set(self.slot_offsets)) != 1:
+            raise ValueError("update requires equal slot offsets; use update_decode_rows")
         length = k_new.shape[2]
         if self.offset + length > self.max_context:
             raise ValueError("MLX KV cache capacity exceeded")
         start = mx.array([0, 0, self.offset, 0], dtype=mx.uint32)
         self.k_layers[layer_idx] = mx.slice_update(self.k_layers[layer_idx], k_new, start, axes=(0, 1, 2, 3))
         self.v_layers[layer_idx] = mx.slice_update(self.v_layers[layer_idx], v_new, start, axes=(0, 1, 2, 3))
-        return (
-            self.k_layers[layer_idx][:, :, : self.offset + length, :],
-            self.v_layers[layer_idx][:, :, : self.offset + length, :],
-        )
+        end = self.offset + length
+        return self.k_layers[layer_idx][:, :, :end, :], self.v_layers[layer_idx][:, :, :end, :]
+
+    def update_decode_rows(
+        self,
+        layer_idx: int,
+        k_new: mx.array,
+        v_new: mx.array,
+        active_rows: List[bool],
+    ) -> Tuple[mx.array, mx.array]:
+        """Scatter one KV token per active row at its independent cursor.
+
+        A single ``put_along_axis`` per K/V layer replaces the former per-row
+        ``slice_update`` and repeated batch-axis concatenation. Inactive rows
+        scatter their existing cache value back into the selected position.
+        """
+        if k_new.shape[2] != 1 or v_new.shape[2] != 1:
+            raise ValueError("update_decode_rows requires exactly one token per row")
+        if len(active_rows) != self.batch_size:
+            raise ValueError("active_rows count must match batch_size")
+        if any(active and offset >= self.max_context for offset, active in zip(self.slot_offsets, active_rows)):
+            raise ValueError("MLX KV cache capacity exceeded")
+
+        k_layer = self.k_layers[layer_idx]
+        v_layer = self.v_layers[layer_idx]
+        write_offsets = [min(offset, self.max_context - 1) for offset in self.slot_offsets]
+        offsets = mx.array(write_offsets, dtype=mx.uint32).reshape(self.batch_size, 1, 1, 1)
+        indices = mx.broadcast_to(offsets, (self.batch_size, k_layer.shape[1], 1, k_layer.shape[3]))
+        active_mask = mx.array(active_rows).reshape(self.batch_size, 1, 1, 1)
+        k_existing = mx.take_along_axis(k_layer, indices, axis=2)
+        v_existing = mx.take_along_axis(v_layer, indices, axis=2)
+        k_updates = mx.where(active_mask, k_new, k_existing)
+        v_updates = mx.where(active_mask, v_new, v_existing)
+        k_layer = mx.put_along_axis(k_layer, indices, k_updates, axis=2)
+        v_layer = mx.put_along_axis(v_layer, indices, v_updates, axis=2)
+        self.k_layers[layer_idx] = k_layer
+        self.v_layers[layer_idx] = v_layer
+        return k_layer, v_layer
 
     def advance(self, length: int) -> None:
-        self.offset += length
+        self.slot_offsets = [offset + length for offset in self.slot_offsets]
+
+    def advance_slots(self, active_rows: List[bool]) -> None:
+        if len(active_rows) != self.batch_size:
+            raise ValueError("active_rows count must match batch_size")
+        self.slot_offsets = [offset + int(active) for offset, active in zip(self.slot_offsets, active_rows)]
 
     def clone(self) -> "MLXKVCache":
         """Create a cheap functional snapshot; later slice_update calls do not mutate this cache."""
         clone = object.__new__(MLXKVCache)
         clone.max_context = self.max_context
         clone.batch_size = self.batch_size
-        clone.offset = self.offset
+        clone.slot_offsets = list(self.slot_offsets)
         clone.k_layers = list(self.k_layers)
         clone.v_layers = list(self.v_layers)
         return clone
@@ -88,6 +145,15 @@ class MLXQwen2:
         self.q_dim = config.num_attention_heads * config.head_dim
         self.kv_dim = config.num_key_value_heads * config.head_dim
         self._compiled_decode: Optional[object] = None
+        self._compiled_static_decodes: dict[tuple[int, int, int, str], object] = {}
+        self._compiled_static_decode_hits = 0
+        self._compiled_static_decode_misses = 0
+        self._compiled_static_decode_greedy: dict[tuple[int, int, int, str], object] = {}
+        self._compiled_static_decode_greedy_hits = 0
+        self._compiled_static_decode_greedy_misses = 0
+        self._compiled_dynamic_decodes: dict[tuple[int, int, int, str], object] = {}
+        self._compiled_dynamic_decode_hits = 0
+        self._compiled_dynamic_decode_misses = 0
         self._decode_attn_kernel: Optional[object] = None
         self._kernel_capacity: Optional[int] = None
         self._quant_bits: int = 0
@@ -110,6 +176,15 @@ class MLXQwen2:
             layer.down_proj = mx.quantize(layer.down_proj, group_size=group_size, bits=bits)
         # Force recompile since weight representation changed
         self._compiled_decode = None
+        self._compiled_static_decodes.clear()
+        self._compiled_static_decode_hits = 0
+        self._compiled_static_decode_misses = 0
+        self._compiled_static_decode_greedy.clear()
+        self._compiled_static_decode_greedy_hits = 0
+        self._compiled_static_decode_greedy_misses = 0
+        self._compiled_dynamic_decodes.clear()
+        self._compiled_dynamic_decode_hits = 0
+        self._compiled_dynamic_decode_misses = 0
 
     def _linear(self, x: mx.array, weight, bias: Optional[mx.array] = None) -> mx.array:
         if isinstance(weight, (tuple, list)):
@@ -126,6 +201,27 @@ class MLXQwen2:
 
     def _rms_norm(self, x: mx.array, weight: mx.array) -> mx.array:
         return mx.fast.rms_norm(x, weight, self.config.rms_norm_eps)
+
+    def _apply_rope_per_row(self, x: mx.array, positions: mx.array) -> mx.array:
+        """Apply RoPE with per-row position offsets using tensor ops.
+
+        Replaces the per-row ``mx.fast.rope`` Python loop that breaks graph
+        fusion and cannot be traced by ``mx.compile`` when offsets are runtime
+        values.
+
+        Args:
+            x: [batch, nheads, seqlen, head_dim]
+            positions: [batch] float32 — per-row decode offset.
+        """
+        half = self.config.head_dim // 2
+        inv_freq = self.config.rope_theta ** (
+            mx.arange(0, self.config.head_dim, 2, dtype=mx.float32) / -self.config.head_dim
+        )  # [half]
+        angles = positions[:, None] * inv_freq[None, :]  # [batch, half]
+        cos = mx.cos(angles)[:, None, None, :]  # [batch, 1, 1, half]
+        sin = mx.sin(angles)[:, None, None, :]
+        x1, x2 = x[..., :half], x[..., half:]
+        return mx.concatenate([x1 * cos - x2 * sin, x1 * sin + x2 * cos], axis=-1)
 
     def _attention(
         self,
@@ -175,9 +271,300 @@ class MLXQwen2:
         cache.advance(token_ids.shape[1])
         return self._rms_norm(x, self.weights.final_norm)
 
+    def forward_hidden_dynamic_decode(
+        self,
+        token_ids: mx.array,
+        cache: MLXKVCache,
+        active_rows: List[bool],
+    ) -> mx.array:
+        """Decode one token per active row with independent KV cursors.
+
+        This eager fallback uses per-row RoPE offsets and batched KV scatter.
+        The compiled fixed-shape counterpart below takes the cache arrays and
+        slot metadata as explicit graph inputs.
+        """
+        if token_ids.shape != (cache.batch_size, 1):
+            raise ValueError("token_ids must have shape [batch_size, 1]")
+        if len(active_rows) != cache.batch_size:
+            raise ValueError("active_rows count must match batch_size")
+
+        x = self.weights.embed_tokens[token_ids]
+        capacity = cache.max_context
+        positions = mx.arange(capacity)[None, None, None, :]
+        offsets = mx.array(cache.slot_offsets, dtype=mx.int32)[:, None, None, None]
+        valid_kv = positions <= offsets
+        inactive_kv = mx.arange(capacity)[None, None, None, :] == 0
+        active_mask = mx.array(active_rows).reshape(cache.batch_size, 1, 1, 1)
+        attention_mask = mx.where(active_mask, valid_kv, inactive_kv)
+
+        for layer_idx, layer in enumerate(self.weights.layers):
+            residual = x
+            x_norm = self._rms_norm(x, layer.input_layernorm)
+            qkv = self._linear(x_norm, layer.qkv_proj, layer.qkv_bias)
+            q, k, v = mx.split(qkv, [self.q_dim, self.q_dim + self.kv_dim], axis=-1)
+            q = mx.transpose(q.reshape(cache.batch_size, 1, self.config.num_attention_heads, self.config.head_dim), (0, 2, 1, 3))
+            k = mx.transpose(k.reshape(cache.batch_size, 1, self.config.num_key_value_heads, self.config.head_dim), (0, 2, 1, 3))
+            v = mx.transpose(v.reshape(cache.batch_size, 1, self.config.num_key_value_heads, self.config.head_dim), (0, 2, 1, 3))
+
+            # Per-row RoPE via tensor ops (no Python loop)
+            positions = mx.array(cache.slot_offsets, dtype=mx.float32)
+            q = self._apply_rope_per_row(q, positions)
+            k = self._apply_rope_per_row(k, positions)
+            k_all, v_all = cache.update_decode_rows(layer_idx, k, v, active_rows)
+            attention = mx.fast.scaled_dot_product_attention(q, k_all, v_all, scale=self.scale, mask=attention_mask)
+            attention = mx.transpose(attention, (0, 2, 1, 3)).reshape(cache.batch_size, 1, self.config.hidden_size)
+            x = residual + self._linear(attention, layer.o_proj)
+            residual = x
+            x_norm = self._rms_norm(x, layer.post_attention_layernorm)
+            gate_up = self._linear(x_norm, layer.gate_up_proj)
+            gate, up = mx.split(gate_up, 2, axis=-1)
+            x = residual + self._linear(nn.silu(gate) * up, layer.down_proj)
+
+        cache.advance_slots(active_rows)
+        return self._rms_norm(x, self.weights.final_norm)
+
     def project_last_hidden(self, hidden_states: mx.array) -> mx.array:
         """Project only the final token state to vocabulary logits."""
         return self._linear(hidden_states[:, -1:, :], self.weights.lm_head)
+
+    def _static_decode_step(
+        self,
+        token_ids: mx.array,
+        position: mx.array,
+        k_layers: list,
+        v_layers: list,
+    ) -> tuple[mx.array, list, list]:
+        """Decode a same-offset batch and return logits plus updated KV arrays."""
+        x = self.weights.embed_tokens[token_ids]
+        batch_size = token_ids.shape[0]
+        capacity = k_layers[0].shape[2]
+        attention_mask = (mx.arange(capacity) <= position).reshape(1, 1, 1, capacity)
+
+        for layer_idx, layer in enumerate(self.weights.layers):
+            residual = x
+            x_norm = self._rms_norm(x, layer.input_layernorm)
+            qkv = self._linear(x_norm, layer.qkv_proj, layer.qkv_bias)
+            q, k, v = mx.split(qkv, [self.q_dim, self.q_dim + self.kv_dim], axis=-1)
+            q = mx.transpose(q.reshape(batch_size, 1, self.config.num_attention_heads, self.config.head_dim), (0, 2, 1, 3))
+            k = mx.transpose(k.reshape(batch_size, 1, self.config.num_key_value_heads, self.config.head_dim), (0, 2, 1, 3))
+            v = mx.transpose(v.reshape(batch_size, 1, self.config.num_key_value_heads, self.config.head_dim), (0, 2, 1, 3))
+            q = mx.fast.rope(q, self.config.head_dim, traditional=False, base=self.config.rope_theta, scale=1.0, offset=position)
+            k = mx.fast.rope(k, self.config.head_dim, traditional=False, base=self.config.rope_theta, scale=1.0, offset=position)
+            start = mx.concatenate([
+                mx.array([0, 0], dtype=mx.uint32),
+                position.astype(mx.uint32).reshape(1),
+                mx.array([0], dtype=mx.uint32),
+            ])
+            new_k_layers = list(k_layers)
+            new_v_layers = list(v_layers)
+            new_k_layers[layer_idx] = mx.slice_update(k_layers[layer_idx], k, start, axes=(0, 1, 2, 3))
+            new_v_layers[layer_idx] = mx.slice_update(v_layers[layer_idx], v, start, axes=(0, 1, 2, 3))
+            k_layers, v_layers = new_k_layers, new_v_layers
+            attention = mx.fast.scaled_dot_product_attention(
+                q, k_layers[layer_idx], v_layers[layer_idx], scale=self.scale, mask=attention_mask
+            )
+            attention = mx.transpose(attention, (0, 2, 1, 3)).reshape(batch_size, 1, self.config.hidden_size)
+            x = residual + self._linear(attention, layer.o_proj)
+            residual = x
+            x_norm = self._rms_norm(x, layer.post_attention_layernorm)
+            gate_up = self._linear(x_norm, layer.gate_up_proj)
+            gate, up = mx.split(gate_up, 2, axis=-1)
+            x = residual + self._linear(nn.silu(gate) * up, layer.down_proj)
+
+        logits = self._linear(self._rms_norm(x, self.weights.final_norm), self.weights.lm_head)
+        return logits[:, -1, :], k_layers, v_layers
+
+    def _static_decode_step_greedy(
+        self,
+        token_ids: mx.array,
+        position: mx.array,
+        k_layers: list,
+        v_layers: list,
+    ) -> tuple[mx.array, list, list]:
+        """Same as _static_decode_step but fuses argmax inside the compiled graph.
+
+        Returns [batch] token ids instead of [batch, vocab] logits, avoiding
+        materialisation of the large logits tensor and the separate argmax
+        kernel launch outside the graph.
+        """
+        x = self.weights.embed_tokens[token_ids]
+        batch_size = token_ids.shape[0]
+        capacity = k_layers[0].shape[2]
+        attention_mask = (mx.arange(capacity) <= position).reshape(1, 1, 1, capacity)
+
+        for layer_idx, layer in enumerate(self.weights.layers):
+            residual = x
+            x_norm = self._rms_norm(x, layer.input_layernorm)
+            qkv = self._linear(x_norm, layer.qkv_proj, layer.qkv_bias)
+            q, k, v = mx.split(qkv, [self.q_dim, self.q_dim + self.kv_dim], axis=-1)
+            q = mx.transpose(q.reshape(batch_size, 1, self.config.num_attention_heads, self.config.head_dim), (0, 2, 1, 3))
+            k = mx.transpose(k.reshape(batch_size, 1, self.config.num_key_value_heads, self.config.head_dim), (0, 2, 1, 3))
+            v = mx.transpose(v.reshape(batch_size, 1, self.config.num_key_value_heads, self.config.head_dim), (0, 2, 1, 3))
+            q = mx.fast.rope(q, self.config.head_dim, traditional=False, base=self.config.rope_theta, scale=1.0, offset=position)
+            k = mx.fast.rope(k, self.config.head_dim, traditional=False, base=self.config.rope_theta, scale=1.0, offset=position)
+            start = mx.concatenate([
+                mx.array([0, 0], dtype=mx.uint32),
+                position.astype(mx.uint32).reshape(1),
+                mx.array([0], dtype=mx.uint32),
+            ])
+            new_k_layers = list(k_layers)
+            new_v_layers = list(v_layers)
+            new_k_layers[layer_idx] = mx.slice_update(k_layers[layer_idx], k, start, axes=(0, 1, 2, 3))
+            new_v_layers[layer_idx] = mx.slice_update(v_layers[layer_idx], v, start, axes=(0, 1, 2, 3))
+            k_layers, v_layers = new_k_layers, new_v_layers
+            attention = mx.fast.scaled_dot_product_attention(
+                q, k_layers[layer_idx], v_layers[layer_idx], scale=self.scale, mask=attention_mask
+            )
+            attention = mx.transpose(attention, (0, 2, 1, 3)).reshape(batch_size, 1, self.config.hidden_size)
+            x = residual + self._linear(attention, layer.o_proj)
+            residual = x
+            x_norm = self._rms_norm(x, layer.post_attention_layernorm)
+            gate_up = self._linear(x_norm, layer.gate_up_proj)
+            gate, up = mx.split(gate_up, 2, axis=-1)
+            x = residual + self._linear(nn.silu(gate) * up, layer.down_proj)
+
+        logits = self._linear(self._rms_norm(x, self.weights.final_norm), self.weights.lm_head)
+        next_tokens = mx.argmax(logits[:, -1, :], axis=-1)
+        return next_tokens, k_layers, v_layers
+
+    def get_compiled_static_decode_fn(
+        self,
+        batch_size: int,
+        capacity: int,
+        dtype: mx.Dtype = mx.float16,
+    ):
+        """Return the cached same-offset batch decode graph for a fixed shape."""
+        if batch_size <= 0 or capacity <= 0:
+            raise ValueError("batch_size and capacity must be greater than 0")
+        key = (self._quant_bits, batch_size, capacity, str(dtype))
+        compiled = self._compiled_static_decodes.get(key)
+        if compiled is None:
+            self._compiled_static_decode_misses += 1
+            compiled = mx.compile(self._static_decode_step)
+            self._compiled_static_decodes[key] = compiled
+        else:
+            self._compiled_static_decode_hits += 1
+        return compiled
+
+    @property
+    def compiled_static_decode_cache_stats(self) -> tuple[int, int]:
+        """Return ``(hits, misses)`` for same-offset batch decode graphs."""
+        return self._compiled_static_decode_hits, self._compiled_static_decode_misses
+
+    def get_compiled_static_decode_greedy_fn(
+        self,
+        batch_size: int,
+        capacity: int,
+        dtype: mx.Dtype = mx.float16,
+    ):
+        """Return the cached greedy (argmax-fused) static decode graph."""
+        if batch_size <= 0 or capacity <= 0:
+            raise ValueError("batch_size and capacity must be greater than 0")
+        key = (self._quant_bits, batch_size, capacity, str(dtype))
+        compiled = self._compiled_static_decode_greedy.get(key)
+        if compiled is None:
+            self._compiled_static_decode_greedy_misses += 1
+            compiled = mx.compile(self._static_decode_step_greedy)
+            self._compiled_static_decode_greedy[key] = compiled
+        else:
+            self._compiled_static_decode_greedy_hits += 1
+        return compiled
+
+    @property
+    def compiled_static_decode_greedy_cache_stats(self) -> tuple[int, int]:
+        """Return ``(hits, misses)`` for greedy static decode graphs."""
+        return self._compiled_static_decode_greedy_hits, self._compiled_static_decode_greedy_misses
+
+    def _dynamic_decode_step(
+        self,
+        token_ids: mx.array,
+        slot_offsets: mx.array,
+        active_rows: mx.array,
+        k_layers: list,
+        v_layers: list,
+    ) -> tuple[mx.array, list, list]:
+        """Tensor-only fixed-shape decode graph for independent slot cursors."""
+        batch_size = token_ids.shape[0]
+        capacity = k_layers[0].shape[2]
+        x = self.weights.embed_tokens[token_ids]
+        positions = mx.arange(capacity)[None, None, None, :]
+        offsets = slot_offsets.astype(mx.int32)[:, None, None, None]
+        valid_kv = positions <= offsets
+        inactive_kv = mx.arange(capacity)[None, None, None, :] == 0
+        active_mask = active_rows.astype(mx.bool_).reshape(batch_size, 1, 1, 1)
+        attention_mask = mx.where(active_mask, valid_kv, inactive_kv)
+        # A released slot can be parked at capacity. Clamp its unused scatter
+        # index so every row remains in-bounds in the fixed-shape graph.
+        write_offsets = mx.minimum(slot_offsets, mx.array(capacity - 1, dtype=slot_offsets.dtype))
+        write_indices = mx.broadcast_to(
+            write_offsets.astype(mx.uint32).reshape(batch_size, 1, 1, 1),
+            (batch_size, k_layers[0].shape[1], 1, k_layers[0].shape[3]),
+        )
+
+        for layer_idx, layer in enumerate(self.weights.layers):
+            residual = x
+            x_norm = self._rms_norm(x, layer.input_layernorm)
+            qkv = self._linear(x_norm, layer.qkv_proj, layer.qkv_bias)
+            q, k, v = mx.split(qkv, [self.q_dim, self.q_dim + self.kv_dim], axis=-1)
+            q = mx.transpose(q.reshape(batch_size, 1, self.config.num_attention_heads, self.config.head_dim), (0, 2, 1, 3))
+            k = mx.transpose(k.reshape(batch_size, 1, self.config.num_key_value_heads, self.config.head_dim), (0, 2, 1, 3))
+            v = mx.transpose(v.reshape(batch_size, 1, self.config.num_key_value_heads, self.config.head_dim), (0, 2, 1, 3))
+            # Per-row RoPE via tensor ops (no Python loop, compilable)
+            positions = slot_offsets.astype(mx.float32)
+            q = self._apply_rope_per_row(q, positions)
+            k = self._apply_rope_per_row(k, positions)
+            k_existing = mx.take_along_axis(k_layers[layer_idx], write_indices, axis=2)
+            v_existing = mx.take_along_axis(v_layers[layer_idx], write_indices, axis=2)
+            k_update = mx.where(active_mask, k, k_existing)
+            v_update = mx.where(active_mask, v, v_existing)
+            new_k_layers = list(k_layers)
+            new_v_layers = list(v_layers)
+            new_k_layers[layer_idx] = mx.put_along_axis(k_layers[layer_idx], write_indices, k_update, axis=2)
+            new_v_layers[layer_idx] = mx.put_along_axis(v_layers[layer_idx], write_indices, v_update, axis=2)
+            k_layers, v_layers = new_k_layers, new_v_layers
+            attention = mx.fast.scaled_dot_product_attention(
+                q, k_layers[layer_idx], v_layers[layer_idx], scale=self.scale, mask=attention_mask
+            )
+            attention = mx.transpose(attention, (0, 2, 1, 3)).reshape(batch_size, 1, self.config.hidden_size)
+            x = residual + self._linear(attention, layer.o_proj)
+            residual = x
+            x_norm = self._rms_norm(x, layer.post_attention_layernorm)
+            gate_up = self._linear(x_norm, layer.gate_up_proj)
+            gate, up = mx.split(gate_up, 2, axis=-1)
+            x = residual + self._linear(nn.silu(gate) * up, layer.down_proj)
+
+        logits = self._linear(self._rms_norm(x, self.weights.final_norm), self.weights.lm_head)
+        return logits[:, -1, :], k_layers, v_layers
+
+    def get_compiled_dynamic_decode_fn(
+        self,
+        batch_size: int,
+        capacity: int,
+        dtype: mx.Dtype = mx.float16,
+    ):
+        """Return a cached fixed-shape dynamic decode graph when supported.
+
+        The cache key includes model quantization, batch capacity, context
+        capacity, and KV dtype. RoPE offsets remain represented by scalar array
+        entries within a static Python unroll, so batch capacity is part of the
+        graph shape and each capacity gets its own cached compilation.
+        """
+        if batch_size <= 0 or capacity <= 0:
+            raise ValueError("batch_size and capacity must be greater than 0")
+        key = (self._quant_bits, batch_size, capacity, str(dtype))
+        compiled = self._compiled_dynamic_decodes.get(key)
+        if compiled is None:
+            self._compiled_dynamic_decode_misses += 1
+            compiled = mx.compile(self._dynamic_decode_step)
+            self._compiled_dynamic_decodes[key] = compiled
+        else:
+            self._compiled_dynamic_decode_hits += 1
+        return compiled
+
+    @property
+    def compiled_dynamic_decode_cache_stats(self) -> tuple[int, int]:
+        """Return ``(hits, misses)`` for fixed-shape dynamic decode graphs."""
+        return self._compiled_dynamic_decode_hits, self._compiled_dynamic_decode_misses
 
     def _build_decode_attn_kernel(self, capacity: int) -> None:
         """Build a custom Metal kernel for batch=1 GQA decode attention.

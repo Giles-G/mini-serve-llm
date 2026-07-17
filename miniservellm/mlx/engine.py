@@ -1,4 +1,4 @@
-"""Single-request MLX inference engine sharing Request and SamplingParams semantics."""
+"""Fixed-slot continuous-batching MLX inference engine."""
 
 from __future__ import annotations
 
@@ -22,11 +22,11 @@ class MLXStepEvent:
 
 
 class MLXInferenceEngine:
-    """Feature-complete single-active-request engine backed by MLX.
+    """MLX engine with fixed-shape slots and continuous request refill.
 
-    Queued requests are accepted using the existing Request model. The first
-    implementation executes them FIFO because MLX continuous batching has not
-    yet been profiled for heterogeneous request lengths.
+    The active cache always has ``max_batch_size`` rows. A finished or aborted
+    request releases its row immediately; a waiting request that fits the cache
+    capacity is prefetched directly into that row on the next engine tick.
     """
 
     def __init__(
@@ -37,20 +37,36 @@ class MLXInferenceEngine:
         eos_token_id: Optional[int] = None,
         stream_interval: int = 1,
         sampler_seed: Optional[int] = None,
+        max_batch_size: int = 1,
+        prompt_bucket_multiple: int = 64,
+        compiled_decode: bool = False,
+        batch_mode: str = "auto",
     ):
         if stream_interval <= 0:
             raise ValueError("stream_interval must be greater than 0")
+        if max_batch_size <= 0:
+            raise ValueError("max_batch_size must be greater than 0")
+        if prompt_bucket_multiple <= 0:
+            raise ValueError("prompt_bucket_multiple must be greater than 0")
+        if batch_mode not in {"static", "continuous", "auto"}:
+            raise ValueError("batch_mode must be one of: static, continuous, auto")
         self.runner = runner
         self.tokenizer = tokenizer
         self.model_config = model_config
         self.eos_token_id = eos_token_id
         self.stream_interval = stream_interval
         self.sampler = MLXSampler(sampler_seed)
+        self.max_batch_size = max_batch_size
+        self.prompt_bucket_multiple = prompt_bucket_multiple
+        self.compiled_decode = compiled_decode
+        self.batch_mode = batch_mode
+        self.static_fast_path_ticks = 0
+        self.dynamic_fallback_ticks = 0
         self.requests_by_id: Dict[str, Request] = {}
         self._waiting: List[str] = []
-        self._active_id: Optional[str] = None
-        self._caches: Dict[str, MLXKVCache] = {}
-        self._prefix_cache: Dict[tuple[int, ...], tuple[MLXKVCache, mx.array]] = {}
+        self._slot_request_ids: List[Optional[str]] = [None] * max_batch_size
+        self._active_cache: Optional[MLXKVCache] = None
+        self._active_next_tokens: Optional[mx.array] = None
         self._next_request_idx = 0
 
     def add_request(
@@ -93,96 +109,289 @@ class MLXInferenceEngine:
         if req.status == RequestStatus.FINISHED:
             return
         req.mark_aborted()
-        self._finish(req)
+        if request_id in self._waiting:
+            self._waiting.remove(request_id)
+            return
+        for slot, active_id in enumerate(self._slot_request_ids):
+            if active_id == request_id:
+                self._release_slot(slot)
+                return
 
     def get_request(self, request_id: str) -> Request:
         return self.requests_by_id[request_id]
 
     def has_pending_work(self) -> bool:
-        return bool(self._waiting) or self._active_id is not None
+        return bool(self._waiting) or any(rid is not None for rid in self._slot_request_ids)
 
-    def _activate_next(self) -> Optional[Request]:
-        while self._waiting:
-            rid = self._waiting.pop(0)
-            req = self.requests_by_id[rid]
-            if req.status != RequestStatus.FINISHED:
-                self._active_id = rid
-                return req
-        return None
+    def _prompt_bucket(self, prompt_len: int) -> int:
+        """Return the upper token-length bucket used for admission."""
+        multiple = self.prompt_bucket_multiple
+        return ((prompt_len + multiple - 1) // multiple) * multiple
 
-    def _finish(self, req: Request) -> None:
-        self._caches.pop(req.request_id, None)
-        if self._active_id == req.request_id:
-            self._active_id = None
+    def _active_slot_count(self) -> int:
+        return sum(rid is not None for rid in self._slot_request_ids)
 
-    def _prefill(self, req: Request) -> int:
-        req.status = RequestStatus.RUNNING_PREFILL
-        prefix_key = tuple(req.prompt_token_ids)
-        cached = self._prefix_cache.get(prefix_key)
-        required_capacity = req.total_prompt_tokens() + req.max_new_tokens
-        if cached is not None and cached[0].max_context >= required_capacity:
-            cache, logits = cached
-            cache = cache.clone()
-        else:
-            cache = MLXKVCache(
-                self.model_config,
-                max_context=req.total_prompt_tokens() + req.max_new_tokens,
+    def _free_slot_indices(self) -> List[int]:
+        return [slot for slot, rid in enumerate(self._slot_request_ids) if rid is None]
+
+    def _release_slot(self, slot: int) -> None:
+        self._slot_request_ids[slot] = None
+
+    def _take_waiting_requests(self, limit: int, capacity: Optional[int] = None) -> List[Request]:
+        """Select compatible waiting requests, exact matching in static mode."""
+        def fits(candidate: Request) -> bool:
+            return capacity is None or candidate.total_prompt_tokens() + candidate.max_new_tokens <= capacity
+
+        def matches_batch(first: Request, candidate: Request) -> bool:
+            if self.batch_mode == "static":
+                return (
+                    candidate.total_prompt_tokens() == first.total_prompt_tokens()
+                    and candidate.max_new_tokens == first.max_new_tokens
+                )
+            return self._prompt_bucket(candidate.total_prompt_tokens()) == self._prompt_bucket(
+                first.total_prompt_tokens()
             )
-            prompt = mx.array([req.prompt_token_ids], dtype=mx.uint32)
-            hidden = self.runner.model.forward_hidden(prompt, cache)
-            logits = self.runner.model.project_last_hidden(hidden).reshape(1, -1)
-            mx.eval(logits)
-            # Functional arrays are immutable: later Decode slice_update operations
-            # return new tensors, so this snapshot remains valid for exact prompt hits.
-            self._prefix_cache[prefix_key] = (cache.clone(), logits)
-        mx.eval(logits)
-        token = self.sampler.sample(logits, req.sampling_params, req.generated_token_ids)
-        mx.eval(token)
-        token_id = int(token.item())
-        req.num_prompt_tokens_processed = req.total_prompt_tokens()
-        req.status = RequestStatus.RUNNING_DECODE
-        self._caches[req.request_id] = cache
-        return token_id
 
-    def step(self, callback: Optional[Callable[[str, List[int]], None]] = None) -> List[MLXStepEvent]:
-        req = self.get_request(self._active_id) if self._active_id else self._activate_next()
-        if req is None:
+        first: Optional[Request] = None
+        skipped: List[str] = []
+        while self._waiting:
+            request_id = self._waiting.pop(0)
+            candidate = self.get_request(request_id)
+            if candidate.status == RequestStatus.FINISHED:
+                continue
+            if fits(candidate):
+                first = candidate
+                break
+            skipped.append(request_id)
+        if first is None:
+            self._waiting = skipped
             return []
-        events: List[MLXStepEvent] = []
 
-        if req.status == RequestStatus.RUNNING_PREFILL:
-            # Defensive: normal path always moves directly from WAITING to prefill below.
-            pass
-        if req.num_prompt_tokens_processed == 0:
-            token_id = self._prefill(req)
-            req.append_generated_token(token_id)
-            events.append(MLXStepEvent("prefill_sampled_first_token", req.request_id, token_id))
-        else:
-            cache = self._caches[req.request_id]
-            input_id = req.last_token_id_for_decode_input()
-            hidden = self.runner.model.forward_hidden(mx.array([[input_id]], dtype=mx.uint32), cache)
-            logits = self.runner.model.project_last_hidden(hidden).reshape(1, -1)
-            mx.eval(logits)
-            token = self.sampler.sample(logits, req.sampling_params, req.generated_token_ids)
-            mx.eval(token)
-            token_id = int(token.item())
-            req.append_generated_token(token_id)
-            events.append(MLXStepEvent("decode_token", req.request_id, token_id))
+        admitted = [first]
+        remaining: List[str] = skipped
+        for rid in self._waiting:
+            candidate = self.get_request(rid)
+            if (
+                len(admitted) < limit
+                and candidate.status != RequestStatus.FINISHED
+                and fits(candidate)
+                and matches_batch(first, candidate)
+            ):
+                admitted.append(candidate)
+            else:
+                remaining.append(rid)
+        self._waiting = remaining
+        return admitted
 
-        if callback and req.generated_token_ids and len(req.generated_token_ids) % self.stream_interval == 0:
+    def _clear_active_cache(self) -> None:
+        self._slot_request_ids = [None] * self.max_batch_size
+        self._active_cache = None
+        self._active_next_tokens = None
+
+    def _can_use_static_fast_path(self) -> bool:
+        """Return whether every slot shares one cursor and remains active."""
+        if self.batch_mode == "continuous" or self._active_cache is None:
+            return False
+        if self._active_slot_count() != self.max_batch_size:
+            return False
+        if len(set(self._active_cache.slot_offsets)) != 1:
+            return False
+        return all(request_id is not None for request_id in self._slot_request_ids)
+
+    def _sample_active_slots(self, active_logits: mx.array, active_slots: List[int]) -> mx.array:
+        """Batch-sample all active slots in one GPU op.
+
+        Groups by sampling strategy: greedy (temperature<=0) rows use argmax;
+        the rest share a per-row temperature categorical. This avoids one
+        ``mx.eval`` per slot.
+        """
+        params_list = [
+            self.get_request(self._slot_request_ids[s]).sampling_params
+            for s in active_slots
+        ]
+        if all(p.temperature <= 0.0 for p in params_list):
+            return mx.argmax(active_logits, axis=-1)
+        temps = mx.array([p.temperature for p in params_list], dtype=mx.float32)
+        work = active_logits.astype(mx.float32) / temps[:, None]
+        return mx.random.categorical(work)
+
+    def _emit_and_finish(
+        self,
+        req: Request,
+        event_kind: str,
+        token_id: int,
+        events: List[MLXStepEvent],
+        callback: Optional[Callable[[str, List[int]], None]],
+    ) -> None:
+        req.append_generated_token(token_id)
+        events.append(MLXStepEvent(event_kind, req.request_id, token_id))
+        if callback and len(req.generated_token_ids) % self.stream_interval == 0:
             callback(req.request_id, req.generated_token_ids[-self.stream_interval :])
 
-        last = req.generated_token_ids[-1]
-        if self.eos_token_id is not None and last == self.eos_token_id:
+        if self.eos_token_id is not None and token_id == self.eos_token_id:
             req.mark_finished_eos()
         elif not req.can_decode_more():
             req.mark_finished_max_new_tokens()
         if req.status == RequestStatus.FINISHED:
-            if callback and len(req.generated_token_ids) % self.stream_interval:
-                callback(req.request_id, req.generated_token_ids[-(len(req.generated_token_ids) % self.stream_interval) :])
+            remainder = len(req.generated_token_ids) % self.stream_interval
+            if callback and remainder:
+                callback(req.request_id, req.generated_token_ids[-remainder:])
             events.append(MLXStepEvent("request_finished", req.request_id))
-            self._finish(req)
+
+    def _install_prefill_slots(
+        self,
+        slots: List[int],
+        requests: List[Request],
+        callback: Optional[Callable[[str, List[int]], None]],
+        event_kind: str,
+    ) -> List[MLXStepEvent]:
+        assert self._active_cache is not None and self._active_next_tokens is not None
+        logits = self.runner.prefill_dynamic_slots(
+            self._active_cache, slots, [req.prompt_token_ids for req in requests]
+        )
+        # Batch-sample all prefill rows in one GPU op (lazy: logits stay on GPU)
+        params_list = [req.sampling_params for req in requests]
+        if all(p.temperature <= 0.0 for p in params_list):
+            tokens = mx.argmax(logits, axis=-1)
+        else:
+            temps = mx.array([p.temperature for p in params_list], dtype=mx.float32)
+            work = logits.astype(mx.float32) / temps[:, None]
+            tokens = mx.random.categorical(work)
+        mx.eval(tokens)
+        token_ids = tokens.tolist()
+
+        next_tokens = self._active_next_tokens.tolist()
+        events: List[MLXStepEvent] = []
+        for idx, (slot, req) in enumerate(zip(slots, requests)):
+            token_id = token_ids[idx]
+            req.num_prompt_tokens_processed = req.total_prompt_tokens()
+            req.status = RequestStatus.RUNNING_DECODE
+            self._slot_request_ids[slot] = req.request_id
+            self._emit_and_finish(req, "prefill_sampled_first_token", token_id, events, callback)
+            next_tokens[slot] = token_id
+            if event_kind:
+                events.append(MLXStepEvent(event_kind, req.request_id))
+            if req.status == RequestStatus.FINISHED:
+                self._release_slot(slot)
+        self._active_next_tokens = mx.array(next_tokens, dtype=mx.uint32)
         return events
+
+    def _start_cache(
+        self,
+        requests: List[Request],
+        callback: Optional[Callable[[str, List[int]], None]],
+    ) -> List[MLXStepEvent]:
+        capacity = max(req.total_prompt_tokens() + req.max_new_tokens for req in requests)
+        self._active_cache = MLXKVCache(self.model_config, capacity, batch_size=self.max_batch_size)
+        self._active_next_tokens = mx.zeros((self.max_batch_size,), dtype=mx.uint32)
+        return self._install_prefill_slots(list(range(len(requests))), requests, callback, "")
+
+    def _refill_free_slots(
+        self,
+        callback: Optional[Callable[[str, List[int]], None]],
+    ) -> List[MLXStepEvent]:
+        if self.batch_mode == "static":
+            return []
+        assert self._active_cache is not None
+        slots = self._free_slot_indices()
+        if not slots:
+            return []
+        requests = self._take_waiting_requests(len(slots), self._active_cache.max_context)
+        if not requests:
+            return []
+        return self._install_prefill_slots(slots[: len(requests)], requests, callback, "slot_refilled")
+
+    def step(self, callback: Optional[Callable[[str, List[int]], None]] = None) -> List[MLXStepEvent]:
+        """Run one fixed-shape decode tick and refill all slots released by it."""
+        if self._active_cache is None:
+            admitted = self._take_waiting_requests(self.max_batch_size)
+            if not admitted:
+                return []
+            return self._start_cache(admitted, callback)
+
+        assert self._active_next_tokens is not None
+        events: List[MLXStepEvent] = []
+        active_rows = [rid is not None for rid in self._slot_request_ids]
+        if any(active_rows):
+            if self._can_use_static_fast_path():
+                all_greedy = self.compiled_decode and all(
+                    self.get_request(rid).sampling_params.temperature <= 0.0
+                    for rid in self._slot_request_ids if rid is not None
+                )
+                if all_greedy:
+                    # Greedy fast path: argmax fused in compiled graph,
+                    # returns [batch] tokens directly — no logits materialisation.
+                    tokens = self.runner.decode_static_batch(
+                        self._active_next_tokens,
+                        self._active_cache,
+                        compiled_decode=True,
+                        greedy=True,
+                    )
+                    self.static_fast_path_ticks += 1
+                    mx.eval(tokens)
+                    token_ids = tokens.tolist()
+                    for slot, request_id in enumerate(self._slot_request_ids):
+                        req = self.get_request(request_id)
+                        token_id = token_ids[slot]
+                        self._emit_and_finish(req, "decode_token", token_id, events, callback)
+                        if req.status == RequestStatus.FINISHED:
+                            self._release_slot(slot)
+                    self._active_next_tokens = tokens.astype(mx.uint32)
+                else:
+                    logits = self.runner.decode_static_batch(
+                        self._active_next_tokens,
+                        self._active_cache,
+                        compiled_decode=self.compiled_decode,
+                    )
+                    self.static_fast_path_ticks += 1
+                    active_slots = [s for s, rid in enumerate(self._slot_request_ids) if rid is not None]
+                    if active_slots:
+                        active_logits = logits[mx.array(active_slots)]
+                        sampled = self._sample_active_slots(active_logits, active_slots)
+                        mx.eval(sampled)
+                        sampled_ids = sampled.tolist()
+                        next_tokens = self._active_next_tokens.tolist()
+                        for idx, slot in enumerate(active_slots):
+                            req = self.get_request(self._slot_request_ids[slot])
+                            token_id = sampled_ids[idx]
+                            self._emit_and_finish(req, "decode_token", token_id, events, callback)
+                            next_tokens[slot] = token_id
+                            if req.status == RequestStatus.FINISHED:
+                                self._release_slot(slot)
+                        self._active_next_tokens = mx.array(next_tokens, dtype=mx.uint32)
+            else:
+                logits = self.runner.decode_dynamic_batch(
+                    self._active_next_tokens,
+                    self._active_cache,
+                    active_rows,
+                    compiled_decode=self.compiled_decode,
+                )
+                self.dynamic_fallback_ticks += 1
+                active_slots = [s for s, rid in enumerate(self._slot_request_ids) if rid is not None]
+                if active_slots:
+                    active_logits = logits[mx.array(active_slots)]
+                    sampled = self._sample_active_slots(active_logits, active_slots)
+                    mx.eval(sampled)
+                    sampled_ids = sampled.tolist()
+                    next_tokens = self._active_next_tokens.tolist()
+                    for idx, slot in enumerate(active_slots):
+                        req = self.get_request(self._slot_request_ids[slot])
+                        token_id = sampled_ids[idx]
+                        self._emit_and_finish(req, "decode_token", token_id, events, callback)
+                        next_tokens[slot] = token_id
+                        if req.status == RequestStatus.FINISHED:
+                            self._release_slot(slot)
+                    self._active_next_tokens = mx.array(next_tokens, dtype=mx.uint32)
+
+        events.extend(self._refill_free_slots(callback))
+        if self._active_slot_count() == 0:
+            self._clear_active_cache()
+        return events
+
+    @property
+    def decode_path_stats(self) -> tuple[int, int]:
+        """Return ``(static_fast_path_ticks, dynamic_fallback_ticks)``."""
+        return self.static_fast_path_ticks, self.dynamic_fallback_ticks
 
     def run_until_all_finished(self, callback: Optional[Callable[[str, List[int]], None]] = None) -> None:
         while self.has_pending_work():
