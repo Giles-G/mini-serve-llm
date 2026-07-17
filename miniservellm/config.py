@@ -25,6 +25,52 @@ def detect_best_device() -> torch.device:
     return torch.device("cpu")
 
 
+def compute_num_gpu_blocks(
+    *,
+    block_size: int,
+    num_hidden_layers: int,
+    num_kv_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    model_param_count: int,
+    reserved_vram_mb: int = 512,
+) -> int:
+    """Estimate available KV cache block count based on free GPU memory.
+
+    Called when ``num_gpu_blocks=0`` or ``"auto"`` is passed to
+    ``EngineConfig.create`` on a CUDA device.
+
+    Formula::
+
+        kv_block_bytes = block_size * num_layers * 2 * num_kv_heads * head_dim * 2
+        usable_mb = free_vram_mb - model_weight_mb - reserved_vram_mb
+        num_gpu_blocks = usable_mb * 1024 * 1024 / kv_block_bytes
+
+    Returns the hard-coded default (1024) if ``pynvml`` is unavailable.
+    """
+    if not torch.cuda.is_available():
+        return 1024  # fallback for non-CUDA
+
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        pynvml.nvmlShutdown()
+    except (ImportError, Exception):
+        return 1024
+
+    free_vram_mb = info.free / (1024 * 1024)
+    bytes_per_param = 2 if dtype in (torch.float16, torch.bfloat16) else 4
+    model_weight_mb = model_param_count * bytes_per_param / (1024 * 1024)
+    usable_mb = free_vram_mb - model_weight_mb - reserved_vram_mb
+    if usable_mb <= 0:
+        return 256  # minimal allocation
+
+    kv_block_bytes = block_size * num_hidden_layers * 2 * num_kv_heads * head_dim * 2
+    return max(256, int(usable_mb * 1024 * 1024 / kv_block_bytes))
+
+
 def default_dtype_for_device(device: torch.device) -> torch.dtype:
     if device.type == "cuda":
         return torch.float16
@@ -89,7 +135,7 @@ class EngineConfig:
         device: str = "auto",
         dtype: str = "auto",
         block_size: int = 16,
-        num_gpu_blocks: int = 1024,
+        num_gpu_blocks: int = 0,  # 0 or "auto" → compute from free VRAM
         max_batch_size: int = 16,
         max_tokens_per_step: int = 128,
         max_prefill_tokens_per_step: int = 96,
@@ -106,6 +152,12 @@ class EngineConfig:
         context_bucket_multiple: Optional[int] = None,
         decode_batch_bucket_multiple: int = 0,
         eos_token_id: Optional[int] = None,
+        # --- VRAM auto-tuning parameters (used when num_gpu_blocks <= 0) ---
+        model_param_count: int = 0,
+        num_hidden_layers: int = 24,
+        num_kv_heads: int = 2,
+        head_dim: int = 64,
+        reserved_vram_mb: int = 512,
     ) -> "EngineConfig":
         if device == "auto":
             dev = detect_best_device()
@@ -126,6 +178,20 @@ class EngineConfig:
         # MPS 对逐 token 变化的动态 context shape 很敏感；32 桶在 M4 实测中
         # 显著优于关闭分桶。调用方显式传 0 时仍可关闭用于 A/B。
         context_bucket = 32 if context_bucket_multiple is None and dev.type == "mps" else int(context_bucket_multiple or 0)
+
+        # num_gpu_blocks=0 时基于可用显存自动计算，适配 6GB/8GB/12GB 等不同 GPU
+        if num_gpu_blocks <= 0 and dev.type == "cuda":
+            num_gpu_blocks = compute_num_gpu_blocks(
+                block_size=block_size,
+                num_hidden_layers=num_hidden_layers,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                dtype=dt,
+                model_param_count=model_param_count,
+                reserved_vram_mb=reserved_vram_mb,
+            )
+        elif num_gpu_blocks <= 0:
+            num_gpu_blocks = 1024  # non-CUDA fallback
 
         return EngineConfig(
             device=dev,

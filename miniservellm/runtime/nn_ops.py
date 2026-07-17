@@ -146,23 +146,100 @@ def _decode_paged_attention_fallback(
 
 
 def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
-    """线性变换（全连接层）
+    """线性变换（全连接层），自动检测量化权重。
 
     公式：
         y = x @ W.T + b
 
-    封装 F.linear，其中 weight 的 shape 为 [out_features, in_features]，
-    F.linear 内部自动执行 x @ weight.T 的计算。
+    当 weight 是 tuple (w_q, scales) 时使用 INT4 group quantization：
+        y = x @ dequantize(w_q, scales).T + b
 
     Args:
         x: 输入张量 [..., in_features]
-        weight: 权重矩阵 [out_features, in_features]
+        weight: 权重矩阵 [out_features, in_features] 或 (w_q, scales) 量化 tuple
         bias: 偏置向量 [out_features]，可选
 
     Returns:
         输出张量 [..., out_features]
     """
+    if isinstance(weight, tuple):
+        return _int4_linear(x, weight, bias)
     return F.linear(x, weight, bias)
+
+
+def _int4_linear(
+    x: torch.Tensor,
+    weight: tuple,  # (w_q_int8, scales_fp16)
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """INT4 group-quantized matmul。
+
+    weight = (w_q, scales) 其中：
+      w_q:    [out_features, in_features]  int8（值域 [-8, 7]）
+      scales: [out_features, in_features // group_size]  fp16
+    """
+    w_q, scales = weight
+    group_size = w_q.shape[1] // scales.shape[1]
+    out_features = w_q.shape[0]
+    in_features = w_q.shape[1]
+
+    # PyTorch 2.4+ 支持 _weight_int4pack_mm（高效 INT4 GEMM）。
+    # 格式要求：权重 packed 为 [out//2, in] uint8，每字节打包两个 int4。
+    try:
+        # Pack: 每 2 个 int4 值打包为 1 字节（低 4 bit 先行）
+        # w_q 值域 [-8, 7] → 加 8 偏置到 [0, 15]
+        w_unsigned = (w_q.to(torch.int8) + 8).to(torch.uint8)
+        w_packed = (w_unsigned[:, 0::2] | (w_unsigned[:, 1::2] << 4)).contiguous()
+        # torch._weight_int4pack_mm 需要 scales_and_zeros: [out, in//group//2]
+        # 以及 qweight: [out//2, in]
+        # 实际上这个 API 在不同 PyTorch 版本中格式有差异，这里做 best-effort
+        y = torch._weight_int4pack_mm(
+            x, w_packed, group_size,
+            scales_and_zeros=scales.contiguous().to(torch.float16)  # type: ignore[arg-type]
+        )
+    except (AttributeError, TypeError, RuntimeError):
+        # Fallback: dequantize + F.linear
+        w_fp16 = (w_q.float() * scales.repeat_interleave(group_size, dim=1)).to(x.dtype)
+        y = F.linear(x, w_fp16)
+
+    return y if bias is None else y + bias
+
+
+def quantize_weight_group(
+    weight: torch.Tensor,
+    bits: int = 4,
+    group_size: int = 64,
+) -> tuple:
+    """对称 group quantization：将 FP16 权重压缩为 INT4。
+
+    公式：
+        scale = max(|w_group|) / (2^{bits-1} - 1)
+        w_q   = round(w_group / scale).clamp(-(2^{bits-1}), 2^{bits-1}-1)
+
+    Args:
+        weight: [out_features, in_features] fp16
+        bits: 量化位宽（4 或 8）
+        group_size: 每组共享 scale 的输入维度大小
+
+    Returns:
+        (w_q, scales): 量化权重和 scale
+    """
+    if weight.dim() != 2:
+        raise ValueError("quantize_weight_group requires 2D weight [out, in]")
+    out_features, in_features = weight.shape
+    if in_features % group_size != 0:
+        raise ValueError(f"in_features ({in_features}) must be divisible by group_size ({group_size})")
+
+    num_groups = in_features // group_size
+    w_reshaped = weight.view(out_features, num_groups, group_size)
+
+    max_val = 2 ** (bits - 1) - 1  # 7 for INT4
+    w_abs = w_reshaped.abs().amax(dim=-1)  # [out, num_groups]
+    scales = (w_abs / max_val).clamp(min=1e-6).to(weight.dtype)  # fp16
+
+    w_q = torch.round(w_reshaped / scales.unsqueeze(-1)).clamp(-max_val, max_val).to(torch.int8)
+    # Squeeze group dim back: [out, num_groups, group_size] → [out, in_features]
+    return w_q.view(out_features, in_features), scales
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:

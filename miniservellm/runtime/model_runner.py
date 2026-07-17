@@ -25,18 +25,18 @@ from miniservellm.cache.kv_cache import KVCacheManager
 from miniservellm.runtime.metadata import PrefillRequestMetadata, DecodeRequestMetadata, SlotRef
 from miniservellm.runtime.model_interface import PrefillModelOutput, DecodeModelOutput
 from miniservellm.runtime.nn_ops import (
-    rms_norm,
-    fused_add_rms_norm,
-    decode_paged_attention,
-    silu_and_mul,
-    build_rope_cache,
     apply_rope,
-    repeat_kv,
+    batched_causal_attention_prefill,
     causal_attention_prefill,
     causal_attention_single_query,
+    decode_paged_attention,
+    fused_add_rms_norm,
     gathered_paged_kv_decode_attention,
-    batched_causal_attention_prefill,
     linear,
+    quantize_weight_group,
+    rms_norm,
+    rotate_half,
+    silu_and_mul,
 )
 from miniservellm.scheduler.request import Request
 
@@ -678,6 +678,19 @@ class TransformerModelRunner:
             device=self._device,
             dtype=self._dtype,
         )
+
+    def quantize_weights(self, bits: int = 4, group_size: int = 64) -> None:
+        """将所有权重矩阵运行时量化为 INT4 group quantization。
+
+        量化后 ``nn_ops.linear()` 自动检测 tuple 格式并走量化路径。
+        Embedding、lm_head、layernorm 保持 fp16 不变。
+        """
+        for block in self.blocks:
+            lw = block.layer_weights
+            lw.qkv_proj = quantize_weight_group(lw.qkv_proj, bits=bits, group_size=group_size)
+            lw.o_proj = quantize_weight_group(lw.o_proj, bits=bits, group_size=group_size)
+            lw.gate_up_proj = quantize_weight_group(lw.gate_up_proj, bits=bits, group_size=group_size)
+            lw.down_proj = quantize_weight_group(lw.down_proj, bits=bits, group_size=group_size)
 
         # 为每一层创建 BlockRunner，每层有独立的权重和共享的 KV Cache 管理器
         self.blocks: List[TransformerBlockRunner] = []

@@ -36,10 +36,12 @@ from miniservellm.runtime.inference_engine import Stage5Engine
 from miniservellm.scheduler.request import SamplingParams
 
 
-def build_engine(ec: EngineConfig, mc, tok, w_cpu, adapter):
+def build_engine(ec: EngineConfig, mc, tok, w_cpu, adapter, quant_bits: int = 0, quant_group_size: int = 64):
     w = adapter.move_weights_to_device(w_cpu, device=ec.device, dtype=ec.dtype)
     kvm = KVCacheManager(ec, mc)
     mr = TransformerModelRunner(engine_config=ec, model_config=mc, weights=w, kv_cache_manager=kvm)
+    if quant_bits > 0:
+        mr.quantize_weights(bits=quant_bits, group_size=quant_group_size)
     return Stage5Engine(engine_config=ec, model_config=mc, model_runner=mr, tokenizer=tok)
 
 
@@ -156,6 +158,10 @@ def main():
     # Stage 8 M5：kernel A/B 对比开关
     parser.add_argument("--no-custom-kernels", action="store_true",
                         help="禁用 mini_llm_kernels 自定义 CUDA kernel，强制走 PyTorch fallback（Stage 8 A/B 对比用）")
+    parser.add_argument("--quant-bits", type=int, default=0, choices=[0, 4, 8],
+                        help="权重量化位宽（0=FP16, 4=INT4, 8=INT8）")
+    parser.add_argument("--quant-group-size", type=int, default=64,
+                        help="量化 group size（默认 64）")
     args = parser.parse_args()
 
     # 必须在 import miniservellm 之前设置，否则 nn_ops.py 已经完成初始化
@@ -195,6 +201,7 @@ def main():
         f"fullgraph={ec.torch_compile_fullgraph} "
         f"ctx_bucket={ec.context_bucket_multiple} "
         f"decode_batch_bucket={ec.decode_batch_bucket_multiple} "
+        f"quant_bits={args.quant_bits} "
         f"custom_kernels={_HAS_CUSTOM_KERNELS}"
     )
 
@@ -216,7 +223,9 @@ def main():
         sp = SamplingParams(temperature=0.7, top_k=20, top_p=0.9, repetition_penalty=1.1)
 
     def make_engine():
-        return build_engine(ec, mc, tok, w_cpu, adapter)
+        return build_engine(ec, mc, tok, w_cpu, adapter,
+                          quant_bits=args.quant_bits,
+                          quant_group_size=args.quant_group_size)
 
     if args.decode_only:
         if args.max_new < 2:
