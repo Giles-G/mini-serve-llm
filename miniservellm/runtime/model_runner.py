@@ -668,6 +668,7 @@ class TransformerModelRunner:
         self.model_config = model_config
         self.weights = weights
         self.kv_cache_manager = kv_cache_manager
+        self._cuda_graph: Optional["CudaGraphBatch1Runner"] = None  # lazy init
 
         # 预计算 RoPE 的 cos/sin 缓存，避免每次前向重复计算
         # rope_cos/rope_sin: [max_seq_len, head_dim]
@@ -1022,6 +1023,27 @@ class TransformerModelRunner:
             PrefillModelOutput
         """
         return self._forward_prefill_impl(requests, metas)
+
+    def enable_cuda_graph(
+        self, first_token: int, context_len: int, block_table: torch.Tensor
+    ) -> None:
+        """Create and capture CUDA graph runner for batch=1 greedy decode."""
+        if self._device.type != "cuda":
+            return
+        from miniservellm.runtime.cuda_graph_runner import CudaGraphBatch1Runner
+        self._cuda_graph = CudaGraphBatch1Runner(self, max_context=context_len + 512)
+        self._cuda_graph.capture(first_token, context_len, block_table)
+
+    def cuda_graph_step(
+        self, token_id: int, context_len: int, block_table: torch.Tensor
+    ) -> torch.Tensor:
+        """Replay CUDA graph for one decode step. Returns [1, vocab] logits."""
+        assert self._cuda_graph is not None
+        return self._cuda_graph.step(token_id, context_len, block_table)
+
+    @property
+    def has_cuda_graph(self) -> bool:
+        return self._cuda_graph is not None and self._cuda_graph.is_captured
 
     def forward_decode(
         self,

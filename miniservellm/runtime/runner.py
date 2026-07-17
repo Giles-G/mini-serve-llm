@@ -81,9 +81,10 @@ class IncrementalPrefillRunner:
 
 
 class DecodeRunner:
-    """Decode 执行器
+    """Decode 执行器，支持 CUDA Graph 加速（batch=1 greedy）。
 
     为每个 decode 请求分配 1 个 KV slot 并构建 metadata。
+    当 batch=1 且模型已启用 CUDA Graph 时，通过 graph replay 执行。
     """
 
     def __init__(self, model, kv_cache_manager: KVCacheManager, metadata_builder: AttentionMetadataBuilder):
@@ -99,5 +100,22 @@ class DecodeRunner:
             meta = self.metadata_builder.build_decode_metadata(req, kv_cache_write_slots[0])
             requests.append(req)
             metas.append(meta)
+
+        # C1: CUDA Graph fast path for batch=1 greedy decode
+        if len(requests) == 1:
+            from miniservellm.runtime.nn_ops import _HAS_CUSTOM_KERNELS
+            if _HAS_CUSTOM_KERNELS:
+                req = requests[0]
+                meta = metas[0]
+                token_id = meta.input_token_id
+                ctx_len = meta.context_len
+                block_table = self.kv_cache_manager.build_decode_block_table([req], ctx_len)
+                # Lazy capture on first call
+                if not self.model.has_cuda_graph:
+                    self.model.enable_cuda_graph(token_id, ctx_len + 1, block_table)
+                logits = self.model.cuda_graph_step(token_id, ctx_len + 1, block_table)
+                output = DecodeModelOutput(logits_by_request={req.request_id: logits})
+                return DecodeRunResult(requests=requests, metas=metas, output=output)
+
         output = self.model.forward_decode(requests, metas)
         return DecodeRunResult(requests=requests, metas=metas, output=output)
