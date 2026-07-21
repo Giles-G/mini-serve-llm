@@ -54,6 +54,7 @@ class CudaGraphBatch1Runner:
         self._hidden_size = self._mc.hidden_size
         self._graph: Optional[torch.cuda.CUDAGraph] = None
         self._captured = False
+        self._graph_max_ctx: int = 0  # pre-computed for graph-safe decode_paged_attention
 
         # Static tensors allocated once, reused across steps
         self._static_tokens = torch.zeros(
@@ -115,6 +116,7 @@ class CudaGraphBatch1Runner:
             v_cache=v_cache,
             block_table=self._static_block_table,
             context_lens=(self._static_context_lens + 1).to(torch.int32),
+            max_ctx=self._graph_max_ctx,
         )
 
         attn_out = attn_out.reshape(1, self._hidden_size)
@@ -179,6 +181,11 @@ class CudaGraphBatch1Runner:
         bt = block_table.to(torch.int32)
         n = bt.shape[1]
         self._static_block_table[:, :n].copy_(bt)
+
+        # Pre-compute max_ctx for graph-safe decode_paged_attention.
+        # Uses _max_ctx (context_len + 512 from init) to cover all future
+        # step replays where context_lens grows beyond capture-time value.
+        self._graph_max_ctx = self._max_ctx
 
         # Warmup (3 iterations to stabilize GPU clock)
         for _ in range(3):

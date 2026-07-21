@@ -75,6 +75,7 @@ def decode_paged_attention(
     v_cache: torch.Tensor,
     block_table: torch.Tensor,
     context_lens: torch.Tensor,
+    max_ctx: int = 0,
 ) -> torch.Tensor:
     """Block-aware Paged Decode Attention（M4 优化）
 
@@ -84,16 +85,24 @@ def decode_paged_attention(
     有 CUDA kernel 时调用 mini_llm_kernels.decode_paged_attention，
     否则退回等价 PyTorch 实现（gather + batched GQA matmul）。
 
+    CUDA graph capture 时跳过 custom kernel（内部 fallback 用 .item() 不兼容），
+    此时必须通过 max_ctx 预传入 context 长度。
+
     Args:
         q:            [N, H_q, D]
         k_cache:      [num_blocks, block_size, H_kv, D]
         v_cache:      [num_blocks, block_size, H_kv, D]
         block_table:  [N, max_blocks]  int32/int64
         context_lens: [N]              int32/int64
+        max_ctx:      context 总长度（CUDA graph capture 时必须提供）
 
     Returns:
         out: [N, H_q, D]
     """
+    if torch.cuda.is_current_stream_capturing():
+        return _decode_paged_attention_fallback(
+            q, k_cache, v_cache, block_table, context_lens, max_ctx
+        )
     if _HAS_CUSTOM_KERNELS and _mkl is not None and q.is_cuda:
         return _mkl.decode_paged_attention(
             q, k_cache, v_cache,
@@ -101,7 +110,7 @@ def decode_paged_attention(
             context_lens.to(torch.int32),
         )
     # PyTorch fallback（等价于原 gather + gathered_paged_kv_decode_attention）
-    return _decode_paged_attention_fallback(q, k_cache, v_cache, block_table, context_lens)
+    return _decode_paged_attention_fallback(q, k_cache, v_cache, block_table, context_lens, max_ctx)
 
 
 def _decode_paged_attention_fallback(
@@ -110,12 +119,18 @@ def _decode_paged_attention_fallback(
     v_cache: torch.Tensor,
     block_table: torch.Tensor,
     context_lens: torch.Tensor,
+    max_ctx: int = 0,
 ) -> torch.Tensor:
-    """PyTorch fallback：gather + batched GQA attention"""
+    """PyTorch fallback：gather + batched GQA attention
+
+    max_ctx > 0 时使用该值作为 context 长度（用于 CUDA graph capture 兼容），
+    否则从 context_lens 中 .item() 获取。
+    """
     N, H_q, D = q.shape
     block_size = k_cache.size(1)
     H_kv = k_cache.size(2)
-    max_ctx = int(context_lens.max().item())
+    if max_ctx <= 0:
+        max_ctx = int(context_lens.max().item())
     max_blocks = block_table.size(1)
 
     pos = torch.arange(max_ctx, device=q.device, dtype=torch.long)
