@@ -169,7 +169,7 @@ class AWQCalibrator:
             act_attn = act_attn / self._num_samples
             act_ffn  = act_ffn / self._num_samples
 
-            lw = block.layer_weights
+            lw = block.weights
             h = self.runner.model_config.hidden_size
             inter = self.runner.model_config.intermediate_size
             qkv_dim = lw.qkv_proj.shape[1]
@@ -262,7 +262,7 @@ def awq_quantize_model(
         if cfg is None:
             continue
 
-        lw = block.layer_weights
+        lw = block.weights
 
         for weight_name in ['qkv_proj', 'o_proj', 'gate_up_proj', 'down_proj']:
             w_orig = getattr(lw, weight_name)

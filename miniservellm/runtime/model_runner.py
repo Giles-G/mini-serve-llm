@@ -725,10 +725,34 @@ class TransformerModelRunner:
         """
         for block in self.blocks:
             lw = block.weights
-            lw.qkv_proj = quantize_weight_group(lw.qkv_proj, bits=bits, group_size=group_size)
-            lw.o_proj = quantize_weight_group(lw.o_proj, bits=bits, group_size=group_size)
-            lw.gate_up_proj = quantize_weight_group(lw.gate_up_proj, bits=bits, group_size=group_size)
-            lw.down_proj = quantize_weight_group(lw.down_proj, bits=bits, group_size=group_size)
+            lw.qkv_proj = self._prepare_int4_weight(
+                lw.qkv_proj, bits=bits, group_size=group_size
+            )
+            lw.o_proj = self._prepare_int4_weight(
+                lw.o_proj, bits=bits, group_size=group_size
+            )
+            lw.gate_up_proj = self._prepare_int4_weight(
+                lw.gate_up_proj, bits=bits, group_size=group_size
+            )
+            lw.down_proj = self._prepare_int4_weight(
+                lw.down_proj, bits=bits, group_size=group_size
+            )
+
+    @staticmethod
+    def _prepare_int4_weight(
+        weight: torch.Tensor, bits: int = 4, group_size: int = 64
+    ) -> tuple:
+        """Quantize once and store the packed representation used at runtime."""
+        w_q, scales = quantize_weight_group(weight, bits=bits, group_size=group_size)
+        if bits != 4:
+            return w_q, scales
+        if w_q.shape[0] % 2 != 0:
+            raise ValueError(
+                f"INT4 CUDA packing requires an even output size, got {w_q.shape[0]}"
+            )
+        w_unsigned = (w_q.to(torch.int16) + 8).clamp(0, 15).to(torch.uint8)
+        w_packed = (w_unsigned[0::2] | (w_unsigned[1::2] << 4)).contiguous()
+        return w_packed, scales
 
     @property
     def device(self) -> torch.device:

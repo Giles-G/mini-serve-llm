@@ -212,19 +212,28 @@ def _int4_linear(
             from mini_llm_kernels.kernels.int4_matmul import _int4_dequant_matmul_pytorch
             y = _int4_dequant_matmul_pytorch(x_scaled, w_packed, group_scales)
     else:
-        # Basic format (P6 fallback)
-        w_q, scales = weight
-        group_size = w_q.shape[1] // scales.shape[1]
-        # Prefer int4 matmul; fallback to dequantize
+        # Basic format: (w_packed_uint8, scales) is the native runtime format.
+        # Keep accepting the legacy (w_q_int8, scales) format for compatibility.
+        w_data, scales = weight
+        group_size = w_data.shape[1] // scales.shape[1]
+
+        if w_data.dtype == torch.uint8:
+            w_packed = w_data
+        else:
+            if w_data.shape[0] % 2 != 0:
+                raise ValueError(
+                    f"INT4 CUDA packing requires an even output size, got {w_data.shape[0]}"
+                )
+            w_unsigned = (w_data.to(torch.int16) + 8).clamp(0, 15).to(torch.uint8)
+            w_packed = w_unsigned[0::2] | (w_unsigned[1::2] << 4)
+
+        # Prefer the fused CUDA kernel; fallback keeps the same packed layout.
         try:
             from mini_llm_kernels.kernels.int4_matmul import int4_dequant_matmul as _im
-            # Pack w_q to uint8 format expected by kernel
-            w_unsigned = (w_q.to(torch.int8) + 8).clamp(0, 15).to(torch.uint8)
-            w_packed = w_unsigned[:, 0::2] | (w_unsigned[:, 1::2] << 4)
             y = _im(x, w_packed.contiguous(), scales)
         except (ImportError, RuntimeError):
-            w_fp16 = (w_q.float() * scales.repeat_interleave(group_size, dim=1)).to(x.dtype)
-            y = F.linear(x, w_fp16)
+            from mini_llm_kernels.kernels.int4_matmul import _int4_dequant_matmul_pytorch
+            y = _int4_dequant_matmul_pytorch(x, w_packed, scales)
 
     return y if bias is None else y + bias
 
