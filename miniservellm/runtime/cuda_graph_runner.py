@@ -15,6 +15,7 @@ import torch
 from miniservellm.config import EngineConfig, ModelConfig
 from miniservellm.runtime.model_runner import TransformerModelRunner
 from miniservellm.runtime.nn_ops import (
+    apply_rope,
     decode_paged_attention,
     fused_add_rms_norm,
     linear,
@@ -91,15 +92,9 @@ class CudaGraphBatch1Runner:
         k_new = k_new.view(1, self._mc.num_key_value_heads, self._mc.head_dim)
         v_new = v_new.view(1, self._mc.num_key_value_heads, self._mc.head_dim)
 
-        # RoPE (index by context_len from static tensor)
+        # RoPE — reuse nn_ops.apply_rope (graph-capturable, pure tensor ops)
         rope_pos = self._static_context_lens.to(torch.long)
-        cos = self.runner.rope_cos.index_select(0, rope_pos).unsqueeze(1)
-        sin = self.runner.rope_sin.index_select(0, rope_pos).unsqueeze(1)
-        half = self._mc.head_dim // 2
-        q1, q2 = q[..., :half], q[..., half:]
-        k1, k2 = k_new[..., :half], k_new[..., half:]
-        q = torch.cat([q1 * cos - q2 * sin, q1 * sin + q2 * cos], dim=-1)
-        k_new = torch.cat([k1 * cos - k2 * sin, k1 * sin + k2 * cos], dim=-1)
+        q, k_new = apply_rope(q, k_new, rope_pos, self.runner.rope_cos, self.runner.rope_sin)
 
         # KV write to paged cache (in-place, graph-capturable)
         k_cache = kv_cache_manager.k_cache[layer_idx]
