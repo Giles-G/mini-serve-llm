@@ -112,8 +112,8 @@ class DecodeRunner:
                 block_table = self.kv_cache_manager.build_decode_block_table([req], ctx_len)
                 # Lazy capture on first call
                 if not self.model.has_cuda_graph:
-                    self.model.enable_cuda_graph(token_id, ctx_len + 1, block_table)
-                logits = self.model.cuda_graph_step(token_id, ctx_len + 1, block_table)
+                    self.model.enable_cuda_graph(token_id, ctx_len - 1, block_table)
+                logits = self.model.cuda_graph_step(token_id, ctx_len - 1, block_table)
                 output = DecodeModelOutput(logits_by_request={req.request_id: logits})
                 return DecodeRunResult(requests=requests, metas=metas, output=output)
 

@@ -101,11 +101,12 @@ class CudaGraphBatch1Runner:
         v_cache = kv_cache_manager.v_cache[layer_idx]
         bs = k_cache.size(1)  # block_size
         pos_long = rope_pos  # already long
-        wb = (pos_long // bs).view(-1)
+        wb_logical = (pos_long // bs).view(-1)
         wo = (pos_long % bs).view(-1)
+        wb_physical = self._static_block_table[0, wb_logical].view(-1).to(torch.long)
 
-        k_cache[wb, wo] = k_new.view(1, kv_dim)
-        v_cache[wb, wo] = v_new.view(1, kv_dim)
+        k_cache[wb_physical, wo] = k_new
+        v_cache[wb_physical, wo] = v_new
 
         # Paged attention
         attn_out = decode_paged_attention(
@@ -113,7 +114,7 @@ class CudaGraphBatch1Runner:
             k_cache=k_cache,
             v_cache=v_cache,
             block_table=self._static_block_table,
-            context_lens=self._static_context_lens.to(torch.int32),
+            context_lens=(self._static_context_lens + 1).to(torch.int32),
         )
 
         attn_out = attn_out.reshape(1, self._hidden_size)
