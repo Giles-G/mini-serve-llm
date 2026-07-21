@@ -58,7 +58,7 @@ def fused_add_rms_norm(
         x_normed:     [N, H]  归一化结果，供下一算子（QKV/MLP）使用
         residual_out: [N, H]  x + residual，作为下一子层的残差输入
     """
-    if _HAS_CUSTOM_KERNELS and _mkl is not None:
+    if _HAS_CUSTOM_KERNELS and _mkl is not None and x.is_cuda:
         return _mkl.fused_add_rms_norm(x, residual, gamma, eps)
     # PyTorch fallback
     orig_dtype = x.dtype
@@ -94,7 +94,7 @@ def decode_paged_attention(
     Returns:
         out: [N, H_q, D]
     """
-    if _HAS_CUSTOM_KERNELS and _mkl is not None:
+    if _HAS_CUSTOM_KERNELS and _mkl is not None and q.is_cuda:
         return _mkl.decode_paged_attention(
             q, k_cache, v_cache,
             block_table.to(torch.int32),
