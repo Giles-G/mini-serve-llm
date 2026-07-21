@@ -103,16 +103,9 @@ class CudaGraphBatch1Runner:
         pos_long = rope_pos  # already long
         wb = (pos_long // bs).view(-1)
         wo = (pos_long % bs).view(-1)
-        kv_head_range = torch.arange(kv_dim, device=self._device, dtype=torch.long)
 
-        k_cache.index_put_(
-            (wb, wo.expand(kv_dim), kv_head_range),
-            k_new.view(-1),
-        )
-        v_cache.index_put_(
-            (wb, wo.expand(kv_dim), kv_head_range),
-            v_new.view(-1),
-        )
+        k_cache[wb, wo] = k_new.view(1, kv_dim)
+        v_cache[wb, wo] = v_new.view(1, kv_dim)
 
         # Paged attention
         attn_out = decode_paged_attention(
