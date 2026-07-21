@@ -101,8 +101,20 @@ class Sampler:
             return {}
 
         N = len(requests)
+        # 模型单请求输出的约定是 [V]。CUDA graph 路径可能保留 batch/
+        # sequence singleton 维度，因此在采样边界统一规范为一维词表 logits。
+        per_request_logits = []
+        for req in requests:
+            request_logits = logits_by_request[req.request_id]
+            if request_logits.numel() != request_logits.shape[-1]:
+                raise ValueError(
+                    f"expected one vocabulary-logit vector for request {req.request_id}, "
+                    f"got shape {tuple(request_logits.shape)}"
+                )
+            per_request_logits.append(request_logits.reshape(-1))
+
         # 堆叠为 [N, V]
-        logits = torch.stack([logits_by_request[r.request_id] for r in requests], dim=0)
+        logits = torch.stack(per_request_logits, dim=0)
 
         # 全 greedy 是性能基准和确定性推理的常见路径，直接 argmax。
         if all(float(r.sampling_params.temperature) <= 0.0 for r in requests):

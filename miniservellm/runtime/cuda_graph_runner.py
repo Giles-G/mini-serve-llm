@@ -148,7 +148,7 @@ class CudaGraphBatch1Runner:
         hidden = rms_norm(
             hidden, self.runner.weights.final_norm, self._mc.rms_norm_eps
         )
-        return linear(hidden[:, -1:, :], self.runner.weights.lm_head)
+        return linear(hidden[:, -1:, :], self.runner.weights.lm_head).squeeze()
 
     # ---- public API ----
 

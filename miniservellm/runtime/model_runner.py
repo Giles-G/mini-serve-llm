@@ -724,7 +724,7 @@ class TransformerModelRunner:
         Embedding、lm_head、layernorm 保持 fp16 不变。
         """
         for block in self.blocks:
-            lw = block.layer_weights
+            lw = block.weights
             lw.qkv_proj = quantize_weight_group(lw.qkv_proj, bits=bits, group_size=group_size)
             lw.o_proj = quantize_weight_group(lw.o_proj, bits=bits, group_size=group_size)
             lw.gate_up_proj = quantize_weight_group(lw.gate_up_proj, bits=bits, group_size=group_size)
