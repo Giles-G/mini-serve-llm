@@ -92,7 +92,7 @@ class CudaGraphBatch1Runner:
         v_new = v_new.view(1, self._mc.num_key_value_heads, self._mc.head_dim)
 
         # RoPE (index by context_len from static tensor)
-        rope_pos = self._static_context_lens
+        rope_pos = self._static_context_lens.to(torch.long)
         cos = self.runner.rope_cos.index_select(0, rope_pos).unsqueeze(1)
         sin = self.runner.rope_sin.index_select(0, rope_pos).unsqueeze(1)
         half = self._mc.head_dim // 2
@@ -105,16 +105,17 @@ class CudaGraphBatch1Runner:
         k_cache = kv_cache_manager.k_cache[layer_idx]
         v_cache = kv_cache_manager.v_cache[layer_idx]
         bs = k_cache.size(1)  # block_size
-        wb = rope_pos // bs
-        wo = rope_pos % bs
-        kv_head_range = torch.arange(kv_dim, device=self._device)
+        pos_long = rope_pos  # already long
+        wb = (pos_long // bs).view(-1)
+        wo = (pos_long % bs).view(-1)
+        kv_head_range = torch.arange(kv_dim, device=self._device, dtype=torch.long)
 
         k_cache.index_put_(
-            (wb.view(-1), wo.view(-1).expand(kv_dim), kv_head_range),
+            (wb, wo.expand(kv_dim), kv_head_range),
             k_new.view(-1),
         )
         v_cache.index_put_(
-            (wb.view(-1), wo.view(-1).expand(kv_dim), kv_head_range),
+            (wb, wo.expand(kv_dim), kv_head_range),
             v_new.view(-1),
         )
 
@@ -186,7 +187,9 @@ class CudaGraphBatch1Runner:
         self._static_context_lens.copy_(
             torch.tensor([context_len], device=self._device, dtype=torch.int32)
         )
-        self._static_block_table.copy_(block_table.to(torch.int32))
+        bt = block_table.to(torch.int32)
+        n = bt.shape[1]
+        self._static_block_table[:, :n].copy_(bt)
 
         # Warmup (3 iterations to stabilize GPU clock)
         for _ in range(3):
@@ -222,7 +225,9 @@ class CudaGraphBatch1Runner:
         self._static_context_lens.copy_(
             torch.tensor([context_len], device=self._device, dtype=torch.int32)
         )
-        self._static_block_table.copy_(block_table.to(torch.int32))
+        bt = block_table.to(torch.int32)
+        n = bt.shape[1]
+        self._static_block_table[:, :n].copy_(bt)
 
         self._graph.replay()
         return self._static_logits
