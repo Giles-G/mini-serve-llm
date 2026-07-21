@@ -169,38 +169,47 @@ def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] =
 
 def _int4_linear(
     x: torch.Tensor,
-    weight: tuple,  # (w_q_int8, scales_fp16)
+    weight: tuple,  # (w_q_int8, scales_fp16) or (w_packed_uint8, group_scales, awq_scales)
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """INT4 group-quantized matmul。
+    """INT4 quantized matmul with AWQ support.
 
-    weight = (w_q, scales) 其中：
-      w_q:    [out_features, in_features]  int8（值域 [-8, 7]）
-      scales: [out_features, in_features // group_size]  fp16
+    Supports two weight formats:
+
+    1. Basic (P6): weight = (w_q_int8, scales_fp16)
+       - w_q: [N, K] int8, values in [-8, 7]
+       - scales: [N, K//group_size] fp16
+
+    2. AWQ (D1a): weight = (w_packed, group_scales, awq_scales)
+       - w_packed: [N//2, K] uint8, 2×INT4 per byte
+       - group_scales: [N, K//group_size] fp16
+       - awq_scales: [K] fp16 per-channel pre-scale for activations
     """
-    w_q, scales = weight
-    group_size = w_q.shape[1] // scales.shape[1]
-    out_features = w_q.shape[0]
-    in_features = w_q.shape[1]
-
-    # PyTorch 2.4+ 支持 _weight_int4pack_mm（高效 INT4 GEMM）。
-    # 格式要求：权重 packed 为 [out//2, in] uint8，每字节打包两个 int4。
-    try:
-        # Pack: 每 2 个 int4 值打包为 1 字节（低 4 bit 先行）
-        # w_q 值域 [-8, 7] → 加 8 偏置到 [0, 15]
-        w_unsigned = (w_q.to(torch.int8) + 8).to(torch.uint8)
-        w_packed = (w_unsigned[:, 0::2] | (w_unsigned[:, 1::2] << 4)).contiguous()
-        # torch._weight_int4pack_mm 需要 scales_and_zeros: [out, in//group//2]
-        # 以及 qweight: [out//2, in]
-        # 实际上这个 API 在不同 PyTorch 版本中格式有差异，这里做 best-effort
-        y = torch._weight_int4pack_mm(
-            x, w_packed, group_size,
-            scales_and_zeros=scales.contiguous().to(torch.float16)  # type: ignore[arg-type]
-        )
-    except (AttributeError, TypeError, RuntimeError):
-        # Fallback: dequantize + F.linear
-        w_fp16 = (w_q.float() * scales.repeat_interleave(group_size, dim=1)).to(x.dtype)
-        y = F.linear(x, w_fp16)
+    if len(weight) == 3:
+        # AWQ format: pre-scale activations, then INT4 matmul
+        w_packed, group_scales, awq_scales = weight
+        x_scaled = x.to(w_packed.dtype) * awq_scales  # pre-scale by AWQ channel
+        # Prefer fused CUDA kernel; fallback to PyTorch unpack
+        try:
+            from mini_llm_kernels.kernels.int4_matmul import int4_dequant_matmul
+            y = int4_dequant_matmul(x_scaled, w_packed, group_scales)
+        except (ImportError, RuntimeError):
+            from mini_llm_kernels.kernels.int4_matmul import _int4_dequant_matmul_pytorch
+            y = _int4_dequant_matmul_pytorch(x_scaled, w_packed, group_scales)
+    else:
+        # Basic format (P6 fallback)
+        w_q, scales = weight
+        group_size = w_q.shape[1] // scales.shape[1]
+        # Prefer int4 matmul; fallback to dequantize
+        try:
+            from mini_llm_kernels.kernels.int4_matmul import int4_dequant_matmul as _im
+            # Pack w_q to uint8 format expected by kernel
+            w_unsigned = (w_q.to(torch.int8) + 8).clamp(0, 15).to(torch.uint8)
+            w_packed = w_unsigned[:, 0::2] | (w_unsigned[:, 1::2] << 4)
+            y = _im(x, w_packed.contiguous(), scales)
+        except (ImportError, RuntimeError):
+            w_fp16 = (w_q.float() * scales.repeat_interleave(group_size, dim=1)).to(x.dtype)
+            y = F.linear(x, w_fp16)
 
     return y if bias is None else y + bias
 
