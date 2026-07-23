@@ -160,6 +160,123 @@ def _decode_paged_attention_fallback(
     return out.reshape(N, H_q, D)
 
 
+def paged_prefill_attention(
+    q_padded: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    chunk_lens: torch.Tensor,
+    history_lens: torch.Tensor,
+    block_size: int,
+) -> torch.Tensor:
+    """Paged prefill attention without materializing a padded KV batch.
+
+    This is the functional B1 implementation used when the optional CUDA
+    extension does not expose a prefill kernel. KV is read block by block from
+    the physical cache and combined with an online softmax, so the batch-level
+    ``[N, max_kv_len, H_kv, D]`` gather is avoided.
+
+    Args:
+        q_padded: [N, T_max, H_q, D]
+        k_cache/v_cache: [num_blocks, block_size, H_kv, D]
+        block_table: [N, max_blocks], physical block ids
+        chunk_lens/history_lens: [N], lengths on the logical sequence
+        block_size: number of tokens in one physical block
+    """
+    # Keep the public call shape identical for a future compiled kernel. An
+    # installed extension can opt in without changing model_runner again.
+    if (
+        _HAS_CUSTOM_KERNELS
+        and _mkl is not None
+        and q_padded.is_cuda
+        and hasattr(_mkl, "paged_prefill_attention")
+    ):
+        return _mkl.paged_prefill_attention(
+            q_padded,
+            k_cache,
+            v_cache,
+            block_table.to(torch.int32),
+            chunk_lens.to(torch.int32),
+            history_lens.to(torch.int32),
+        )
+
+    if q_padded.ndim != 4:
+        raise ValueError("q_padded must have shape [N, T, H_q, D]")
+    if k_cache.shape != v_cache.shape or k_cache.ndim != 4:
+        raise ValueError("k_cache and v_cache must have shape [blocks, block, heads, dim]")
+    if block_size <= 0 or k_cache.size(1) != block_size:
+        raise ValueError("block_size must match the KV cache")
+
+    n, _, h_q, d = q_padded.shape
+    h_kv = k_cache.size(2)
+    if h_q % h_kv != 0:
+        raise ValueError("num query heads must be divisible by num KV heads")
+    group = h_q // h_kv
+    scale = d ** -0.5
+    output = torch.zeros_like(q_padded)
+
+    # Keep the outer request loop deliberately small: it avoids allocating a
+    # dense KV tensor while the inner work remains tensorized over all queries.
+    for req_idx in range(n):
+        t = int(chunk_lens[req_idx].item())
+        history = int(history_lens[req_idx].item())
+        total = history + t
+        if t == 0 or total == 0:
+            continue
+
+        q = q_padded[req_idx, :t].view(t, h_kv, group, d)
+        q = q.permute(1, 0, 2, 3)  # [H_kv, T, G, D]
+        running_max = torch.full((h_kv, t, group), float("-inf"), device=q.device, dtype=torch.float32)
+        running_sum = torch.zeros((h_kv, t, group), device=q.device, dtype=torch.float32)
+        running_out = torch.zeros((h_kv, t, group, d), device=q.device, dtype=torch.float32)
+
+        n_blocks = (total + block_size - 1) // block_size
+        for block_idx in range(n_blocks):
+            physical_block = block_table[req_idx, block_idx].long()
+            start = block_idx * block_size
+            length = min(block_size, total - start)
+            k = k_cache[physical_block, :length].float()  # [B, H_kv, D]
+            v = v_cache[physical_block, :length].float()
+            k = k.permute(1, 0, 2)  # [H_kv, B, D]
+            v = v.permute(1, 0, 2)
+
+            scores = torch.einsum("htgd,hbd->htgb", q.float(), k) * scale
+            # Query i corresponds to logical position history + i. The first
+            # ``history`` positions are always visible; later blocks need a
+            # per-query causal mask.
+            key_positions = torch.arange(start, start + length, device=q.device)
+            query_positions = history + torch.arange(t, device=q.device)
+            scores = scores.masked_fill(
+                key_positions.view(1, 1, 1, -1) > query_positions.view(1, -1, 1, 1),
+                float("-inf"),
+            )
+
+            block_max = scores.amax(dim=-1)
+            new_max = torch.maximum(running_max, block_max)
+            # A later block can be entirely masked for an early query. Avoid
+            # (-inf - -inf), which would otherwise introduce NaNs.
+            finite_new_max = torch.isfinite(new_max)
+            old_factor = torch.where(
+                finite_new_max & torch.isfinite(running_max),
+                torch.exp(running_max - new_max),
+                torch.zeros_like(new_max),
+            )
+            block_factor = torch.where(
+                torch.isfinite(scores) & finite_new_max.unsqueeze(-1),
+                torch.exp(scores - new_max.unsqueeze(-1)),
+                torch.zeros_like(scores),
+            )
+            running_sum = running_sum * old_factor + block_factor.sum(dim=-1)
+            running_out = running_out * old_factor.unsqueeze(-1) + torch.einsum(
+                "htgb,hbd->htgd", block_factor, v
+            )
+            running_max = new_max
+
+        result = (running_out / running_sum.clamp_min(1e-6).unsqueeze(-1)).to(q_padded.dtype)
+        output[req_idx, :t] = result.permute(1, 0, 2, 3).reshape(t, h_q, d)
+    return output
+
+
 def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
     """线性变换（全连接层），自动检测量化权重。
 

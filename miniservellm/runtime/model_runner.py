@@ -28,6 +28,7 @@ from miniservellm.runtime.nn_ops import (
     apply_rope,
     batched_causal_attention_prefill,
     build_rope_cache,
+    paged_prefill_attention,
     causal_attention_prefill,
     causal_attention_single_query,
     decode_paged_attention,
@@ -98,6 +99,7 @@ class PrefillBatchCtx:
     last_token_indices: torch.Tensor = field(default_factory=lambda: torch.empty(0))
     pad_row: torch.Tensor = field(default_factory=lambda: torch.empty(0))
     pad_col: torch.Tensor = field(default_factory=lambda: torch.empty(0))
+    block_table: torch.Tensor = field(default_factory=lambda: torch.empty(0))
 
 
 @dataclass
@@ -410,14 +412,6 @@ class TransformerBlockRunner:
             v_values=v_new,
         )
 
-        # 批量 KV gather：[N, max_kv_len, H_kv, D]
-        k_padded = self.kv_cache_manager.k_cache[
-            self.layer_idx, ctx.block_ids, ctx.block_offsets
-        ]
-        v_padded = self.kv_cache_manager.v_cache[
-            self.layer_idx, ctx.block_ids, ctx.block_offsets
-        ]
-
         # 把 q [sum_T, H_q, D] pack 成 [N, max_chunk_len, H_q, D]
         # 用预计算的 (pad_row, pad_col) 索引一次散列写入，避免 Python for 循环
         N = ctx.chunk_lens.shape[0]
@@ -428,15 +422,35 @@ class TransformerBlockRunner:
         )
         q_padded[ctx.pad_row, ctx.pad_col] = q
 
-        # 批量 attention
-        attn_padded = batched_causal_attention_prefill(
-            q_padded=q_padded,
-            k_padded=k_padded,
-            v_padded=v_padded,
-            chunk_lens=ctx.chunk_lens,
-            history_lens=ctx.history_lens,
-            num_q_heads=self.num_q_heads,
-        )  # [N, max_chunk_len, H_q, D]
+        # B1：attention 内直接沿 block_table 读取物理 KV，避免整个 batch 的
+        # [N, max_kv_len, H_kv, D] gather。旧 padded 实现保留作显式回退。
+        compiler = getattr(torch, "compiler", None)
+        compiling = bool(compiler is not None and getattr(compiler, "is_compiling", lambda: False)())
+        if ctx.block_table.numel() > 0 and not compiling:
+            attn_padded = paged_prefill_attention(
+                q_padded=q_padded,
+                k_cache=self.kv_cache_manager.k_cache[self.layer_idx],
+                v_cache=self.kv_cache_manager.v_cache[self.layer_idx],
+                block_table=ctx.block_table,
+                chunk_lens=ctx.chunk_lens,
+                history_lens=ctx.history_lens,
+                block_size=self.kv_cache_manager.engine_config.block_size,
+            )
+        else:
+            k_padded = self.kv_cache_manager.k_cache[
+                self.layer_idx, ctx.block_ids, ctx.block_offsets
+            ]
+            v_padded = self.kv_cache_manager.v_cache[
+                self.layer_idx, ctx.block_ids, ctx.block_offsets
+            ]
+            attn_padded = batched_causal_attention_prefill(
+                q_padded=q_padded,
+                k_padded=k_padded,
+                v_padded=v_padded,
+                chunk_lens=ctx.chunk_lens,
+                history_lens=ctx.history_lens,
+                num_q_heads=self.num_q_heads,
+            )  # [N, max_chunk_len, H_q, D]
 
         # Unpack 回 [sum_T, H_q, D]：advanced indexing 一次拿到
         attn_flat = attn_padded[ctx.pad_row, ctx.pad_col]
@@ -920,10 +934,12 @@ class TransformerModelRunner:
         max_kv_len = max(total_kv_lens) if total_kv_lens else 0
         max_kv_len_bucketed = self._bucket_len(max_kv_len)
 
-        # 复用 KV gather 索引构造（按 total_kv_lens 当 context_len）
-        # 为提升 compile 命中率，可把 max_ctx 向上 pad 到分桶边界。
+        # 保留旧路径所需的索引，同时构造 B1 直接跳读物理 block 的 table。
         block_ids, block_offsets = self.kv_cache_manager.build_decode_batch_indices(
             requests, total_kv_lens, padded_max_ctx=max_kv_len_bucketed,
+        )
+        block_table = self.kv_cache_manager.build_decode_block_table(
+            requests, max_kv_len_bucketed,
         )
 
         # 写入 slot 的 (block_ids, block_offsets) 一次性算出，跨层复用
@@ -954,6 +970,7 @@ class TransformerModelRunner:
             last_token_indices=last_token_indices,
             pad_row=pad_row,
             pad_col=pad_col,
+            block_table=block_table,
         )
 
     def _forward_prefill_impl(
