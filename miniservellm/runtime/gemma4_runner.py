@@ -129,7 +129,11 @@ class Gemma4EagerTextRunner:
         return emb.cos().to(torch.float32), emb.sin().to(torch.float32)
 
     def _apply_rope(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        # x: [T, H, D]; cos/sin: [T, D]
+        # x: [T, H, D]; cos/sin: [T, D]. Official implementation casts
+        # cos/sin to x.dtype before applying (modeling_gemma4.py rotary
+        # forward), keeping q/k in the model dtype.
+        cos = cos.to(x.dtype)
+        sin = sin.to(x.dtype)
         return x * cos[:, None, :] + _rotate_half(x) * sin[:, None, :]
 
     def _mask(self, attention_type: str, seq_len: int, dtype: torch.dtype) -> torch.Tensor:

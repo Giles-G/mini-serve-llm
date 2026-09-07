@@ -2,7 +2,7 @@
 
 Implements the :class:`ModelRunner` protocol (fresh/incremental prefill +
 decode) on top of :class:`Gemma4EagerTextRunner` primitives and
-:class:`Gemma4KVCacheManager`. Each request in a step batch is processed
+:class:`Gemma4PagedKVCacheManager`. Each request in a step batch is processed
 independently (batch=1 per request); cross-request batching kernels come
 with the later performance stages.
 
@@ -23,7 +23,7 @@ from typing import Dict, List, Optional
 
 import torch
 
-from miniservellm.cache.gemma4_kv_cache import Gemma4KVCacheManager
+from miniservellm.cache.gemma4_paged_kv_cache import Gemma4PagedKVCacheManager
 from miniservellm.config import EngineConfig, ModelConfig
 from miniservellm.model_adapter.adapters.gemma4_adapter import Gemma4TextWeights
 from miniservellm.runtime.gemma4_runner import (
@@ -49,7 +49,7 @@ class Gemma4EngineModelRunner(Gemma4EagerTextRunner):
         engine_config: EngineConfig,
         model_config: ModelConfig,
         weights: Gemma4TextWeights,
-        kv_cache_manager: Gemma4KVCacheManager,
+        kv_cache_manager: Gemma4PagedKVCacheManager,
     ):
         # Weights must already live on the target device/dtype (see
         # load_gemma4_text_weights); the eager runner forbids moving here.
@@ -139,11 +139,14 @@ class Gemma4EngineModelRunner(Gemma4EagerTextRunner):
                 k = self._apply_rope(k, cos, sin)
                 v = (h @ lw.v_proj.t()).view(len(chunk_ids), spec.num_key_value_heads, head_dim)
                 v = _rms_norm(v, lw.v_norm, self.eps)
-                self.kv_cache_manager.write_kv_chunk(
-                    req.request_id, spec.layer_idx, start, k, v
+                self.kv_cache_manager.write_kv_for_tokens(
+                    spec.layer_idx, meta.write_slots, k, v
                 )
                 k, v = self.kv_cache_manager.gather_kv_for_request(spec.layer_idx, req, total)
-            k, v = self._window_slice(spec, k, v)
+            # NOTE: no window slicing here — prefill attention uses the full
+            # gathered K/V with the sliding mask built over absolute
+            # positions (_prefill_mask). Slicing would misalign K with the
+            # mask when the chunk spans multiple windows.
 
             scores = torch.matmul(
                 q.transpose(0, 1), k.transpose(0, 1).transpose(-1, -2)
@@ -221,8 +224,8 @@ class Gemma4EngineModelRunner(Gemma4EagerTextRunner):
                 k = self._apply_rope(k, cos, sin)
                 v = (h @ lw.v_proj.t()).view(1, spec.num_key_value_heads, head_dim)
                 v = _rms_norm(v, lw.v_norm, self.eps)
-                self.kv_cache_manager.write_kv_chunk(
-                    req.request_id, spec.layer_idx, position, k, v
+                self.kv_cache_manager.write_kv_for_tokens(
+                    spec.layer_idx, [meta.write_slot], k, v
                 )
                 k, v = self.kv_cache_manager.gather_kv_for_request(spec.layer_idx, req, ctx_len)
             k, v = self._window_slice(spec, k, v)

@@ -38,7 +38,7 @@ def run_gemma4_eager(
     import torch
     from transformers import AutoTokenizer
 
-    from miniservellm.cache.gemma4_kv_cache import Gemma4KVCacheManager
+    from miniservellm.cache.gemma4_paged_kv_cache import Gemma4PagedKVCacheManager
     from miniservellm.model_adapter.adapters.gemma4_hf_model import (
         load_gemma4_config,
         load_gemma4_text_weights,
@@ -65,9 +65,9 @@ def run_gemma4_eager(
         device=device,
         dtype="bf16" if torch_dtype == torch.bfloat16 else "fp32",
         block_size=128,
-        # Virtual block pool: 512 blocks * 128 tokens = 64k token capacity.
-        # The Gemma4 manager only uses this for scheduler accounting.
-        num_gpu_blocks=512,
+        # Physical paged blocks: 128 blocks x 128 tokens = 16k token capacity,
+        # ~300MB bf16 across the D=256/D=512 cache groups.
+        num_gpu_blocks=128,
         max_batch_size=8,
         max_tokens_per_step=256,
         max_prefill_tokens_per_step=128,
@@ -83,7 +83,7 @@ def run_gemma4_eager(
     )
     engine_config.eos_token_id = (1, 106, 50)
 
-    kv_cache_manager = Gemma4KVCacheManager(engine_config, model_config)
+    kv_cache_manager = Gemma4PagedKVCacheManager(engine_config, model_config)
     model_runner = Gemma4EngineModelRunner(engine_config, model_config, weights, kv_cache_manager)
     tokenizer = AutoTokenizer.from_pretrained(str(model_path), local_files_only=True)
     engine = Stage5Engine(
