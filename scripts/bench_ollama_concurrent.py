@@ -86,16 +86,16 @@ def post_generate(
     max_new: int,
     timeout: float,
     request_index: int,
+    raw: bool,
 ) -> RequestResult:
     """Send one non-streaming Ollama /api/generate request and collect metrics."""
     payload = {
         "model": model,
         "prompt": prompt,
         "stream": False,
-        # Match the direct raw token-ID inputs used by HF/MLX parity checks.
-        # Without this, Ollama applies the model chat template and runs a
-        # different token sequence despite receiving the same prompt string.
-        "raw": True,
+        # Native mode lets Ollama apply the selected model's own template.
+        # Raw mode is retained for callers that already rendered a template.
+        "raw": raw,
         # Keep sampling deterministic and avoid EOS shortening the measured decode.
         "options": {"num_predict": max_new, "temperature": 0, "seed": 0},
     }
@@ -138,6 +138,7 @@ def run_round(
     max_new_list: list[int],
     concurrency: int,
     timeout: float,
+    raw: bool,
 ) -> tuple[list[RequestResult], float]:
     """Run a fixed request count with at most ``concurrency`` in flight."""
     started = time.perf_counter()
@@ -151,6 +152,7 @@ def run_round(
                 max_new_list[request_index],
                 timeout,
                 request_index,
+                raw,
             )
             for request_index in range(len(prompts))
         ]
@@ -184,6 +186,11 @@ def main() -> None:
         "--chat-template",
         action="store_true",
         help="Render --prompt with the HF Qwen tokenizer template before sending it as raw Ollama input.",
+    )
+    parser.add_argument(
+        "--raw",
+        action="store_true",
+        help="Send raw input instead of applying Ollama's native model template.",
     )
     parser.add_argument(
         "--template-model",
@@ -224,6 +231,7 @@ def main() -> None:
 
     if args.chat_template and args.prompt is None:
         raise ValueError("--chat-template requires --prompt")
+    use_raw = args.raw or args.chat_template
     if args.heterogeneous_prompts and args.prompt is not None:
         raise ValueError("--heterogeneous-prompts requires synthetic prompts (omit --prompt)")
     if args.prompt is not None:
@@ -239,10 +247,11 @@ def main() -> None:
             prompt_source = f"qwen_chat_template:{args.template_model}"
         else:
             prompt = args.prompt
-            prompt_source = "explicit_raw"
+            prompt_source = "explicit_raw" if use_raw else "ollama_native_template"
     else:
         prompt = build_fixed_prompt(args.context_len)
-        prompt_source = f"synthetic_context_len={args.context_len}"
+        source_mode = "raw" if use_raw else "ollama_native_template"
+        prompt_source = f"synthetic_context_len={args.context_len}:{source_mode}"
 
     # Build per-request prompt and max_new lists for heterogeneous mode.
     def build_request_params(count: int) -> tuple[list[str], list[int]]:
@@ -280,6 +289,7 @@ def main() -> None:
             max_new_list=warmup_max_new,
             concurrency=min(args.concurrency, args.warmup_requests),
             timeout=args.timeout,
+            raw=use_raw,
         )
 
     aggregate_rates: list[float] = []
@@ -299,6 +309,7 @@ def main() -> None:
             max_new_list=run_max_new,
             concurrency=args.concurrency,
             timeout=args.timeout,
+            raw=use_raw,
         )
         total_output_tokens = sum(result.eval_count for result in results)
         aggregate_rate = total_output_tokens / round_seconds if round_seconds > 0 else 0.0
@@ -324,7 +335,7 @@ def main() -> None:
     print("\n[ollama concurrent summary]")
     print(
         f"model={args.model} concurrency={args.concurrency} requests/run={args.requests} "
-        f"runs={args.runs} stream=false raw=true "
+        f"runs={args.runs} stream=false raw={str(use_raw).lower()} "
         f"heterogeneous_prompts={args.heterogeneous_prompts} "
         f"heterogeneous_max_new={args.heterogeneous_max_new}"
     )

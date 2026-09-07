@@ -8,8 +8,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Any, Optional
 
 import torch
 
@@ -248,3 +248,15 @@ class ModelConfig:
     max_position_embeddings: int
     rope_theta: float
     rms_norm_eps: float
+
+    # Model-family extensions. Qwen keeps the legacy scalar fields above;
+    # Gemma 4 uses the layer-aware fields below.
+    hidden_activation: str = "silu"
+    tie_word_embeddings: bool = True
+    final_logit_softcapping: Optional[float] = None
+    sliding_window: Optional[int] = None
+    hidden_size_per_layer_input: int = 0
+    vocab_size_per_layer_input: int = 0
+    num_kv_shared_layers: int = 0
+    use_double_wide_mlp: bool = False
+    layer_specs: list[Any] = field(default_factory=list)

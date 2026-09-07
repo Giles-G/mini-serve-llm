@@ -9,11 +9,12 @@ from __future__ import annotations
 from typing import Optional
 
 import torch
+from miniservellm.model_adapter.adapter_factory import create_model_adapter
 
 
 def load_model_bundle(
-    adapter,
-    model_name_or_path: str,
+    adapter=None,
+    model_name_or_path: str = "",
     trust_remote_code: bool = False,
     load_model_device: str = "cpu",
     load_dtype: Optional[torch.dtype] = None,
@@ -30,6 +31,18 @@ def load_model_bundle(
     Returns:
         (tokenizer, hf_config, model_config, hf_model, weights)
     """
+    if adapter is None:
+        config_loader = create_model_adapter
+        # The first config read is intentionally done through Transformers so
+        # the factory can select the correct model-family adapter.
+        from transformers import AutoConfig
+
+        hf_config = AutoConfig.from_pretrained(
+            model_name_or_path,
+            trust_remote_code=trust_remote_code,
+            local_files_only=True,
+        )
+        adapter = config_loader(hf_config)
     tokenizer = adapter.load_tokenizer(
         model_name_or_path=model_name_or_path,
         trust_remote_code=trust_remote_code,

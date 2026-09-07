@@ -10,3 +10,6 @@ requirements.txt
 ~/.cache/
 .vscode
 docs
+# 本地模型权重不进仓库
+models/
+.DS_Store

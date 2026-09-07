@@ -121,6 +121,14 @@ class Stage5Engine:
 
         # 请求注册表：request_id → Request 的映射，用于快速查找
         self.requests_by_id: Dict[str, Request] = {}
+        # EOS 集合：兼容单个 id 和多个 id（如 Gemma4 的 [1, 106, 50]）
+        eos = engine_config.eos_token_id
+        if eos is None:
+            self.eos_token_ids = set()
+        elif isinstance(eos, (list, tuple, set)):
+            self.eos_token_ids = {int(t) for t in eos}
+        else:
+            self.eos_token_ids = {int(eos)}
         # 自增的请求编号，用于生成唯一 request_id
         self.next_request_idx = 0
         # 连续无事件步数：用于 deadlock breaker（临时放宽 KV 预留水位）
@@ -300,8 +308,7 @@ class Stage5Engine:
                 )
 
                 # 检查首 token 是否为 EOS（虽然罕见，但理论可能）
-                eos_id = self.engine_config.eos_token_id
-                if eos_id is not None and first_token == eos_id:
+                if first_token in self.eos_token_ids:
                     req.mark_finished_eos()
                     self._finish_request(req, events)
                     continue
@@ -344,8 +351,7 @@ class Stage5Engine:
             )
 
             # 检查是否生成了 EOS token，若是则结束请求
-            eos_id = self.engine_config.eos_token_id
-            if eos_id is not None and token_id == eos_id:
+            if token_id in self.eos_token_ids:
                 req.mark_finished_eos()
                 self._finish_request(req, events)
                 continue

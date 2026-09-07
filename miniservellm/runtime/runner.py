@@ -101,10 +101,13 @@ class DecodeRunner:
             requests.append(req)
             metas.append(meta)
 
-        # C1: CUDA Graph fast path for batch=1 greedy decode
+        # C1: CUDA Graph fast path for batch=1 greedy decode.
+        # Only models that support the fixed-shape paged kernel may enter;
+        # Gemma4 (heterogeneous head dims, KV sharing) sets
+        # supports_cuda_graph=False.
         if len(requests) == 1:
             from miniservellm.runtime.nn_ops import _HAS_CUSTOM_KERNELS
-            if _HAS_CUSTOM_KERNELS:
+            if _HAS_CUSTOM_KERNELS and getattr(self.model, "supports_cuda_graph", True):
                 req = requests[0]
                 meta = metas[0]
                 token_id = meta.input_token_id
