@@ -56,6 +56,24 @@ class Gemma4EngineModelRunner(Gemma4EagerTextRunner):
         super().__init__(model_config, weights)
         self.engine_config = engine_config
         self.kv_cache_manager = kv_cache_manager
+        # Dense per-request KV mirror (stage H): attention reads contiguous
+        # tensors (same zero-copy pattern as the direct runner) while the
+        # paged pages stay the durable/accounting storage. Mirror size is
+        # ~18KB/token/request — negligible. Cleared on request finish.
+        self._dense: dict[str, dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
+        engine_config  # pages remain authoritative for capacity accounting
+
+    def _dense_for(self, request_id: str) -> dict:
+        return self._dense.setdefault(request_id, {})
+
+    def drop_dense(self, request_id: str) -> None:
+        self._dense.pop(request_id, None)
+
+    def _gc_dense(self) -> None:
+        """Drop mirrors of requests no longer tracked by the cache manager."""
+        live = self.kv_cache_manager.req_block_tables
+        for rid in [rid for rid in self._dense if rid not in live]:
+            del self._dense[rid]
 
     # ------------------------------------------------------------------
     # protocol surface
@@ -92,6 +110,7 @@ class Gemma4EngineModelRunner(Gemma4EagerTextRunner):
     def _run_prefill(
         self, requests: List[Request], metas: List[PrefillRequestMetadata]
     ) -> PrefillModelOutput:
+        self._gc_dense()
         logits_by_request: Dict[str, torch.Tensor] = {}
         for req, meta in zip(requests, metas):
             if not meta.chunk_token_ids:
@@ -109,6 +128,10 @@ class Gemma4EngineModelRunner(Gemma4EagerTextRunner):
         start = meta.context_len_before_chunk
         total = start + len(chunk_ids)
         input_ids = torch.tensor(chunk_ids, dtype=torch.long, device=self.device)
+        if start == 0:
+            # Fresh prefill: reset any stale mirror for this request.
+            self._dense.pop(req.request_id, None)
+        dense = self._dense_for(req.request_id)
 
         x = w.embed_tokens[input_ids] * float(self.config.hidden_size) ** 0.5
         per_layer_inputs = self._ple(input_ids, x) if self.config.hidden_size_per_layer_input else None
@@ -130,9 +153,9 @@ class Gemma4EngineModelRunner(Gemma4EagerTextRunner):
 
             source = self.kv_source.get(spec.layer_idx)
             if source is not None:
-                # Shared layer: K/V come from the source layer's cache. The
-                # source layer (< this index) already wrote the current chunk.
-                k, v = self.kv_cache_manager.gather_kv_for_request(source, req, total)
+                # Shared layer: K/V come from the source layer's mirror. The
+                # source layer (< this index) already stored the current chunk.
+                k, v = dense[source]
             else:
                 k = (h @ lw.k_proj.t()).view(len(chunk_ids), spec.num_key_value_heads, head_dim)
                 k = _rms_norm(k, lw.k_norm, self.eps)
@@ -142,7 +165,15 @@ class Gemma4EngineModelRunner(Gemma4EagerTextRunner):
                 self.kv_cache_manager.write_kv_for_tokens(
                     spec.layer_idx, meta.write_slots, k, v
                 )
-                k, v = self.kv_cache_manager.gather_kv_for_request(spec.layer_idx, req, total)
+                prev = dense.get(spec.layer_idx)
+                if prev is None:
+                    dense[spec.layer_idx] = (k, v)
+                else:
+                    dense[spec.layer_idx] = (
+                        torch.cat([prev[0], k], dim=0),
+                        torch.cat([prev[1], v], dim=0),
+                    )
+                k, v = dense[spec.layer_idx]
             # NOTE: no window slicing here — prefill attention uses the full
             # gathered K/V with the sliding mask built over absolute
             # positions (_prefill_mask). Slicing would misalign K with the
@@ -187,6 +218,7 @@ class Gemma4EngineModelRunner(Gemma4EagerTextRunner):
     # ------------------------------------------------------------------
     def _decode_one(self, req: Request, meta: DecodeRequestMetadata) -> torch.Tensor:
         w = self.w
+        dense = self._dense_for(req.request_id)
         input_ids = torch.tensor([meta.input_token_id], dtype=torch.long, device=self.device)
         position = meta.query_position
         ctx_len = meta.context_len
@@ -217,7 +249,7 @@ class Gemma4EngineModelRunner(Gemma4EagerTextRunner):
 
             source = self.kv_source.get(spec.layer_idx)
             if source is not None:
-                k, v = self.kv_cache_manager.gather_kv_for_request(source, req, ctx_len)
+                k, v = dense[source]
             else:
                 k = (h @ lw.k_proj.t()).view(1, spec.num_key_value_heads, head_dim)
                 k = _rms_norm(k, lw.k_norm, self.eps)
@@ -227,7 +259,15 @@ class Gemma4EngineModelRunner(Gemma4EagerTextRunner):
                 self.kv_cache_manager.write_kv_for_tokens(
                     spec.layer_idx, [meta.write_slot], k, v
                 )
-                k, v = self.kv_cache_manager.gather_kv_for_request(spec.layer_idx, req, ctx_len)
+                prev = dense.get(spec.layer_idx)
+                if prev is None:
+                    dense[spec.layer_idx] = (k, v)
+                else:
+                    dense[spec.layer_idx] = (
+                        torch.cat([prev[0], k], dim=0),
+                        torch.cat([prev[1], v], dim=0),
+                    )
+                k, v = dense[spec.layer_idx]
             k, v = self._window_slice(spec, k, v)
 
             scores = torch.matmul(

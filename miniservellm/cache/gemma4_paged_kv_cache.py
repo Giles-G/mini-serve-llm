@@ -138,6 +138,14 @@ class Gemma4PagedKVCacheManager:
         if not slot_refs:
             return
         key, local_layer = self._layer_group[layer_idx]
+        if len(slot_refs) == 1:
+            # Decode fast path: scalar indexing avoids building small index
+            # tensors per layer per step (32 × torch.tensor(...) per step was
+            # the dominant engine overhead on MPS).
+            slot = slot_refs[0]
+            self._k_cache[key][local_layer, slot.block_id, slot.block_offset] = k_values[0]
+            self._v_cache[key][local_layer, slot.block_id, slot.block_offset] = v_values[0]
+            return
         block_ids = torch.tensor([s.block_id for s in slot_refs], device=self.engine_config.device, dtype=torch.long)
         offsets = torch.tensor([s.block_offset for s in slot_refs], device=self.engine_config.device, dtype=torch.long)
         self._k_cache[key][local_layer, block_ids, offsets] = k_values

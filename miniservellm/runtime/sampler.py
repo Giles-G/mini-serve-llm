@@ -118,6 +118,9 @@ class Sampler:
 
         # 全 greedy 是性能基准和确定性推理的常见路径，直接 argmax。
         if all(float(r.sampling_params.temperature) <= 0.0 for r in requests):
+            if N == 1:
+                # 单请求快路径：跳过 stack，减少一次全词表拷贝与同步开销。
+                return {requests[0].request_id: int(torch.argmax(per_request_logits[0]))}
             tokens = torch.argmax(logits, dim=-1).tolist()
             return {requests[i].request_id: int(tokens[i]) for i in range(N)}
 
