@@ -19,6 +19,7 @@ Key semantics preserved from the official implementation:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 import torch
@@ -37,6 +38,20 @@ from miniservellm.runtime.model_interface import (
     PrefillModelOutput,
 )
 from miniservellm.scheduler.request import Request
+
+
+@dataclass
+class _DenseKVEntry:
+    """Amortized-growth contiguous KV mirror for one layer/request.
+
+    ``torch.cat`` on every decode token copies the complete history and makes
+    incremental generation O(T^2).  Keep a geometrically growing buffer and
+    expose only the populated prefix to attention instead.
+    """
+
+    k: torch.Tensor
+    v: torch.Tensor
+    length: int
 
 
 class Gemma4EngineModelRunner(Gemma4EagerTextRunner):
@@ -60,11 +75,69 @@ class Gemma4EngineModelRunner(Gemma4EagerTextRunner):
         # tensors (same zero-copy pattern as the direct runner) while the
         # paged pages stay the durable/accounting storage. Mirror size is
         # ~18KB/token/request — negligible. Cleared on request finish.
-        self._dense: dict[str, dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
+        self._dense: dict[str, dict[int, _DenseKVEntry]] = {}
         engine_config  # pages remain authoritative for capacity accounting
 
     def _dense_for(self, request_id: str) -> dict:
         return self._dense.setdefault(request_id, {})
+
+    @staticmethod
+    def _next_capacity(required: int, current: int = 0) -> int:
+        capacity = max(128, current)
+        while capacity < required:
+            capacity *= 2
+        return capacity
+
+    def _dense_append(
+        self,
+        dense: dict[int, _DenseKVEntry],
+        layer_idx: int,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Append K/V with geometric growth and return the populated prefix."""
+        entry = dense.get(layer_idx)
+        required = (entry.length if entry is not None else 0) + k.shape[0]
+        if entry is None:
+            capacity = self._next_capacity(required)
+            k_buffer = torch.empty(
+                (capacity, *k.shape[1:]), device=k.device, dtype=k.dtype
+            )
+            v_buffer = torch.empty(
+                (capacity, *v.shape[1:]), device=v.device, dtype=v.dtype
+            )
+            length = 0
+        elif required > entry.k.shape[0]:
+            capacity = self._next_capacity(required, entry.k.shape[0])
+            k_buffer = torch.empty(
+                (capacity, *entry.k.shape[1:]),
+                device=entry.k.device,
+                dtype=entry.k.dtype,
+            )
+            v_buffer = torch.empty(
+                (capacity, *entry.v.shape[1:]),
+                device=entry.v.device,
+                dtype=entry.v.dtype,
+            )
+            k_buffer[: entry.length].copy_(entry.k[: entry.length])
+            v_buffer[: entry.length].copy_(entry.v[: entry.length])
+            length = entry.length
+        else:
+            k_buffer = entry.k
+            v_buffer = entry.v
+            length = entry.length
+
+        k_buffer[length:required].copy_(k)
+        v_buffer[length:required].copy_(v)
+        dense[layer_idx] = _DenseKVEntry(k=k_buffer, v=v_buffer, length=required)
+        return k_buffer[:required], v_buffer[:required]
+
+    @staticmethod
+    def _dense_get(
+        dense: dict[int, _DenseKVEntry], layer_idx: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        entry = dense[layer_idx]
+        return entry.k[: entry.length], entry.v[: entry.length]
 
     def drop_dense(self, request_id: str) -> None:
         self._dense.pop(request_id, None)
@@ -155,7 +228,7 @@ class Gemma4EngineModelRunner(Gemma4EagerTextRunner):
             if source is not None:
                 # Shared layer: K/V come from the source layer's mirror. The
                 # source layer (< this index) already stored the current chunk.
-                k, v = dense[source]
+                k, v = self._dense_get(dense, source)
             else:
                 k = (h @ lw.k_proj.t()).view(len(chunk_ids), spec.num_key_value_heads, head_dim)
                 k = _rms_norm(k, lw.k_norm, self.eps)
@@ -165,15 +238,7 @@ class Gemma4EngineModelRunner(Gemma4EagerTextRunner):
                 self.kv_cache_manager.write_kv_for_tokens(
                     spec.layer_idx, meta.write_slots, k, v
                 )
-                prev = dense.get(spec.layer_idx)
-                if prev is None:
-                    dense[spec.layer_idx] = (k, v)
-                else:
-                    dense[spec.layer_idx] = (
-                        torch.cat([prev[0], k], dim=0),
-                        torch.cat([prev[1], v], dim=0),
-                    )
-                k, v = dense[spec.layer_idx]
+                k, v = self._dense_append(dense, spec.layer_idx, k, v)
             # NOTE: no window slicing here — prefill attention uses the full
             # gathered K/V with the sliding mask built over absolute
             # positions (_prefill_mask). Slicing would misalign K with the
@@ -249,7 +314,7 @@ class Gemma4EngineModelRunner(Gemma4EagerTextRunner):
 
             source = self.kv_source.get(spec.layer_idx)
             if source is not None:
-                k, v = dense[source]
+                k, v = self._dense_get(dense, source)
             else:
                 k = (h @ lw.k_proj.t()).view(1, spec.num_key_value_heads, head_dim)
                 k = _rms_norm(k, lw.k_norm, self.eps)
@@ -259,15 +324,7 @@ class Gemma4EngineModelRunner(Gemma4EagerTextRunner):
                 self.kv_cache_manager.write_kv_for_tokens(
                     spec.layer_idx, [meta.write_slot], k, v
                 )
-                prev = dense.get(spec.layer_idx)
-                if prev is None:
-                    dense[spec.layer_idx] = (k, v)
-                else:
-                    dense[spec.layer_idx] = (
-                        torch.cat([prev[0], k], dim=0),
-                        torch.cat([prev[1], v], dim=0),
-                    )
-                k, v = dense[spec.layer_idx]
+                k, v = self._dense_append(dense, spec.layer_idx, k, v)
             k, v = self._window_slice(spec, k, v)
 
             scores = torch.matmul(

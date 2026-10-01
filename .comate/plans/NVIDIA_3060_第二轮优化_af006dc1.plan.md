@@ -14,7 +14,7 @@
 ✅ KV 加载向量化 (float4)
 ✅ KV sequence 分区 (batch=1 SM 利用率 50% → 100%)
 ✅ 动态 VRAM 适配
-✅ INT4 量化 (runtime group quantization, fallback dequantize+matmul)
+✅ INT4 量化 (runtime group quantization, fallback dequantize+matmul, 未含 AWQ)
 
 ---
 
@@ -61,46 +61,98 @@ class CudaGraphRunner:
 
 ---
 
-### D1: INT4 Fused Dequantize+Matmul Kernel
+### D1: INT4 Fused Dequantize+Matmul Kernel（含 AWQ）
 
-**问题**: 当前 P6 的 INT4 路径 fallback 到 `dequantize(w_q, scales) → F.linear(x, w_fp16)`，先反量化出完整 FP16 权重再 matmul，没有减少 HBM 流量。权重仍以 INT8 存储（1 byte/weight），但反量化后临时 FP16 矩阵仍占 2 bytes/weight。
+**问题**: 当前 P6 的 INT4 路径 fallback 到 `dequantize(w_q, scales) → F.linear(x, w_fp16)`，没有减少 HBM 流量。且量化算法是简单的 max-abs group quantization，未利用激活统计量，量化精度不如 AWQ。
 
-**方案**: 写自定义 CUDA kernel，直接从 INT4 packed 权重读取，on-the-fly 反量化并做 matmul，避免中间 FP16 权重物化。
+**方案**: 分两步实现：
 
-**kernel 设计**:
+**D1a: AWQ 校准（Python 侧）**
 
-```cpp
-// 每个 thread block 处理 [out_tile, in_tile] 的 GEMM tile
-// 权重以 int4 packed 存储 (2 weights per byte)
-// 输入 x: [batch, in_features] fp16
-// 权重 w_packed: [out_features // 2, in_features] uint8 (每字节 2 个 int4)
-// scales: [out_features, in_features // group_size] fp16
-//
-// kernel 内部:
-//   1. 从 w_packed 读取 1 byte → 解包 2 个 int4
-//   2. 查 scales 表反量化: w_fp16 = int4_val * scale[group_idx]
-//   3. 累加 x * w_fp16 到输出
-//
-// HBM 流量: uint8 (1 byte/weight) vs FP16 (2 bytes/weight) → 2x 减少
-// 如果用真 INT4 packed (4 bit): 4x 减少
+```python
+# 1. 跑一小批校准数据（16-32 个 prompt），收集每层输入激活
+# 2. 计算 per-channel activation magnitude
+# 3. 找 salient channels (top-k by activation magnitude)
+# 4. 计算 per-channel AWQ scale: s_c = max(|w_c|) * (activation_magnitude_c) ^ alpha
+#    alpha=0.5 是经验最优值
+# 5. 应用 scale: w_scaled = w / s_c, x_input = x * s_c（推理时通过 pre-scale 激活实现）
 ```
 
-**替代方案**: 使用 CUTLASS 的 INT4 GEMM，或 PyTorch 2.4+ 的 `torch._weight_int4pack_mm`（如果格式匹配）。
+**AWQ 核心公式**：
 
-**预期收益**: 量化场景下权重带宽 4x 减少，decode 吞吐 ~2x 提升
+```
+给定 layer input activation 统计量 a ∈ R^in_features (校准集平均 L2 norm):
 
-**涉及文件**: `mini-llm-kernels/csrc/int4_matmul.cu` (新增), `nn_ops.py`
+salient_mask[c] = a[c] > percentile(a, 95%)              # 前 5% 通道为 salient
+s[c] = mean(|w[:,c]|)^α × (a[c] / mean(a))^β              # AWQ scale, α=1, β=0.5
+w'[:,c] = w[:,c] / s[c]                                    # 放大重要通道权重
+x'[:,c] = x[:,c] * s[c]                                     # 对应缩小激活（推理时）
+
+量化: scale_group = max(|w'_group|) / 7                   # 在 scaled 权重上做 group quantization
+量化为: (w_q, group_scales, awq_scales)                    # awq_scales 用于推理时 pre-scale 激活
+```
+
+**D1b: Fused INT4 Matmul Kernel（CUDA 侧）**
+
+warp-level dot product + on-the-fly dequantize，支持 batch=1-4 decode 场景。
+
+```cpp
+// grid:  [B, ceil(N_out / 32)]
+// block: 128 threads (4 warps)
+//
+// 每个 block 处理 N_TILE=32 个输出维度的内积
+//
+// 内层循环:
+//   for k_tile in range(0, K, K_TILE):
+//       1. float4 加载 INT4 packed 权重 [32, K_TILE/8] 到 shared memory
+//       2. __syncthreads
+//       3. 解包 int4_val = (byte >> (bit_offset)) & 0xF → 偏移到 [-8,7]
+//       4. 反量化 w_fp16 = int4_val * group_scale[group_idx]
+//       5. 加载激活 x[k_tile:k_tile+K_TILE] 到寄存器
+//       6. dot product (32 threads × 32 outputs, 每个 thread 负责 1 个输出)
+//       7. warp_reduce_sum 归约，累加到 fp32 accumulator
+//   写出: y[batch, out_start:out_start+32] = cast_fp16(accumulator)
+```
+
+**线程布局**:
+
+```
+Block: 128 threads = 4 warps (32 × 4)
+  Warp 0: 处理 output[0:32] vs 所有 K（每个 lane 1 个输出）
+  Warp 1-3: 同上，各处理 32 个输出（每个 block 共处理 128 个输出）
+  K 维度按 K_TILE=64 分块迭代
+
+Shared memory:
+  [0..2047]: 权重 tile [128, 64/8] uint8 = 8KB（解包后变为 16KB fp16，不物化）
+  total: 8KB < 48KB OK
+```
+
+**AWQ 推理时的额外操作**:
+
+```python
+# AWQ 量化后的 linear 调用:
+def _awq_int4_linear(x, weight_packed, group_scales, awq_scales, bias):
+    # Step 1: pre-scale 激活（AWQ 特有，开销 < 0.01ms）
+    x_scaled = x * awq_scales  # [B, in_features]
+    # Step 2: fused INT4 matmul（D1 kernel）
+    y = int4_dequant_matmul(x_scaled, weight_packed, group_scales)
+    return y + bias if bias is not None else y
+```
+
+**预期收益**: 量化场景下权重带宽 4x 减少（真 INT4 packed → 4 bit/weight），AWQ 精度损失从 ~12% 降到 ~3-5%，decode 吞吐 ~2x 提升。结合 P6 已有量化基础设施，D1 是 kernel 层替换。
+
+**涉及文件**: `mini-llm-kernels/csrc/int4_matmul.cu` (新增), `miniservellm/quantization/awq.py` (新增), `nn_ops.py`
 
 ---
 
-### B1: Paged Prefill Attention Kernel
+### B1: Paged Prefill Attention Kernel（已接入 block-aware 路径）
 
 **问题**: 当前 prefill 路径 `batched_causal_attention_prefill` 先用 advanced indexing 把 paged KV gather 到 padded tensor `[N, max_kv_len, H_kv, D]`，再做标准 attention。gather 操作：
 1. 额外 HBM 分配（max_kv_len 可能远大于实际 context）
 2. 额外 KV 拷贝（N × max_kv_len × H_kv × D × 2 bytes）
 3. padding 浪费计算
 
-**方案**: 写 paged prefill attention kernel，类似 decode kernel 但支持 Q length > 1 + causal mask，直接按 block_table 跳读 KV。
+**方案**: 已在 `/Users/gengzhiqiang/User_Program/mini-llm-kernels` 实现 `paged_prefill_attention` CUDA kernel，支持 Q length > 1 + causal mask，按 `block_table` 跳读 KV，并用 online softmax 避免完整 padded KV 物化。主仓库通过同名 Python binding 调用，未编译 CUDA 扩展时使用等价 PyTorch fallback。
 
 **kernel 设计**:
 
@@ -118,7 +170,7 @@ class CudaGraphRunner:
 - 消除 padding 浪费（实际 context vs max_kv_len 的差异）
 - prefill 阶段 30-50% 加速
 
-**涉及文件**: `mini-llm-kernels/csrc/prefill_attention.cu` (新增), `nn_ops.py`
+**涉及文件**: `miniservellm/runtime/nn_ops.py`, `miniservellm/runtime/model_runner.py`, `miniservellm/cache/kv_cache.py`（复用 block table 接口）；`/Users/gengzhiqiang/User_Program/mini-llm-kernels/csrc/prefill_attention.cu`, `csrc/bindings.cpp`, `setup.py`, `mini_llm_kernels/kernels/prefill_attention.py`
 
 ---
 
@@ -184,23 +236,25 @@ class CudaGraphRunner:
 ## 优先级与实施顺序
 
 ```
-C1 (CUDA Graphs)        ★★★  10-30%     中等   先做，独立性强
-D1 (INT4 GEMM kernel)   ★★★  量化2x     高     量化场景核心
-B1 (Paged Prefill)      ★★   prefill 30%+ 中等   prefill 瓶颈时做
+C1 (CUDA Graphs)        ★★★  10-30%     中等   已完成
+D1 (INT4 GEMM + AWQ)    ★★★  量化 2x    高     量化场景核心（分 D1a AWQ 校准 + D1b fused kernel）
+B1 (Paged Prefill)      ★★   prefill 30%+ 中等   已接入 block-aware eager 路径，CUDA binding 可替换
 A1 (Speculative)        ★★   greedy 2-3x 高     算法层，独立
 B2 (QKV+RoPE 融合)      ★    5-10%      中等   锦上添花
 ```
 
-建议顺序: **C1 → D1 → B1 → A1 → B2**
+建议顺序: **C1（已完成）→ D1 → B1 → A1 → B2**
 
 ## 涉及文件总览
 
 | 文件 | 改动项 |
 |------|--------|
 | `miniservellm/runtime/model_runner.py` | C1: CudaGraphRunner, A1: speculative decode |
+| `miniservellm/runtime/cuda_graph_runner.py` | C1: 新增 |
 | `miniservellm/runtime/inference_engine.py` | C1: graph replay 调度, A1: draft/verify 循环 |
-| `miniservellm/runtime/nn_ops.py` | D1: int4_matmul 调用, B1: paged prefill 调用, B2: qkv_rope_fused 调用 |
-| `mini-llm-kernels/csrc/int4_matmul.cu` | D1: 新增 |
+| `miniservellm/runtime/nn_ops.py` | D1: int4_matmul + awq 调用, B1: block-aware paged prefill + CUDA binding hook, B2: qkv_rope_fused |
+| `miniservellm/quantization/awq.py` | D1a: AWQ 校准模块（新增） |
+| `mini-llm-kernels/csrc/int4_matmul.cu` | D1b: fused INT4 dequant+matmul kernel（新增） |
 | `mini-llm-kernels/csrc/prefill_attention.cu` | B1: 新增 |
 | `mini-llm-kernels/csrc/qkv_rope_fused.cu` | B2: 新增 |
 | `mini-llm-kernels/setup.py` | 注册新 kernel |

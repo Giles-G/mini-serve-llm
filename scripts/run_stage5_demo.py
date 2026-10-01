@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -54,8 +55,14 @@ def run_gemma4_eager(
 
     if device == "auto":
         device = "mps" if torch.backends.mps.is_available() else "cpu"
-    # bf16 matches the checkpoint natively; fp32 doubles memory for parity runs.
-    torch_dtype = torch.bfloat16 if dtype in {"auto", "fp16", "bf16"} else torch.float32
+    # Keep the CLI dtype truthful: fp16 must not silently become bf16.
+    # ``auto`` retains the checkpoint-native bf16 path for parity runs.
+    if dtype == "fp16":
+        torch_dtype = torch.float16
+    elif dtype in {"auto", "bf16"}:
+        torch_dtype = torch.bfloat16
+    else:
+        torch_dtype = torch.float32
 
     started = time.perf_counter()
     model_config = convert_gemma4_config(load_gemma4_config(model_path))
@@ -63,7 +70,7 @@ def run_gemma4_eager(
 
     engine_config = EngineConfig.create(
         device=device,
-        dtype="bf16" if torch_dtype == torch.bfloat16 else "fp32",
+        dtype={torch.float16: "fp16", torch.bfloat16: "bf16", torch.float32: "fp32"}[torch_dtype],
         block_size=128,
         # Physical paged blocks: 128 blocks x 128 tokens = 16k token capacity,
         # ~300MB bf16 across the D=256/D=512 cache groups.
@@ -85,7 +92,27 @@ def run_gemma4_eager(
 
     kv_cache_manager = Gemma4PagedKVCacheManager(engine_config, model_config)
     model_runner = Gemma4EngineModelRunner(engine_config, model_config, weights, kv_cache_manager)
-    tokenizer = AutoTokenizer.from_pretrained(str(model_path), local_files_only=True)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(str(model_path), local_files_only=True)
+    except (AttributeError, TypeError, ValueError, OSError):
+        # Some released Gemma4 checkpoints contain a tokenizer.json that is
+        # usable by tokenizers but whose tokenizer_config is not understood by
+        # the installed Transformers version.  Keep the inference path usable
+        # without changing the checkpoint in place.
+        from tokenizers import Tokenizer
+
+        backend = Tokenizer.from_file(str(model_path / "tokenizer.json"))
+        eos_token_id = backend.token_to_id("<eos>")
+
+        class _TokenizerFallback:
+            def encode(self, text, add_special_tokens=False):
+                return backend.encode(text, add_special_tokens=add_special_tokens).ids
+
+            def decode(self, ids, **kwargs):
+                return backend.decode(list(ids), skip_special_tokens=kwargs.get("skip_special_tokens", True))
+
+        tokenizer = _TokenizerFallback()
+        tokenizer.eos_token_id = eos_token_id
     engine = Stage5Engine(
         engine_config=engine_config,
         model_config=model_config,
@@ -138,7 +165,6 @@ def main():
     args = parser.parse_args()
     model_name = args.model
 
-    from transformers import AutoConfig
     model_path = Path(model_name).expanduser()
     is_local_path = model_path.exists()
     if model_path.is_absolute() and not is_local_path:
@@ -146,15 +172,23 @@ def main():
             f"Local model path does not exist: {model_path}\n"
             "Download the checkpoint first or pass a valid Hugging Face repo id."
         )
-    local_files_only = not args.allow_download
-    hf_config = AutoConfig.from_pretrained(
-        str(model_path) if is_local_path else model_name,
-        trust_remote_code=False,
-        local_files_only=local_files_only,
-    )
-    adapter = create_model_adapter(hf_config)
+    # Gemma4 is newer than some installed Transformers releases.  Read the
+    # local config directly so the project runner does not depend on AutoConfig
+    # knowing this architecture just to select the already-supported path.
+    if is_local_path:
+        with (model_path / "config.json").open("r", encoding="utf-8") as handle:
+            raw_config = json.load(handle)
+        model_type = str(raw_config.get("model_type", "")).lower()
+    else:
+        from transformers import AutoConfig
 
-    model_type = str(getattr(hf_config, "model_type", "")).lower()
+        hf_config = AutoConfig.from_pretrained(
+            model_name,
+            trust_remote_code=False,
+            local_files_only=not args.allow_download,
+        )
+        model_type = str(getattr(hf_config, "model_type", "")).lower()
+
     if model_type in {"gemma4", "gemma4_text"}:
         run_gemma4_eager(
             model_name=model_name,
@@ -164,6 +198,16 @@ def main():
             max_new_tokens=args.max_new_tokens,
         )
         return
+
+    from transformers import AutoConfig
+
+    if is_local_path:
+        hf_config = AutoConfig.from_pretrained(
+            str(model_path),
+            trust_remote_code=False,
+            local_files_only=not args.allow_download,
+        )
+    adapter = create_model_adapter(hf_config)
 
     tokenizer, hf_config, model_config, hf_model, weights_cpu = load_model_bundle(
         adapter=adapter,

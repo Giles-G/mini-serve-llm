@@ -62,10 +62,17 @@ class Int4Weight:
       lookups touch T rows per step instead of the whole table).
     """
 
-    def __init__(self, packed: torch.Tensor, scales: torch.Tensor, group_size: int):
+    def __init__(
+        self,
+        packed: torch.Tensor,
+        scales: torch.Tensor,
+        group_size: int,
+        compute_dtype: torch.dtype = torch.bfloat16,
+    ):
         self.packed = packed
         self.scales = scales
         self.group_size = group_size
+        self.compute_dtype = compute_dtype
 
     # -- tensor-ish surface -------------------------------------------------
     def t(self) -> _Int4MatmulProxy:
@@ -77,7 +84,7 @@ class Int4Weight:
     @property
     def dtype(self) -> torch.dtype:
         # Compute dtype of the dequantized representation.
-        return torch.bfloat16
+        return self.compute_dtype
 
     @property
     def device(self) -> torch.device:
@@ -88,18 +95,18 @@ class Int4Weight:
 
     # -- kernels -------------------------------------------------------------
     def _unpack_rows(self, rows: torch.Tensor) -> torch.Tensor:
-        """Dequantize the given packed rows to bf16 [T, K]."""
+        """Dequantize the given packed rows to the configured compute dtype."""
         packed = self.packed.index_select(0, rows)
         low = (packed.to(torch.int16) & 0x0F).to(torch.int16) - 8
         high = (packed.to(torch.int16) >> 4).to(torch.int16) - 8
         w_q = torch.empty(
-            (packed.shape[0] * 2, packed.shape[1]), dtype=torch.bfloat16, device=packed.device
+            (packed.shape[0] * 2, packed.shape[1]), dtype=self.compute_dtype, device=packed.device
         )
         w_q[0::2] = low
         w_q[1::2] = high
         n_groups = self.scales.shape[1]
         w = w_q.view(packed.shape[0] * 2, n_groups, self.group_size)
-        w = w * self.scales.to(torch.bfloat16).unsqueeze(-1)
+        w = w * self.scales.to(self.compute_dtype).unsqueeze(-1)
         return w.view(packed.shape[0] * 2, -1)
 
     def dequant_rows(self, ids: torch.Tensor) -> torch.Tensor:
@@ -110,22 +117,22 @@ class Int4Weight:
         low = (packed.to(torch.int16) & 0x0F).to(torch.int16) - 8
         high = (packed.to(torch.int16) >> 4).to(torch.int16) - 8
         is_odd = (ids & 1).to(torch.bool).unsqueeze(-1)
-        w_q = torch.where(is_odd, high, low).to(torch.bfloat16)  # [T, K]
+        w_q = torch.where(is_odd, high, low).to(self.compute_dtype)  # [T, K]
         n_groups = self.scales.shape[1]
-        s = self.scales.to(torch.bfloat16).index_select(0, ids)  # [T, n_groups]
+        s = self.scales.to(self.compute_dtype).index_select(0, ids)  # [T, n_groups]
         w = w_q.view(ids.numel(), n_groups, self.group_size) * s.unsqueeze(-1)
         return w.view(ids.numel(), -1)
 
     def dequant_dense(self) -> torch.Tensor:
-        """Dequantize the full matrix to bf16 [N, K]."""
+        """Dequantize the full matrix to the configured compute dtype."""
         n2, k = self.packed.shape
         low = (self.packed.to(torch.int16) & 0x0F).to(torch.int16) - 8
         high = (self.packed.to(torch.int16) >> 4).to(torch.int16) - 8
-        w_q = torch.empty((n2 * 2, k), dtype=torch.bfloat16, device=self.packed.device)
+        w_q = torch.empty((n2 * 2, k), dtype=self.compute_dtype, device=self.packed.device)
         w_q[0::2] = low
         w_q[1::2] = high
         n_groups = self.scales.shape[1]
-        w = w_q.view(n2 * 2, n_groups, self.group_size) * self.scales.to(torch.bfloat16).unsqueeze(-1)
+        w = w_q.view(n2 * 2, n_groups, self.group_size) * self.scales.to(self.compute_dtype).unsqueeze(-1)
         return w.view(n2 * 2, k)
 
     def matmul(self, x: torch.Tensor) -> torch.Tensor:
@@ -184,11 +191,18 @@ def _pack_int4(w_q: torch.Tensor) -> torch.Tensor:
     return w_unsigned[0::2] | (w_unsigned[1::2] << 4)
 
 
-def _quantize_tensor(weight: torch.Tensor, group_size: int, device: torch.device) -> Int4Weight:
+def _quantize_tensor(
+    weight: torch.Tensor,
+    group_size: int,
+    device: torch.device,
+    compute_dtype: torch.dtype = torch.bfloat16,
+) -> Int4Weight:
     """Quantize one [out, in] tensor and move the packed result to device."""
     w_q, scales = quantize_weight_group(weight.float(), bits=4, group_size=group_size)
     packed = _pack_int4(w_q).to(device)
-    return Int4Weight(packed, scales.to(device=device, dtype=torch.float16), group_size)
+    return Int4Weight(
+        packed, scales.to(device=device, dtype=torch.float16), group_size, compute_dtype
+    )
 
 
 def quantize_gemma4_weights(
@@ -214,7 +228,7 @@ def quantize_gemma4_weights(
 
     def quant(name: str) -> QuantWeight:
         tensor = read(name)
-        result = _quantize_tensor(tensor, group_size, device)
+        result = _quantize_tensor(tensor, group_size, device, compute_dtype)
         del tensor
         return result
 
