@@ -151,6 +151,31 @@ class Gemma4PagedKVCacheManager:
         self._k_cache[key][local_layer, block_ids, offsets] = k_values
         self._v_cache[key][local_layer, block_ids, offsets] = v_values
 
+    def layer_cache(
+        self, layer_idx: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return one layer's physical KV pools as contiguous 4D tensors.
+
+        The CUDA kernels consume ``[blocks, block_size, kv_heads, head_dim]``.
+        Gemma4 stores an extra group-local layer dimension so layers with the
+        same KV shape can share block accounting without sharing contents.
+        Selecting one layer removes that dimension without copying.
+        """
+        key, local_layer = self._layer_group[layer_idx]
+        return (
+            self._k_cache[key][local_layer],
+            self._v_cache[key][local_layer],
+        )
+
+    def block_table_tensor(self, req: Request) -> torch.Tensor:
+        """Return a CUDA-friendly int32 block table for one request."""
+        table = self.req_block_tables.get(req.request_id, req.block_table)
+        return torch.tensor(
+            table,
+            device=self.engine_config.device,
+            dtype=torch.int32,
+        )
+
     def gather_kv_for_request(
         self,
         layer_idx: int,

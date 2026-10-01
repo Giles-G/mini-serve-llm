@@ -32,6 +32,7 @@ from miniservellm.runtime.gemma4_runner import (
     Gemma4EagerTextRunner,
     _rms_norm,
 )
+from miniservellm.runtime.nn_ops import gemma4_decode_attention
 from miniservellm.runtime.metadata import DecodeRequestMetadata, PrefillRequestMetadata
 from miniservellm.runtime.model_interface import (
     DecodeModelOutput,
@@ -327,11 +328,37 @@ class Gemma4EngineModelRunner(Gemma4EagerTextRunner):
                 k, v = self._dense_append(dense, spec.layer_idx, k, v)
             k, v = self._window_slice(spec, k, v)
 
-            scores = torch.matmul(
-                q.transpose(0, 1), k.transpose(0, 1).transpose(-1, -2)
+            # The Gemma4-specific CUDA kernel handles D=256/512 and applies
+            # sliding-window visibility without materializing dense K/V. The
+            # eager path remains the reference fallback on MPS/CPU.
+            use_cuda_attention = (
+                self.device.type == "cuda"
+                and q.shape[-1] in (256, 512)
+                and self.kv_cache_manager.engine_config.device.type == "cuda"
             )
-            probs = torch.softmax(scores.float(), dim=-1).to(v.dtype)
-            attn = torch.matmul(probs, v.transpose(0, 1))
+            if use_cuda_attention:
+                cache_layer = source if source is not None else spec.layer_idx
+                k_cache, v_cache = self.kv_cache_manager.layer_cache(cache_layer)
+                block_table = self.kv_cache_manager.block_table_tensor(req)
+                context_lens = torch.tensor(
+                    [ctx_len],
+                    device=self.device,
+                    dtype=torch.int32,
+                )
+                attn = gemma4_decode_attention(
+                    q,
+                    k_cache,
+                    v_cache,
+                    block_table.view(1, -1),
+                    context_lens,
+                    self.window if spec.attention_type == SLIDING else 0,
+                )
+            else:
+                scores = torch.matmul(
+                    q.transpose(0, 1), k.transpose(0, 1).transpose(-1, -2)
+                )
+                probs = torch.softmax(scores.float(), dim=-1).to(v.dtype)
+                attn = torch.matmul(probs, v.transpose(0, 1))
             h = attn.transpose(0, 1).reshape(1, num_q * head_dim) @ lw.o_proj.t()
 
             h = _rms_norm(h, lw.post_attention_layernorm, self.eps)

@@ -99,7 +99,7 @@ def decode_paged_attention(
     Returns:
         out: [N, H_q, D]
     """
-    if torch.cuda.is_current_stream_capturing():
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
         return _decode_paged_attention_fallback(
             q, k_cache, v_cache, block_table, context_lens, max_ctx
         )
@@ -111,6 +111,44 @@ def decode_paged_attention(
         )
     # PyTorch fallback（等价于原 gather + gathered_paged_kv_decode_attention）
     return _decode_paged_attention_fallback(q, k_cache, v_cache, block_table, context_lens, max_ctx)
+
+
+def gemma4_decode_attention(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    context_lens: torch.Tensor,
+    window_size: int = 0,
+) -> torch.Tensor:
+    """Gemma4-specific paged decode attention for head_dim 256/512.
+
+    The optional kernels package owns the CUDA implementation because this
+    path needs Gemma4's heterogeneous head dimensions and sliding-window
+    semantics. Keeping the dispatch here lets Gemma4 runners use the same
+    runtime feature detection as the generic attention path.
+    """
+    if (
+        _HAS_CUSTOM_KERNELS
+        and _mkl is not None
+        and q.is_cuda
+        and hasattr(_mkl, "gemma4_decode_attention")
+    ):
+        return _mkl.gemma4_decode_attention(
+            q,
+            k_cache,
+            v_cache,
+            block_table,
+            context_lens,
+            window_size,
+        )
+    from mini_llm_kernels.kernels.gemma4_attention import (
+        _gemma4_decode_attention_pytorch,
+    )
+
+    return _gemma4_decode_attention_pytorch(
+        q, k_cache, v_cache, block_table, context_lens, window_size
+    )
 
 
 def _decode_paged_attention_fallback(
