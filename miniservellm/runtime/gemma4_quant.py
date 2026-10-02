@@ -29,12 +29,12 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 import torch
-from safetensors import safe_open
 
 from miniservellm.config import ModelConfig
 from miniservellm.model_adapter.adapters.gemma4_adapter import Gemma4LayerWeights
 from miniservellm.model_adapter.gemma4_config import build_gemma4_layer_specs
 from miniservellm.runtime.nn_ops import quantize_weight_group
+from miniservellm.safetensors_io import StreamingSafetensors
 from miniservellm.model_adapter.adapters.gemma4_hf_model import (
     TEXT_PREFIX,
     load_gemma4_config,
@@ -136,13 +136,19 @@ class Int4Weight:
         return w.view(n2 * 2, k)
 
     def matmul(self, x: torch.Tensor) -> torch.Tensor:
-        """y = x @ W.T via fused CUDA kernel when available, else dequant."""
-        try:
-            from mini_llm_kernels.kernels.int4_matmul import int4_dequant_matmul
+        """y = x @ W.T via the fused CUDA kernel when it is actually usable.
 
+        Only a missing/CPU-only kernel falls back to dequantize-then-matmul.
+        A ``RuntimeError`` raised *by* the kernel is a real failure (bad
+        shapes, OOM, a broken kernel) and is re-raised: silently rerouting it
+        to the reference path hides correctness bugs behind a 3-5x slower
+        fallback, which is exactly how a wrong fused kernel goes unnoticed.
+        """
+        from mini_llm_kernels.kernels.int4_matmul import _HAS_INT4_CUDA, int4_dequant_matmul
+
+        if _HAS_INT4_CUDA and x.is_cuda and self.packed.is_cuda:
             return int4_dequant_matmul(x, self.packed, self.scales)
-        except (ImportError, RuntimeError):
-            return torch.nn.functional.linear(x, self.dequant_dense())
+        return torch.nn.functional.linear(x, self.dequant_dense())
 
 
 @dataclass
@@ -196,12 +202,72 @@ def _quantize_tensor(
     group_size: int,
     device: torch.device,
     compute_dtype: torch.dtype = torch.bfloat16,
+    chunk_rows: int = 32768,
 ) -> Int4Weight:
-    """Quantize one [out, in] tensor and move the packed result to device."""
-    w_q, scales = quantize_weight_group(weight.float(), bits=4, group_size=group_size)
-    packed = _pack_int4(w_q).to(device)
+    """Quantize one [out, in] tensor and move the packed result to device.
+
+    Runs in row chunks so the fp staging copy never exceeds
+    ``chunk_rows * in_features`` elements. The largest Gemma4 tensor is the
+    262144-row embedding table; at fp32 that single tensor is >500 MB, which
+    is the difference between fitting and not fitting on a 16 GB-or-less
+    host. Chunking is numerically identical: each group lies inside one row.
+    """
+    out_features, in_features = weight.shape
+    if in_features % group_size != 0:
+        raise ValueError(
+            f"in_features ({in_features}) must be divisible by group_size ({group_size})"
+        )
+    chunk_rows = max(group_size, chunk_rows)
+
+    packed_chunks = []
+    scale_chunks = []
+    for start in range(0, out_features, chunk_rows):
+        rows = weight[start : start + chunk_rows].float()
+        w_q, scales = quantize_weight_group(rows, bits=4, group_size=group_size)
+        packed_chunks.append(_pack_int4(w_q))
+        scale_chunks.append(scales)
+        del rows, w_q
+
+    packed = torch.cat(packed_chunks, dim=0).to(device)
+    scales = torch.cat(scale_chunks, dim=0).to(device=device, dtype=torch.float16)
+    return Int4Weight(packed, scales, group_size, compute_dtype)
+
+
+def quantize_checkpoint_tensor(
+    source: StreamingSafetensors,
+    name: str,
+    device: str | torch.device = "cpu",
+    group_size: int = 64,
+    compute_dtype: torch.dtype = torch.bfloat16,
+    chunk_rows: int = 4096,
+) -> Int4Weight:
+    """Quantize one checkpoint tensor by streaming it row-chunk by row-chunk.
+
+    Needed for the PLE table (``[262144, 8960]``, 4.4 GiB in bf16): its rows
+    are read, quantized and released in slices, so neither the file nor the
+    tensor is ever materialized whole.
+    """
+    device = torch.device(device)
+    out_features, in_features = source.shape(name)
+    if in_features % group_size != 0:
+        raise ValueError(
+            f"{name}: in_features ({in_features}) must be divisible by group_size ({group_size})"
+        )
+
+    packed_chunks = []
+    scale_chunks = []
+    for start in range(0, out_features, chunk_rows):
+        rows = source.read(name, (start, min(start + chunk_rows, out_features)))
+        w_q, scales = quantize_weight_group(rows.float(), bits=4, group_size=group_size)
+        packed_chunks.append(_pack_int4(w_q).to(device))
+        scale_chunks.append(scales.to(device=device, dtype=torch.float16))
+        del rows, w_q, scales
+
     return Int4Weight(
-        packed, scales.to(device=device, dtype=torch.float16), group_size, compute_dtype
+        torch.cat(packed_chunks, dim=0),
+        torch.cat(scale_chunks, dim=0),
+        group_size,
+        compute_dtype,
     )
 
 
@@ -211,23 +277,33 @@ def quantize_gemma4_weights(
     device: str | torch.device = "cpu",
     group_size: int = 64,
     compute_dtype: torch.dtype = torch.bfloat16,
+    prequantized: Optional[dict[str, Int4Weight]] = None,
 ) -> Gemma4Int4Weights:
     """Stream-quantize the checkpoint text backbone to INT4.
 
-    Reads each tensor from safetensors individually, quantizes on CPU, moves
-    the packed result to ``device`` and frees the fp copy — peak memory stays
-    around one tensor instead of the whole model.
+    Reads each tensor from the shard individually, quantizes on CPU, moves the
+    packed result to ``device`` and frees the fp copy — peak host memory stays
+    around one chunk instead of the whole model.
+
+    ``prequantized`` supplies already-quantized tensors (keyed by their
+    checkpoint name) so callers can substitute a chunked result for the two
+    multi-gigabyte tables that cannot be held in host RAM as one tensor.
     """
     path = Path(model_dir).expanduser()
     device = torch.device(device)
     specs = build_gemma4_layer_specs(load_gemma4_config(path))
-    weights_file = safe_open(str(path / "model.safetensors"), framework="pt")
+    source = StreamingSafetensors(path / "model.safetensors")
+    supplied = prequantized or {}
 
     def read(name: str) -> torch.Tensor:
-        return weights_file.get_tensor(f"{TEXT_PREFIX}{name}").to(torch.float32)
+        key = f"{TEXT_PREFIX}{name}"
+        return source.read(key).to(compute_dtype)
 
-    def quant(name: str) -> QuantWeight:
-        tensor = read(name)
+    def quant(name: str) -> Int4Weight:
+        key = f"{TEXT_PREFIX}{name}"
+        if key in supplied:
+            return supplied[key]
+        tensor = source.read(key)
         result = _quantize_tensor(tensor, group_size, device, compute_dtype)
         del tensor
         return result

@@ -16,13 +16,13 @@ from types import SimpleNamespace
 from typing import Any
 
 import torch
-from safetensors import safe_open
 
 from miniservellm.model_adapter.adapters.gemma4_adapter import (
     Gemma4LayerWeights,
     Gemma4TextWeights,
 )
 from miniservellm.model_adapter.gemma4_config import build_gemma4_layer_specs
+from miniservellm.safetensors_io import StreamingSafetensors
 
 TEXT_PREFIX = "model.language_model."
 
@@ -38,7 +38,7 @@ def load_gemma4_config(model_dir: str | Path) -> SimpleNamespace:
 
 
 def _read(weights_file: Any, key: str, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    tensor = weights_file.get_tensor(key)
+    tensor = weights_file.read(key)
     return tensor.to(device=device, dtype=dtype)
 
 
@@ -51,11 +51,15 @@ def load_gemma4_text_weights(
 
     ``lm_head`` is tied in the E2B checkpoint, so it shares storage with
     ``embed_tokens`` instead of allocating a second full-vocab tensor.
+
+    Tensors are read by explicit byte range rather than through ``safe_open``:
+    the 10 GB shard cannot be mmapped on hosts with less free address space or
+    RAM than the file size, which is exactly the single-GPU dev box case.
     """
     path = Path(model_dir).expanduser()
     device = torch.device(device)
     specs = build_gemma4_layer_specs(load_gemma4_config(path))
-    weights_file = safe_open(str(path / "model.safetensors"), framework="pt")
+    weights_file = StreamingSafetensors(path / "model.safetensors")
 
     def read(key: str) -> torch.Tensor:
         return _read(weights_file, f"{TEXT_PREFIX}{key}", device, dtype)
