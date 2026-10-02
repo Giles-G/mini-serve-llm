@@ -32,7 +32,10 @@ from miniservellm.runtime.gemma4_runner import (
     Gemma4EagerTextRunner,
     _rms_norm,
 )
-from miniservellm.runtime.nn_ops import gemma4_decode_attention
+from miniservellm.runtime.nn_ops import (
+    gemma4_decode_attention,
+    gemma4_decode_attention_available,
+)
 from miniservellm.runtime.metadata import DecodeRequestMetadata, PrefillRequestMetadata
 from miniservellm.runtime.model_interface import (
     DecodeModelOutput,
@@ -330,11 +333,15 @@ class Gemma4EngineModelRunner(Gemma4EagerTextRunner):
 
             # The Gemma4-specific CUDA kernel handles D=256/512 and applies
             # sliding-window visibility without materializing dense K/V. The
-            # eager path remains the reference fallback on MPS/CPU.
+            # eager path remains the reference fallback on MPS/CPU, and also
+            # on CUDA while the dedicated kernel is unavailable — the paged
+            # path would otherwise only gather the same K/V back into a dense
+            # tensor at extra cost.
             use_cuda_attention = (
                 self.device.type == "cuda"
                 and q.shape[-1] in (256, 512)
                 and self.kv_cache_manager.engine_config.device.type == "cuda"
+                and gemma4_decode_attention_available()
             )
             if use_cuda_attention:
                 cache_layer = source if source is not None else spec.layer_idx

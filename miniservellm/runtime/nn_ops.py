@@ -123,10 +123,10 @@ def gemma4_decode_attention(
 ) -> torch.Tensor:
     """Gemma4-specific paged decode attention for head_dim 256/512.
 
-    The optional kernels package owns the CUDA implementation because this
-    path needs Gemma4's heterogeneous head dimensions and sliding-window
-    semantics. Keeping the dispatch here lets Gemma4 runners use the same
-    runtime feature detection as the generic attention path.
+    The kernels package owns the implementation: its CUDA path covers Gemma4's
+    heterogeneous head dimensions and sliding-window semantics, and its Python
+    entry point already falls back to an equivalent PyTorch gather when the
+    extension or the device is unavailable.
     """
     if (
         _HAS_CUSTOM_KERNELS
@@ -142,13 +142,95 @@ def gemma4_decode_attention(
             context_lens,
             window_size,
         )
-    from mini_llm_kernels.kernels.gemma4_attention import (
-        _gemma4_decode_attention_pytorch,
-    )
-
     return _gemma4_decode_attention_pytorch(
         q, k_cache, v_cache, block_table, context_lens, window_size
     )
+
+
+def gemma4_decode_attention_kernel_available() -> bool:
+    """Whether the Gemma4 decode-attention CUDA kernel is actually usable.
+
+    Delegates to the kernels package's startup correctness probe rather than
+    merely checking for an exported ``_C`` symbol: a compiled symbol that
+    produces wrong results or hangs is worse than no kernel at all. When this
+    is False, :func:`gemma4_decode_attention` falls back to gathering the
+    paged KV into a dense tensor, so callers should keep their existing dense
+    attention path instead of paying a page round-trip.
+    """
+    if not (_HAS_CUSTOM_KERNELS and _mkl is not None):
+        return False
+    probe = getattr(_mkl, "cuda_attention_usable", None)
+    if probe is None:
+        return False
+    try:
+        return bool(probe())
+    except Exception:  # noqa: BLE001 - never let a probe break inference
+        return False
+
+
+# Backwards-compatible alias.
+gemma4_decode_attention_available = gemma4_decode_attention_kernel_available
+
+
+def _gemma4_decode_attention_pytorch(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    context_lens: torch.Tensor,
+    window_size: int = 0,
+) -> torch.Tensor:
+    """Reference paged decode attention for Gemma4 (head_dim 256/512).
+
+    Rows are independent: each reads exactly ``context_lens[row]`` tokens
+    through its own ``block_table`` row. ``window_size`` keeps only the most
+    recent window, which is equivalent to masking for a single decode query.
+    Computes in fp32 and casts back, mirroring the eager reference path.
+
+    Args:
+        q:            [N, H_q, D]
+        k_cache:      [num_blocks, block_size, H_kv, D]
+        v_cache:      [num_blocks, block_size, H_kv, D]
+        block_table:  [N, max_blocks] per-request physical block ids
+        context_lens: [N] number of valid tokens per request
+        window_size:  sliding window length, 0 disables windowing
+
+    Returns:
+        out: [N, H_q, D]
+    """
+    num_rows, num_q_heads, _ = q.shape
+    kv_heads = k_cache.shape[-2]
+    block_size = k_cache.shape[1]
+    outputs = []
+
+    for row in range(num_rows):
+        length = int(context_lens[row].item())
+        if length <= 0:
+            outputs.append(torch.zeros_like(q[row]))
+            continue
+
+        start = max(0, length - window_size) if window_size else 0
+        positions = torch.arange(start, length, device=q.device, dtype=torch.long)
+        block_ids = block_table[row][positions // block_size]
+        offsets = positions % block_size
+
+        k = k_cache[block_ids, offsets]  # [T, H_kv, D]
+        v = v_cache[block_ids, offsets]
+        if num_q_heads != kv_heads:
+            repeat = num_q_heads // kv_heads
+            k = k.repeat_interleave(repeat, dim=1)
+            v = v.repeat_interleave(repeat, dim=1)
+
+        # [T, H, D] -> [H, T, D]: move the head axis first, matching the
+        # generic paged path (transposing would swap head and feature axes
+        # whenever the head count differs from the head dim).
+        k = k.transpose(0, 1)
+        v = v.transpose(0, 1)
+        scores = torch.matmul(q[row].unsqueeze(1), k.transpose(-1, -2)).float()
+        probs = torch.softmax(scores, dim=-1).to(v.dtype)
+        outputs.append(torch.matmul(probs, v).squeeze(1))
+
+    return torch.stack(outputs, dim=0)
 
 
 def _decode_paged_attention_fallback(

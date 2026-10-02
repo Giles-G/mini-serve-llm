@@ -71,9 +71,11 @@ def _make_case(
     scales = (0.002 + 0.03 * torch.rand(
         (n, k // group_size), generator=generator, dtype=torch.float32
     )).to(device=device, dtype=torch.float16)
+    # The generator is CPU-seeded for reproducibility, so sample on CPU and
+    # move afterwards; torch.randn rejects a CPU generator on a CUDA device.
     x = torch.randn(
-        (tokens, k), generator=generator, device=device, dtype=dtype
-    )
+        (tokens, k), generator=generator, dtype=dtype
+    ).to(device)
     return name, x, packed, scales
 
 
