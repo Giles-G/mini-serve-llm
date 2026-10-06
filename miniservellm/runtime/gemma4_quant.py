@@ -144,7 +144,13 @@ class Int4Weight:
         to the reference path hides correctness bugs behind a 3-5x slower
         fallback, which is exactly how a wrong fused kernel goes unnoticed.
         """
-        from mini_llm_kernels.kernels.int4_matmul import _HAS_INT4_CUDA, int4_dequant_matmul
+        try:
+            from mini_llm_kernels.kernels.int4_matmul import (
+                _HAS_INT4_CUDA,
+                int4_dequant_matmul,
+            )
+        except ImportError:
+            _HAS_INT4_CUDA = False
 
         if _HAS_INT4_CUDA and x.is_cuda and self.packed.is_cuda:
             return int4_dequant_matmul(x, self.packed, self.scales)
@@ -254,21 +260,25 @@ def quantize_checkpoint_tensor(
             f"{name}: in_features ({in_features}) must be divisible by group_size ({group_size})"
         )
 
-    packed_chunks = []
-    scale_chunks = []
+    packed = torch.empty(
+        (out_features // 2, in_features),
+        dtype=torch.uint8,
+        device=device,
+    )
+    scale_buffer = torch.empty(
+        (out_features, in_features // group_size),
+        dtype=torch.float16,
+        device=device,
+    )
     for start in range(0, out_features, chunk_rows):
         rows = source.read(name, (start, min(start + chunk_rows, out_features)))
-        w_q, scales = quantize_weight_group(rows.float(), bits=4, group_size=group_size)
-        packed_chunks.append(_pack_int4(w_q).to(device))
-        scale_chunks.append(scales.to(device=device, dtype=torch.float16))
-        del rows, w_q, scales
+        w_q, row_scales = quantize_weight_group(rows.float(), bits=4, group_size=group_size)
+        end = start + rows.shape[0]
+        packed[start // 2 : end // 2].copy_(_pack_int4(w_q).to(device))
+        scale_buffer[start:end].copy_(row_scales.to(device=device, dtype=torch.float16))
+        del rows, w_q, row_scales
 
-    return Int4Weight(
-        torch.cat(packed_chunks, dim=0),
-        torch.cat(scale_chunks, dim=0),
-        group_size,
-        compute_dtype,
-    )
+    return Int4Weight(packed, scale_buffer, group_size, compute_dtype)
 
 
 def quantize_gemma4_weights(
@@ -303,6 +313,15 @@ def quantize_gemma4_weights(
         key = f"{TEXT_PREFIX}{name}"
         if key in supplied:
             return supplied[key]
+        shape = source.shape(key)
+        if len(shape) == 2 and shape[0] >= 65536:
+            return quantize_checkpoint_tensor(
+                source,
+                key,
+                device=device,
+                group_size=group_size,
+                compute_dtype=compute_dtype,
+            )
         tensor = source.read(key)
         result = _quantize_tensor(tensor, group_size, device, compute_dtype)
         del tensor

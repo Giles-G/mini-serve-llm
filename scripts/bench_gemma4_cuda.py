@@ -134,17 +134,35 @@ def _synthetic_cases(args, device: torch.device) -> Iterable[tuple]:
 def _real_cases(args, device: torch.device) -> Iterable[tuple]:
     from miniservellm.model_adapter.adapters.gemma4_hf_model import load_gemma4_config
     from miniservellm.model_adapter.gemma4_config import convert_gemma4_config
-    from miniservellm.runtime.gemma4_quant import quantize_gemma4_weights
+    from miniservellm.runtime.gemma4_quant import (
+        quantize_checkpoint_tensor,
+        quantize_gemma4_weights,
+    )
+    from miniservellm.safetensors_io import StreamingSafetensors
 
     model_dir = Path(args.model).expanduser()
     model_config = convert_gemma4_config(load_gemma4_config(model_dir))
     started = time.perf_counter()
+    source = StreamingSafetensors(model_dir / "model.safetensors")
+    prequantized = {}
+    for name in (
+        "model.language_model.embed_tokens.weight",
+        "model.language_model.embed_tokens_per_layer.weight",
+    ):
+        prequantized[name] = quantize_checkpoint_tensor(
+            source,
+            name,
+            device=device,
+            group_size=args.group_size,
+            compute_dtype=args.dtype,
+        )
     weights = quantize_gemma4_weights(
         model_dir,
         model_config,
         device=device,
         group_size=args.group_size,
         compute_dtype=args.dtype,
+        prequantized=prequantized,
     )
     print(f"real INT4 weights loaded in {time.perf_counter() - started:.1f}s")
 

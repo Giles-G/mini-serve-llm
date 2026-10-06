@@ -173,7 +173,7 @@ def build_runner(
         device=device,
         dtype="fp16" if dtype == torch.float16 else "bf16",
         block_size=128,
-        num_gpu_blocks=8,
+        num_gpu_blocks=max(8, (max_tokens + history + 127) // 128 + 2),
         max_batch_size=1,
         max_tokens_per_step=1,
         max_prefill_tokens_per_step=max_tokens,
@@ -194,16 +194,32 @@ def build_runner(
 
 
 def bench_direct(runner: Gemma4EagerTextRunner, prompt_ids, max_new_tokens: int) -> dict:
-    generated, stats = runner.generate_cached(
-        prompt_ids, max_new_tokens=max_new_tokens, eos_token_ids=()
-    )
+    device = runner.w.embed_tokens.device
+    runner.reset_cache()
+    sync(device)
+    started = time.perf_counter()
+    with torch.inference_mode():
+        logits = runner.prefill(torch.tensor(prompt_ids, device=device, dtype=torch.long))
+        next_id = int(logits.argmax())
+        sync(device)
+        prefill_done = time.perf_counter()
+        generated = [next_id] if max_new_tokens > 0 else []
+        while len(generated) < max_new_tokens:
+            logits = runner.decode_step(next_id)
+            next_id = int(logits.argmax())
+            generated.append(next_id)
+        sync(device)
+    finished = time.perf_counter()
+    decode_s = finished - prefill_done
+    decode_tokens = max(0, len(generated) - 1)
     return {
         "path": "direct_eager_runner",
-        "prompt_tokens": stats["prompt_tokens"],
-        "generated_tokens": stats["generated_tokens"],
-        "prefill_s": round(stats["prefill_seconds"], 3),
-        "decode_s": round(stats["decode_seconds"], 3),
-        "decode_tok_s": round(stats["decode_tok_s"], 3),
+        "prompt_tokens": len(prompt_ids),
+        "generated_tokens": len(generated),
+        "prefill_s": round(prefill_done - started, 3),
+        "decode_s": round(decode_s, 3),
+        "decode_tokens": decode_tokens,
+        "decode_tok_s": round(decode_tokens / decode_s, 3) if decode_s else 0.0,
         "sample": generated[:12],
     }
 
@@ -367,6 +383,12 @@ def main() -> None:
         results.append(bench_direct(direct, prompt_ids, args.max_new_tokens))
 
     if args.mode in ("engine", "both"):
+        if args.warmup:
+            bench_engine(
+                model_config=model_config, weights=weights, model_path=model_path,
+                device=args.device, dtype=dtype, prompt_ids=prompt_ids,
+                max_new_tokens=args.warmup,
+            )
         results.append(
             bench_engine(
                 model_config=model_config,
