@@ -11,5 +11,6 @@ requirements.txt
 .vscode
 docs
 # 本地模型权重不进仓库
-models/
+# 不带斜杠：同时匹配真实目录和指向外部权重目录的 models 软链接
+models
 .DS_Store

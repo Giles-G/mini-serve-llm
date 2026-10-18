@@ -67,6 +67,42 @@ class JsonTokenizer:
         )
 
 
+def render_chat_prompt(model_path: Path, prompt: str) -> str | None:
+    """Render one user turn with the checkpoint's chat template.
+
+    Gemma4 checkpoints ship the template as a standalone
+    ``chat_template.jinja`` (``tokenizer_config.json`` carries no
+    ``chat_template`` key), so the template text has to be handed to
+    ``apply_chat_template`` explicitly. An instruct checkpoint that is fed a
+    raw, un-templated prompt answers ``<end_of_turn>`` immediately, which would
+    make this benchmark report a single-token decode.
+
+    Returns ``None`` when no template can be rendered, so the caller can fall
+    back to the raw prompt instead of failing.
+    """
+    template = None
+    config_path = model_path / "tokenizer_config.json"
+    if config_path.is_file():
+        template = json.loads(config_path.read_text(encoding="utf-8")).get("chat_template")
+    if not template:
+        jinja_path = model_path / "chat_template.jinja"
+        if jinja_path.is_file():
+            template = jinja_path.read_text(encoding="utf-8")
+    if not template:
+        return None
+    try:
+        from transformers import AutoTokenizer
+    except ImportError:
+        return None
+    hf_tokenizer = AutoTokenizer.from_pretrained(str(model_path))
+    return hf_tokenizer.apply_chat_template(
+        [{"role": "user", "content": prompt}],
+        tokenize=False,
+        add_generation_prompt=True,
+        chat_template=template,
+    )
+
+
 def sync(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -302,6 +338,11 @@ def main() -> None:
         help="auto uses the fused kernel when importable; reference forces the PyTorch path",
     )
     parser.add_argument("--prompt", default="请简要介绍新疆地区。")
+    parser.add_argument(
+        "--no-chat-template",
+        action="store_true",
+        help="feed --prompt raw instead of rendering the checkpoint chat template",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--warmup", type=int, default=0, help="unmeasured decode steps")
     args = parser.parse_args()
@@ -371,8 +412,26 @@ def main() -> None:
     )
 
     tokenizer = JsonTokenizer(model_path)
-    prompt_ids = tokenizer.encode(args.prompt, add_special_tokens=False)
-    print(json.dumps({"prompt_tokens": len(prompt_ids), "prompt": args.prompt}))
+    # Instruct checkpoints must be prompted through their chat template: the
+    # raw prompt carries no turn markers, so the model emits <end_of_turn> as
+    # its first token and the decode numbers below measure nothing.
+    chat_text = None if args.no_chat_template else render_chat_prompt(model_path, args.prompt)
+    if chat_text is None and not args.no_chat_template:
+        print(json.dumps({"chat_template": "unavailable, falling back to raw prompt"}))
+    prompt_ids = tokenizer.encode(
+        chat_text if chat_text is not None else args.prompt,
+        add_special_tokens=False,
+    )
+    print(
+        json.dumps(
+            {
+                "prompt_tokens": len(prompt_ids),
+                "chat_template": chat_text is not None,
+                "prompt": args.prompt,
+            },
+            ensure_ascii=False,
+        )
+    )
 
     results = []
     if args.mode in ("direct", "both"):
