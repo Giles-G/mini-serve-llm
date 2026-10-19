@@ -131,6 +131,25 @@ def _profile_int4_labels(weights):
     return Int4Weight, labels
 
 
+def projection_shapes(weights):
+    """Actual checkpoint dimensions, not synthetic benchmark assumptions."""
+    shapes = {}
+    for name in ("lm_head", "per_layer_model_projection"):
+        value = getattr(weights, name, None)
+        if value is not None:
+            shapes[name] = (
+                [value.packed.shape[0] * 2, value.packed.shape[1]]
+                if hasattr(value, "packed") else list(value.shape)
+            )
+    for index, layer in enumerate(weights.layers):
+        for name, value in vars(layer).items():
+            if hasattr(value, "packed"):
+                shapes[f"layer{index}.{name}"] = [
+                    value.packed.shape[0] * 2, value.packed.shape[1]
+                ]
+    return shapes
+
+
 def load_weights(model_path: Path, device: str, dtype: torch.dtype, int4: bool, backend: str):
     """Load dense or INT4 text weights for the Gemma4 backbone."""
     started = time.perf_counter()
@@ -218,6 +237,7 @@ def build_runner(
     dtype: torch.dtype,
     max_tokens: int,
     history: int,
+    eos_token_ids: tuple[int, ...] = (1, 106, 50),
 ):
     """Build the Stage5Engine serving path around the given weights."""
     head_dim = max(spec.head_dim for spec in model_config.layer_specs)
@@ -239,13 +259,19 @@ def build_runner(
         num_kv_heads=model_config.num_key_value_heads,
         head_dim=head_dim,
     )
-    engine_config.eos_token_id = (1, 106, 50)
+    engine_config.eos_token_id = eos_token_ids
     cache_manager = Gemma4PagedKVCacheManager(engine_config, model_config)
     runner = Gemma4EngineModelRunner(engine_config, model_config, weights, cache_manager)
     return engine_config, cache_manager, runner
 
 
-def bench_direct(runner: Gemma4EagerTextRunner, prompt_ids, max_new_tokens: int) -> dict:
+def bench_direct(
+    runner: Gemma4EagerTextRunner,
+    prompt_ids,
+    max_new_tokens: int,
+    tokenizer,
+    eos_token_ids: tuple[int, ...] = (1, 106, 50),
+) -> dict:
     device = runner.w.embed_tokens.device
     runner.reset_cache()
     sync(device)
@@ -256,7 +282,7 @@ def bench_direct(runner: Gemma4EagerTextRunner, prompt_ids, max_new_tokens: int)
         sync(device)
         prefill_done = time.perf_counter()
         generated = [next_id] if max_new_tokens > 0 else []
-        while len(generated) < max_new_tokens:
+        while len(generated) < max_new_tokens and next_id not in eos_token_ids:
             logits = runner.decode_step(next_id)
             next_id = int(logits.argmax())
             generated.append(next_id)
@@ -273,6 +299,9 @@ def bench_direct(runner: Gemma4EagerTextRunner, prompt_ids, max_new_tokens: int)
         "decode_tokens": decode_tokens,
         "decode_tok_s": round(decode_tokens / decode_s, 3) if decode_s else 0.0,
         "sample": generated[:12],
+        "generated_token_ids": generated,
+        "generated_text": tokenizer.decode(generated, skip_special_tokens=True),
+        "generated_text_raw": tokenizer.decode(generated, skip_special_tokens=False),
     }
 
 
@@ -286,6 +315,8 @@ def bench_engine(
     prompt_ids,
     max_new_tokens: int,
     profile_steps: bool = False,
+    profiler=None,
+    eos_token_ids: tuple[int, ...] = (1, 106, 50),
 ) -> dict:
     engine_config, cache_manager, runner = build_runner(
         model_path=model_path,
@@ -295,6 +326,7 @@ def bench_engine(
         dtype=dtype,
         max_tokens=max(len(prompt_ids), 1),
         history=max_new_tokens,
+        eos_token_ids=eos_token_ids,
     )
     engine = Stage5Engine(
         engine_config=engine_config,
@@ -311,24 +343,54 @@ def bench_engine(
     sync(dev)
     started = time.perf_counter()
     prefill_done = None
-    while engine.has_pending_work():
-        scope = (
-            torch.profiler.record_function(
-                "engine::prefill" if prefill_done is None else "engine::decode"
+    profile_started = False
+    decode_steps = 0
+    try:
+        while engine.has_pending_work():
+            # Start immediately before the second decode step. This excludes
+            # both prefill and the first decode handoff from the profile.
+            if (
+                profiler is not None
+                and prefill_done is not None
+                and decode_steps >= 1
+                and not profile_started
+            ):
+                sync(dev)
+                profiler.start()
+                profile_started = True
+            scope = (
+                torch.profiler.record_function(
+                    "engine::prefill" if prefill_done is None else "engine::decode"
+                )
+                if profile_steps
+                else nullcontext()
             )
-            if profile_steps
-            else nullcontext()
+            with scope:
+                result = engine.step()
+                sync(dev)
+            if profile_started:
+                profiler.step()
+            if prefill_done is not None:
+                decode_steps += 1
+            now = time.perf_counter()
+            if prefill_done is None and any(
+                event.kind == "prefill_sampled_first_token" for event in result.events
+            ):
+                prefill_done = now
+        finished = time.perf_counter()
+    finally:
+        if profile_started:
+            profiler.stop()
+    if profiler is not None and not profile_started:
+        raise RuntimeError(
+            "Request ended before decode-only profiling could start; "
+            "increase token budget or check EOS"
         )
-        with scope:
-            result = engine.step()
-            sync(dev)
-        now = time.perf_counter()
-        if prefill_done is None and any(
-            event.kind == "prefill_sampled_first_token" for event in result.events
-        ):
-            prefill_done = now
-    finished = time.perf_counter()
     info = engine.debug_request(request_id)
+    generated_token_ids = list(info["generated_token_ids"])
+    generated_text = engine.tokenizer.decode(
+        generated_token_ids, skip_special_tokens=True
+    )
 
     prefill_s = (prefill_done or finished) - started
     decode_s = max(0.0, finished - (prefill_done or started))
@@ -346,6 +408,12 @@ def bench_engine(
             info["generated"] / (finished - started), 3
         ) if finished > started else 0.0,
         "kv_cache": cache_manager.debug_global_state()["cache_groups"],
+        "generated_token_ids": generated_token_ids,
+        "generated_text": generated_text,
+        "generated_text_raw": engine.tokenizer.decode(
+            generated_token_ids, skip_special_tokens=False
+        ),
+        "profile_decode_steps": max(0, decode_steps - 1) if profiler is not None else 0,
     }
 
 
@@ -371,18 +439,44 @@ def main() -> None:
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--warmup", type=int, default=0, help="unmeasured decode steps")
     parser.add_argument(
-        "--profile", type=Path, metavar="TRACE_JSON",
-        help="run a separate short engine trace after normal benchmark",
+        "--eos-token-ids",
+        type=int,
+        nargs="+",
+        default=[1, 106, 50],
+        help="token IDs that finish generation (default: 1 106 50)",
+    )
+    parser.add_argument(
+        "--output-json",
+        type=Path,
+        metavar="RESULTS_JSON",
+        help="save the actual benchmark results as JSON",
+    )
+    parser.add_argument(
+        "--profile", type=Path, metavar="SUMMARY_JSON",
+        help="run a separate short engine profile after normal benchmark",
+    )
+    parser.add_argument(
+        "--profile-trace", type=Path, metavar="TRACE_JSON",
+        help="also export a detailed Chrome trace; omitted by default",
+    )
+    parser.add_argument(
+        "--profile-summary", type=Path, metavar="SUMMARY_JSON",
+        help="write the compact profiler summary as JSON",
     )
     parser.add_argument(
         "--profile-tokens", type=int, default=16,
         help="generated tokens in the separate profiling run",
     )
     args = parser.parse_args()
-    if args.max_new_tokens < 1 or args.warmup < 0 or args.profile_tokens < 2:
-        parser.error("max-new-tokens >= 1, warmup >= 0, profile-tokens >= 2 required")
-    if args.profile and args.mode == "direct":
-        parser.error("--profile requires engine mode")
+    if args.max_new_tokens < 1 or args.warmup < 0 or args.profile_tokens < 3:
+        parser.error("max-new-tokens >= 1, warmup >= 0, profile-tokens >= 3 required")
+    if (args.profile or args.profile_trace or args.profile_summary) and args.mode == "direct":
+        parser.error("profiling requires engine mode")
+    # Backward-compatible: the old --profile path now receives the compact
+    # summary.  A large Chrome trace requires the explicit --profile-trace flag.
+    if args.profile and not args.profile_trace and not args.profile_summary:
+        args.profile_summary = args.profile
+        args.profile = None
 
     model_path = Path(args.model).expanduser()
     if not model_path.is_dir():
@@ -444,6 +538,7 @@ def main() -> None:
                 "load_s": round(load_s, 2),
                 "vram_free_after_load_gib": round(free_after, 2),
                 "weights": weight_report(weights),
+                "projection_shapes": projection_shapes(weights),
             }
         )
     )
@@ -470,13 +565,30 @@ def main() -> None:
         )
     )
 
+    eos_token_ids = tuple(args.eos_token_ids)
     results = []
     if args.mode in ("direct", "both"):
         direct = Gemma4EagerTextRunner(model_config, weights)
-        if args.warmup:
-            direct.generate_cached(prompt_ids, args.warmup, eos_token_ids=())
+        try:
+            if args.warmup:
+                direct.generate_cached(
+                    prompt_ids, args.warmup, eos_token_ids=eos_token_ids
+                )
+                direct.reset_cache()
+            results.append(
+                bench_direct(
+                    direct,
+                    prompt_ids,
+                    args.max_new_tokens,
+                    tokenizer,
+                    eos_token_ids=eos_token_ids,
+                )
+            )
+        finally:
             direct.reset_cache()
-        results.append(bench_direct(direct, prompt_ids, args.max_new_tokens))
+            del direct
+            if args.device == "cuda":
+                torch.cuda.empty_cache()
 
     if args.mode in ("engine", "both"):
         if args.warmup:
@@ -484,6 +596,7 @@ def main() -> None:
                 model_config=model_config, weights=weights, model_path=model_path,
                 device=args.device, dtype=dtype, prompt_ids=prompt_ids,
                 max_new_tokens=args.warmup,
+                eos_token_ids=eos_token_ids,
             )
         results.append(
             bench_engine(
@@ -494,17 +607,35 @@ def main() -> None:
                 dtype=dtype,
                 prompt_ids=prompt_ids,
                 max_new_tokens=args.max_new_tokens,
+                eos_token_ids=eos_token_ids,
             )
         )
 
     for result in results:
-        print(json.dumps(result, ensure_ascii=False))
+        printable = dict(result)
+        generated_text = printable.pop("generated_text", "")
+        print(json.dumps(printable, ensure_ascii=False))
+        print(f"=== GEMMA4 GENERATION BEGIN ({result['path']}) ===")
+        print(f"prompt: {args.prompt}")
+        print(f"finish_reason: {result.get('finish_reason', 'N/A')}")
+        print(f"generated_tokens: {result['generated_tokens']}")
+        if generated_text:
+            print(generated_text)
+        else:
+            print("[WARNING] decoded generation is empty")
+            print(f"generated_token_ids: {result.get('generated_token_ids', [])}")
+            print(
+                "raw decoded generation: "
+                f"{result.get('generated_text_raw', '')!r}"
+            )
+        print(f"=== GEMMA4 GENERATION END ({result['path']}) ===")
 
     stats = globals().get("_INT4_STATS")
     if stats:
         print(json.dumps({"int4_matmul_calls": stats}))
 
-    if args.profile:
+    profile_info = None
+    if args.profile or args.profile_trace or args.profile_summary:
         profile_int4_weight, labels = _profile_int4_labels(weights)
         original_matmul = profile_int4_weight.matmul
 
@@ -515,34 +646,65 @@ def main() -> None:
 
         profile_int4_weight.matmul = profiled_matmul
         try:
-            with torch.profiler.profile(
+            profiler = torch.profiler.profile(
                 activities=[
                     torch.profiler.ProfilerActivity.CPU,
                     torch.profiler.ProfilerActivity.CUDA,
                 ],
-                record_shapes=True,
-            ) as profiler:
-                bench_engine(
-                    model_config=model_config,
-                    weights=weights,
-                    model_path=model_path,
-                    device=args.device,
-                    dtype=dtype,
-                    prompt_ids=prompt_ids,
-                    max_new_tokens=args.profile_tokens,
-                    profile_steps=True,
-                )
-            args.profile.parent.mkdir(parents=True, exist_ok=True)
-            profiler.export_chrome_trace(str(args.profile))
-            print(profiler.key_averages().table(
-                sort_by="self_cuda_time_total", row_limit=30
-            ))
-            print(json.dumps({
-                "profile_trace": str(args.profile.resolve()),
+                record_shapes=False,
+                profile_memory=False,
+                with_stack=False,
+            )
+            profile_result = bench_engine(
+                model_config=model_config,
+                weights=weights,
+                model_path=model_path,
+                device=args.device,
+                dtype=dtype,
+                prompt_ids=prompt_ids,
+                max_new_tokens=args.profile_tokens,
+                profile_steps=True,
+                profiler=profiler,
+                eos_token_ids=eos_token_ids,
+            )
+            summary = profiler.key_averages()
+            print(summary.table(sort_by="self_cuda_time_total", row_limit=30))
+            print(summary.table(sort_by="self_cpu_time_total", row_limit=20))
+            profile_info = {
                 "profile_tokens": args.profile_tokens,
-            }))
+                "actual_decode_steps": profile_result["profile_decode_steps"],
+                "trace_exported": bool(args.profile_trace),
+                "cuda_summary": summary.table(
+                    sort_by="self_cuda_time_total", row_limit=30
+                ),
+                "cpu_summary": summary.table(
+                    sort_by="self_cpu_time_total", row_limit=20
+                ),
+            }
+            if args.profile_trace:
+                args.profile_trace.parent.mkdir(parents=True, exist_ok=True)
+                profiler.export_chrome_trace(str(args.profile_trace))
+                profile_info["profile_trace"] = str(args.profile_trace.resolve())
+            if args.profile_summary:
+                args.profile_summary.parent.mkdir(parents=True, exist_ok=True)
+                args.profile_summary.write_text(
+                    json.dumps(profile_info, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                profile_info["profile_summary"] = str(args.profile_summary.resolve())
+            print(json.dumps(profile_info, ensure_ascii=False))
         finally:
             profile_int4_weight.matmul = original_matmul
+
+    if args.output_json:
+        args.output_json.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"results": results}
+        if profile_info is not None:
+            payload["profile"] = profile_info
+        args.output_json.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ workspace after installing ``mini-llm-kernels`` there.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import gc
 import json
 import sys
@@ -49,7 +50,11 @@ def _pack_int4(w_q: torch.Tensor) -> torch.Tensor:
     """Pack [N, K] values in [-8, 7] as [N//2, K] uint8."""
     if w_q.ndim != 2 or w_q.shape[0] % 2:
         raise ValueError("INT4 packing requires a 2D tensor with even N")
-    unsigned = (w_q.to(torch.int16) + 8).clamp(0, 15).to(torch.uint8)
+    if w_q.dtype not in (torch.int8, torch.int16, torch.int32, torch.int64):
+        raise TypeError("INT4 packing requires an integer tensor")
+    if not bool(((w_q >= -8) & (w_q <= 7)).all()):
+        raise ValueError("INT4 values must be in [-8, 7]")
+    unsigned = (w_q.to(torch.int16) + 8).to(torch.uint8)
     return unsigned[0::2] | (unsigned[1::2] << 4)
 
 
@@ -100,26 +105,91 @@ def _format_error(reference: torch.Tensor, actual: torch.Tensor) -> tuple[float,
     return float(diff.max().item()), float(diff.mean().item())
 
 
-def _high_precision_references(x, packed, scales, *, chunk_rows=256):
-    """CUDA FP32 oracles, with bounded temporary storage even for lm_head.
+def _validate_inputs(x: torch.Tensor, packed: torch.Tensor, scales: torch.Tensor) -> int:
+    if x.ndim < 2 or packed.ndim != 2 or scales.ndim != 2:
+        raise ValueError("x must be [..., K], packed/scales must be 2D")
+    if packed.shape[0] * 2 != scales.shape[0] or packed.shape[1] != x.shape[-1]:
+        raise ValueError("packed, scales, and x have incompatible shapes")
+    if scales.shape[1] < 1 or x.shape[-1] % scales.shape[1]:
+        raise ValueError("K must be divisible by the number of scale groups")
+    if packed.dtype != torch.uint8:
+        raise TypeError("packed weights must have dtype torch.uint8")
+    if not torch.isfinite(x).all() or not torch.isfinite(scales).all():
+        raise ValueError("x and scales must contain only finite values")
+    return x.shape[-1] // scales.shape[1]
 
-    Return exact dequantization, activation-dtype rounded dequantization, and
-    sum(abs(x*w)). These check two different arithmetic contracts.
+
+@contextmanager
+def _tf32_disabled():
+    """Temporarily make FP32 references independent of TF32 settings."""
+    cuda_matmul = torch.backends.cuda.matmul
+    cudnn = torch.backends.cudnn
+    old_matmul = cuda_matmul.allow_tf32
+    old_cudnn = cudnn.allow_tf32
+    cuda_matmul.allow_tf32 = False
+    cudnn.allow_tf32 = False
+    try:
+        yield
+    finally:
+        cuda_matmul.allow_tf32 = old_matmul
+        cudnn.allow_tf32 = old_cudnn
+
+
+def _cpu_fp64_oracle(x, packed, scales):
+    """Compute the dequantized matmul in CPU FP64 for small-matrix checking."""
+    group_size = _validate_inputs(x, packed, scales)
+    x64 = x.detach().cpu().reshape(-1, x.shape[-1]).double()
+    packed_cpu = packed.detach().cpu()
+    scales64 = scales.detach().cpu().double()
+    pair = packed_cpu
+    q = torch.stack((pair & 15, pair >> 4), dim=1).reshape(-1, pair.shape[1])
+    w = (q.double() - 8.0) * scales64.repeat_interleave(group_size, dim=1)
+    return x64 @ w.T
+
+
+def _validate_fp32_reference_with_cpu64(x, packed, scales, fp32_reference):
+    """Check a small FP32 reference against an independent CPU FP64 result."""
+    cpu64 = _cpu_fp64_oracle(x, packed, scales)
+    pair = packed.detach().cpu()
+    q = torch.stack((pair & 15, pair >> 4), dim=1).reshape(-1, pair.shape[1]).double() - 8
+    group_size = x.shape[-1] // scales.shape[1]
+    w = q * scales.detach().cpu().double().repeat_interleave(group_size, dim=1)
+    magnitudes = x.detach().cpu().reshape(-1, x.shape[-1]).double().abs() @ w.abs().T
+    # The CPU FP32 matmul is itself rounded, so use a standard dot-product
+    # bound plus one FP32 output rounding term. This checks the reference
+    # implementation without calling it mathematically exact.
+    eps32 = torch.finfo(torch.float32).eps
+    k = x.shape[-1]
+    gamma = (k * eps32) / (1 - k * eps32)
+    allowance = gamma * magnitudes + eps32 * cpu64.abs() + torch.finfo(torch.float32).tiny
+    return _error_report(cpu64, fp32_reference, allowance)
+
+
+def _high_precision_references(x, packed, scales, *, chunk_rows=256):
+    """Return bounded FP32 reference results for the two arithmetic contracts.
+
+    The first result uses the mathematical dequantized weight represented in
+    FP32, and the second rounds that weight to the activation dtype first.
+    Neither result is an exact real-number computation.
     """
+    group_size = _validate_inputs(x, packed, scales)
+    if not isinstance(chunk_rows, int) or isinstance(chunk_rows, bool) or chunk_rows < 1:
+        raise ValueError("chunk_rows must be a positive integer")
+    if chunk_rows % 2:
+        raise ValueError("chunk_rows must be even because packed rows are pairs")
     x32 = x.detach().reshape(-1, x.shape[-1]).float()
     exact, rounded, magnitudes = [], [], []
-    group_size = x.shape[-1] // scales.shape[1]
-    for start in range(0, packed.shape[0] * 2, chunk_rows):
-        stop = min(start + chunk_rows, packed.shape[0] * 2)
-        # Chunks must start on a packed pair boundary.
-        pair = packed[start // 2:(stop + 1) // 2]
-        q = torch.stack((pair & 15, pair >> 4), dim=1).reshape(-1, pair.shape[1])
-        q = q[:stop - start].float() - 8
-        scale = scales[start:stop].float()
-        w = q * scale.repeat_interleave(group_size, dim=1)
-        exact.append(x32 @ w.T)
-        rounded.append(x32 @ w.to(x.dtype).float().T)
-        magnitudes.append(x32.abs() @ w.abs().T)
+    with _tf32_disabled():
+        for start in range(0, packed.shape[0] * 2, chunk_rows):
+            stop = min(start + chunk_rows, packed.shape[0] * 2)
+            pair = packed[start // 2:stop // 2]
+            q = torch.stack((pair & 15, pair >> 4), dim=1).reshape(-1, pair.shape[1])
+            q = q.float() - 8
+            scale = scales[start:stop].float()
+            w = q * scale.repeat_interleave(group_size, dim=1)
+            exact.append(x32 @ w.T)
+            rounded.append(x32 @ w.to(x.dtype).float().T)
+            magnitudes.append(x32.abs() @ w.abs().T)
     return tuple(torch.cat(parts, dim=1) for parts in (exact, rounded, magnitudes))
 
 
@@ -131,10 +201,18 @@ def _error_report(expected, actual, allowance):
     finite = torch.isfinite(actual) & torch.isfinite(expected)
     failed = (~finite) | (diff > allowance)
     safe_diff = torch.where(finite, diff, torch.full_like(diff, float("inf")))
+    ratio = torch.where(
+        finite & (allowance > 0),
+        diff / allowance.clamp_min(torch.finfo(torch.float64).tiny),
+        torch.full_like(diff, float("inf")),
+    )
     index = int(safe_diff.argmax())
+    over_index = int(ratio.argmax())
     row, col = divmod(index, expected.shape[1])
+    over_row, over_col = divmod(over_index, expected.shape[1])
     return {
         "finite": bool(finite.all()),
+        "nan_or_inf_elements": int((~finite).sum()),
         "max_abs": float(safe_diff.max()),
         "mean_abs": float(safe_diff.mean()),
         "p99_abs": float(torch.quantile(safe_diff.flatten(), 0.99)),
@@ -144,32 +222,52 @@ def _error_report(expected, actual, allowance):
         "elements": failed.numel(),
         "worst": {"row": row, "column": col, "expected": float(expected[row, col]),
                   "actual": float(actual[row, col]), "allowance": float(allowance[row, col])},
+        "worst_over_budget": {
+            "row": over_row,
+            "column": over_col,
+            "ratio": float(ratio[over_row, over_col]),
+            "expected": float(expected[over_row, over_col]),
+            "actual": float(actual[over_row, over_col]),
+            "allowance": float(allowance[over_row, over_col]),
+        } if bool(failed.any()) else None,
     }
 
 
-def _check_parity(x, packed, scales, reference, fused):
-    exact, rounded, magnitudes = _high_precision_references(x, packed, scales)
+def _check_parity(x, packed, scales, reference, fused, *, chunk_rows=256):
+    exact, rounded, magnitudes = _high_precision_references(
+        x, packed, scales, chunk_rows=chunk_rows
+    )
     # Conservative FP32 dot/group accumulation budget plus final output rounding.
     # No empirical absolute threshold fitted to one observed failure.
-    group_size = x.shape[-1] // scales.shape[1]
-    operations = group_size + scales.shape[1] + 2
+    operations = x.shape[-1] + 3
     eps32 = torch.finfo(torch.float32).eps
     gamma = operations * eps32 / (1 - operations * eps32)
     output_eps = torch.finfo(x.dtype).eps
-    tiny = torch.finfo(x.dtype).tiny * output_eps
+    tiny = torch.finfo(x.dtype).tiny
     allowance = gamma * magnitudes + output_eps * exact.abs() + tiny
     fused_report = _error_report(exact, fused, allowance)
     fallback_allowance = gamma * magnitudes + output_eps * rounded.abs() + tiny
     fallback_report = _error_report(rounded, reference, fallback_allowance)
+    cpu_report = None
+    if packed.numel() * 2 <= 65_536:
+        cpu_report = _validate_fp32_reference_with_cpu64(x, packed, scales, exact)
     return {
         "fused_vs_exact": fused_report,
         "fallback_vs_rounded": fallback_report,
+        "cpu_fp64_reference": cpu_report,
+        "reference_operations": operations,
+        "reference_gamma": gamma,
         "weight_rounding_max_abs": float((exact - rounded).abs().max()),
-        # The fallback is a separate PyTorch implementation whose reduction
-        # order can vary by CUDA backend.  It is diagnostic only; the fused
-        # kernel is judged against the FP32 oracle.
-        "passed": fused_report["failed_elements"] == 0,
-        "criterion": "FP32 accumulation bound + output dtype rounding budget",
+        "fallback_failure_policy": (
+            "fallback is independently checked; a checked fallback failure fails "
+            "the case and is reported separately"
+        ),
+        "passed": (
+            fused_report["failed_elements"] == 0
+            and fallback_report["failed_elements"] == 0
+            and (cpu_report is None or cpu_report["failed_elements"] == 0)
+        ),
+        "criterion": "FP32 accumulation bound plus activation-dtype output rounding",
     }
 
 
@@ -241,44 +339,52 @@ def _real_cases(args, device: torch.device) -> Iterable[tuple]:
     print(f"real INT4 weights loaded in {time.perf_counter() - started:.1f}s")
 
     seen = 0
-    if not args.skip_lm_head:
-        weight = weights.lm_head
-        yield (
-            "lm_head",
-            torch.randn((args.tokens, weight.packed.shape[1]), device=device, dtype=args.dtype),
-            weight.packed, weight.scales,
-        )
-        seen += 1
-        if args.limit and seen >= args.limit:
-            return
-    for layer_idx, layer in enumerate(weights.layers):
-        for name in (
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-            "per_layer_input_gate",
-            "per_layer_projection",
-        ):
-            weight = getattr(layer, name)
+    for seed in args.seeds:
+        generator = torch.Generator(device="cpu").manual_seed(seed)
+        if not args.skip_lm_head:
+            weight = weights.lm_head
             yield (
-                f"layer{layer_idx}.{name}",
+                f"lm_head.seed{seed}",
                 torch.randn(
                     (args.tokens, weight.packed.shape[1]),
-                    device=device,
+                    generator=generator,
                     dtype=args.dtype,
-                ),
-                weight.packed,
-                weight.scales,
+                ).to(device),
+                weight.packed, weight.scales,
             )
             seen += 1
             if args.limit and seen >= args.limit:
                 del weights
                 gc.collect()
                 return
+        for layer_idx, layer in enumerate(weights.layers):
+            for name in (
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+                "per_layer_input_gate",
+                "per_layer_projection",
+            ):
+                weight = getattr(layer, name)
+                yield (
+                    f"layer{layer_idx}.{name}.seed{seed}",
+                    torch.randn(
+                        (args.tokens, weight.packed.shape[1]),
+                        generator=generator,
+                        dtype=args.dtype,
+                    ).to(device),
+                    weight.packed,
+                    weight.scales,
+                )
+                seen += 1
+                if args.limit and seen >= args.limit:
+                    del weights
+                    gc.collect()
+                    return
     del weights
     gc.collect()
 
@@ -314,7 +420,9 @@ def _run_case(args, case) -> bool:
         f" fused_ms={fused_ms:.3f} tflops={_tflops(args.tokens, n, x.shape[-1], fused_ms):.2f}"
         f"{suffix} max_abs={max_abs:.5f} mean_abs={mean_abs:.6f}"
     )
-    diagnostics = _check_parity(x, packed, scales, reference, fused)
+    diagnostics = _check_parity(
+        x, packed, scales, reference, fused, chunk_rows=args.chunk_rows
+    )
     print(json.dumps({"case": name, "parity": diagnostics}, allow_nan=True), flush=True)
     return diagnostics["passed"]
 
@@ -327,6 +435,12 @@ def main() -> None:
     parser.add_argument("--group-size", type=int, default=64)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=100)
+    parser.add_argument(
+        "--chunk-rows",
+        type=int,
+        default=256,
+        help="Even logical output rows per bounded FP32 reference chunk",
+    )
     parser.add_argument("--skip-fallback", action="store_true")
     parser.add_argument("--skip-lm-head", action="store_true",
                         help="Skip the large vocabulary projection (included by default)")
@@ -335,8 +449,19 @@ def main() -> None:
     parser.add_argument("--dtype", choices=("fp16", "bf16"), default="fp16")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
-    if args.tokens < 1 or args.group_size < 1 or args.warmup < 0 or args.iters < 1 or args.limit < 0:
-        parser.error("tokens/group-size/iters must be positive; warmup/limit nonnegative")
+    if (
+        args.tokens < 1
+        or args.group_size < 1
+        or args.warmup < 0
+        or args.iters < 1
+        or args.limit < 0
+        or args.chunk_rows < 1
+        or args.chunk_rows % 2
+    ):
+        parser.error(
+            "tokens/group-size/iters/chunk-rows must be positive; "
+            "chunk-rows must be even; warmup/limit nonnegative"
+        )
     if not args.seeds:
         parser.error("at least one seed is required")
     args.dtype = torch.float16 if args.dtype == "fp16" else torch.bfloat16
