@@ -29,6 +29,7 @@ import argparse
 import json
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -113,6 +114,21 @@ def sync(device: torch.device) -> None:
 def gpu_memory_gib() -> tuple[float, float]:
     free, total = torch.cuda.mem_get_info()
     return free / 2**30, total / 2**30
+
+
+def _profile_int4_labels(weights):
+    from miniservellm.runtime.gemma4_quant import Int4Weight
+
+    labels = {}
+    for name in ("embed_tokens", "lm_head", "per_layer_model_projection"):
+        value = getattr(weights, name, None)
+        if isinstance(value, Int4Weight):
+            labels[id(value)] = name
+    for layer_idx, layer in enumerate(weights.layers):
+        for name, value in vars(layer).items():
+            if isinstance(value, Int4Weight):
+                labels[id(value)] = f"layer{layer_idx}.{name}"
+    return Int4Weight, labels
 
 
 def load_weights(model_path: Path, device: str, dtype: torch.dtype, int4: bool, backend: str):
@@ -269,6 +285,7 @@ def bench_engine(
     dtype: torch.dtype,
     prompt_ids,
     max_new_tokens: int,
+    profile_steps: bool = False,
 ) -> dict:
     engine_config, cache_manager, runner = build_runner(
         model_path=model_path,
@@ -295,8 +312,16 @@ def bench_engine(
     started = time.perf_counter()
     prefill_done = None
     while engine.has_pending_work():
-        result = engine.step()
-        sync(dev)
+        scope = (
+            torch.profiler.record_function(
+                "engine::prefill" if prefill_done is None else "engine::decode"
+            )
+            if profile_steps
+            else nullcontext()
+        )
+        with scope:
+            result = engine.step()
+            sync(dev)
         now = time.perf_counter()
         if prefill_done is None and any(
             event.kind == "prefill_sampled_first_token" for event in result.events
@@ -345,7 +370,19 @@ def main() -> None:
     )
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--warmup", type=int, default=0, help="unmeasured decode steps")
+    parser.add_argument(
+        "--profile", type=Path, metavar="TRACE_JSON",
+        help="run a separate short engine trace after normal benchmark",
+    )
+    parser.add_argument(
+        "--profile-tokens", type=int, default=16,
+        help="generated tokens in the separate profiling run",
+    )
     args = parser.parse_args()
+    if args.max_new_tokens < 1 or args.warmup < 0 or args.profile_tokens < 2:
+        parser.error("max-new-tokens >= 1, warmup >= 0, profile-tokens >= 2 required")
+    if args.profile and args.mode == "direct":
+        parser.error("--profile requires engine mode")
 
     model_path = Path(args.model).expanduser()
     if not model_path.is_dir():
@@ -466,6 +503,46 @@ def main() -> None:
     stats = globals().get("_INT4_STATS")
     if stats:
         print(json.dumps({"int4_matmul_calls": stats}))
+
+    if args.profile:
+        profile_int4_weight, labels = _profile_int4_labels(weights)
+        original_matmul = profile_int4_weight.matmul
+
+        def profiled_matmul(weight, x):
+            label = labels.get(id(weight), "other")
+            with torch.profiler.record_function(f"int4::{label}"):
+                return original_matmul(weight, x)
+
+        profile_int4_weight.matmul = profiled_matmul
+        try:
+            with torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                record_shapes=True,
+            ) as profiler:
+                bench_engine(
+                    model_config=model_config,
+                    weights=weights,
+                    model_path=model_path,
+                    device=args.device,
+                    dtype=dtype,
+                    prompt_ids=prompt_ids,
+                    max_new_tokens=args.profile_tokens,
+                    profile_steps=True,
+                )
+            args.profile.parent.mkdir(parents=True, exist_ok=True)
+            profiler.export_chrome_trace(str(args.profile))
+            print(profiler.key_averages().table(
+                sort_by="self_cuda_time_total", row_limit=30
+            ))
+            print(json.dumps({
+                "profile_trace": str(args.profile.resolve()),
+                "profile_tokens": args.profile_tokens,
+            }))
+        finally:
+            profile_int4_weight.matmul = original_matmul
 
 
 if __name__ == "__main__":
