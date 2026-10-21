@@ -16,17 +16,33 @@
 
 本文是实施与验收计划；条目未完成前不能视为已经实现或已在 3060 验证。
 
-### 当前工作区实施状态
+### 当前工作区实施状态（2026-10-20）
 
-- 已实现：正式请求完整文本/全部 token ID 输出、空文本 raw 解码诊断、结果 JSON 保存、direct/engine EOS 配置统一。
-- 已实现：独立 decode-only profile（排除 prefill 和第一次 decode）、CPU/CUDA 小摘要、显式可选 trace、真实 checkpoint 投影尺寸报告。
-- 已实现：TF32 设置恢复、分块 FP32 参考、小矩阵 CPU FP64 检查、fallback 独立失败判定及相关 CPU 测试。
-- 未完成：新的 CUDA GEMV、算子融合、KV 执行路径优化、专用 attention 与 prefill 重构、CUDA Graph。
-- 未完成：真实激活/完整模型逐步 logits parity，以及 3060 上编译、数值、生成质量和性能验证。
-- 当前仅 server 仓库可写，kernels 仓库的内核工作尚未开展。上述已实现项是验证基础，不代表完成整体性能整改。
-- 所有本轮变更保持未提交、未推送，等待用户检查。
+- 已完成：正式请求完整文本/全部 token ID 输出、空文本 raw 解码诊断、结果 JSON 保存、direct/engine EOS 配置统一。
+- 已完成：独立 decode-only profile、CPU/CUDA 小摘要、显式可选 trace、真实 checkpoint 投影尺寸报告。
+- 已完成：TF32 设置恢复、分块 FP32 参考、小矩阵 CPU FP64 检查、fallback 独立失败判定。
+- 已完成：batch=1 INT4 vectorized row-pair GEMV（pair_vec）并设为默认（legacy/warp/pair/pair_vec 可选）；真实 shape、边界输入、真实激活、三 prompt、FP16/BF16、官方 512 sliding、KV sharing、EOS 的 parity 全部通过。pair_vec 与 scalar pair 的 256-token 输出逐 token 一致。报告见 `reports/gemma4_c_parity.md`。
+- 已完成：A 的 profile 起始 context、期望/实际步数、分组归因、每 step/per-call 时间、`--profile-shapes`；direct/engine 双后端 profile 对照；逐事件 `event_shapes`（CPU aten op 形状）；输出 JSON 的 device/driver/torch/CUDA/commit/EOS/backend/weights/317 shapes 元数据；direct finish_reason、空文本失败标记、tokenize/decode/postprocess/print 开销。
+- 已完成：B 的 row-pair 与 pair_vec kernel、逻辑带宽、3 轮中位数/范围、GPU 时钟/温度/功耗记录、pair_vec/pair/warp/legacy 真实 shape 对比、3 seed × 12 shape、rows/block 2/4/8 调参、CUDA register/occupancy attributes；pair_vec 默认。报告见 `reports/gemma4_ab_gaps.md`。
+- 已完成：融合 RMSNorm、RoPE 每步只算一次、addcmul RoPE、residual+RMSNorm 融合、QKV 合并、gate/up 合并、paged attention 未启用时跳过双写。
+- 已完成：Gemma4 专用 paged decode attention safe kernel 的 parity 测试与启用；paged KV 路径。
+- 已完成：CUDA Graph decode 原型并设为 CUDA batch=1 默认；graph 与 eager reference 在 256 token 上逐 token 一致。
+- 已完成：D 的 residual/layer-scale 原地化、融合 qkv/gate-up 权重去重（graph 路径空闲显存 2.01→2.40 GiB）、block table tensor 缓存、`MINI_LLM_GEMMA4_PAGED=0` 显式 dense fallback gate；dense fallback 19+160 token 与 eager 逐 token 一致。
+- 已完成：E 的 prompt 批量 prefill、快速 INT4→FP16/BF16 反量化 kernel + prefill GEMM（rows>=8）；1024/2048/4096 token prefill 约 0.55/1.04/2.37 s（2k 1966 tok/s），query-chunked prefill attention 把 4k 峰值从 4.18 降到 3.21 GiB。
+- 已完成：P0 的 warp-split decode attention（8 warp 分段 KV、无 per-token barrier）；4k D512 单算子 4.18→0.915 ms（4.57×）。
+- 已完成：全局 split-K attention（长上下文 full-attention，partial scratch + merge kernel）；4k D512 进一步降到 0.270 ms，2k/4k 完整模型 decode 约 18.1/29.4 ms/token；短上下文仍走 warp-split，不受影响。
+- 已完成：4k 并发边界：4k+short、两个 4k batch=2 均完成；peak 3.29–3.36 GiB，free 1.20–1.22 GiB；大 prefill 由 scheduler token budget 串行化。
+- 已完成：P1-3 pair_vec8（8-byte packed load）设为默认；lm_head 1.028→0.845 ms，128-token decode 8.20→7.15 ms/token；P1-4 启动预 warm 短/长 graph，双 graph 短上下文稳态约 6.86 ms/token。
+- 已完成：正式验收 3 prompt × 3 轮 + 256-token；pair_vec8 + graph + batched prefill + split-K 中位数 7.15–7.45 ms/token（134.3–146.6 tok/s），prefill 0.060–0.069 s；长上下文稳态 1k/2k/4k 约 9.47/9.67/10.29 ms/token；测试 server 75、kernels 644。
+- 已完成：true batched decode + batch 2/3/4 CUDA Graph + pair_batch；batch 2/4 吞吐约 169/224 tok/s（旧逐请求约 30 tok/s）；batch 2/4 token ID 与 eager 一致。
+- 已完成：Ollama `gemma4:e2b` Q4_K_M 外部 baseline（1/2/4 并发，16/64 输出）：Ollama N4 decode 约 403–417 tok/s，项目约 199–226；项目 e2e 因 prefill 更快而领先。报告见 `reports/gemma4_ollama_baseline.md`。
+- 已完成：P2-5 证据/工具。`scripts/check_gemma4_p2_p5.py` 统一跑 server/kernel 测试、batch parity、prefill 2k/4k、prefix-cache 命中 benchmark，输出 `reports/gemma4_p2_p5_evidence.json` / `.md`。
+- 已完成（后续）：batch graph 2–16、Triton flash prefill、exact-prefix cache。19-token cold TTFT 约 60 ms；prefix-cache 命中 N=16 约 37 ms（4k prefill 1.65 s）。
+- 未完成/已知问题：prefill 反量化仍是逐 projection 临时执行；sampler 最终 `.item()`、dense fallback 速度未优化。
+- 当前所有改动仍未提交、未推送；等待用户检查。
 
 ### 当前验证入口
+
 
 完整生成文本默认输出，无需额外开关。沿用原 speed 配置，可追加：
 
@@ -47,6 +63,18 @@ python scripts/bench_gemma4_cuda.py --model models/gemma-4-E2B-it --device cuda 
 ```
 
 此命令测试真实权重与随机激活，不等于真实模型激活/logits parity。真实 checkpoint 全层检查耗时较长，可用 `--limit` 控制调试范围。
+
+D/E 边界与 prefill/attention 对照：
+
+```text
+python scripts/check_gemma4_graph_boundaries.py   # 520 graph、复用、batch2、forced dense
+python scripts/check_gemma4_e_boundaries.py       # 1k/2k/4k prompt + decode vs eager
+python scripts/bench_gemma4_prefill.py            # GEMV vs 反量化 GEMM、TTFT、峰值显存
+python scripts/bench_gemma4_attention.py          # safe attention vs dense reference
+```
+
+prefill 的 batch/GEMM 切换阈值由 `MINI_LLM_GEMMA4_PREFILL_GEMM_MIN_ROWS`（默认 64）控制；
+`MINI_LLM_GEMMA4_PAGED=0` 可强制 dense fallback 做回归。
 
 ## 2. 当前基线与证据边界
 

@@ -1,0 +1,105 @@
+{
+  "load_s": 41.29,
+  "long_context": {
+    "prompt_tokens": 520,
+    "ids_match_eager": true,
+    "graph": {
+      "prompt_tokens": 520,
+      "generated_tokens": 32,
+      "finish_reason": "MAX_NEW_TOKENS",
+      "elapsed_s": 0.529
+    },
+    "eager_tokens": 32,
+    "first_divergence": null
+  },
+  "graph_reuse": {
+    "requests": [
+      {
+        "prompt": "请详细介绍KV Cache的作用和实现原理。",
+        "prompt_tokens": 19,
+        "generated_tokens": 16,
+        "finish_reason": "MAX_NEW_TOKENS",
+        "elapsed_s": 0.319,
+        "nonempty": true
+      },
+      {
+        "prompt": "Explain the purpose and implementation of a KV cache.",
+        "prompt_tokens": 19,
+        "generated_tokens": 16,
+        "finish_reason": "MAX_NEW_TOKENS",
+        "elapsed_s": 0.321,
+        "nonempty": true
+      },
+      {
+        "prompt": "What is 27 + 45? Answer with the number only.",
+        "prompt_tokens": 25,
+        "generated_tokens": 3,
+        "finish_reason": "EOS",
+        "elapsed_s": 0.079,
+        "nonempty": true
+      },
+      {
+        "prompt": "请用一句话说明KV Cache。",
+        "prompt_tokens": 17,
+        "generated_tokens": 16,
+        "finish_reason": "MAX_NEW_TOKENS",
+        "elapsed_s": 0.266,
+        "nonempty": true
+      },
+      {
+        "prompt": "Write one short sentence about transformers.",
+        "prompt_tokens": 16,
+        "generated_tokens": 12,
+        "finish_reason": "EOS",
+        "elapsed_s": 0.232,
+        "nonempty": true
+      }
+    ],
+    "vram_free_after_capture_gib": 2.26,
+    "vram_free_after_reuse_gib": 2.26,
+    "all_finished": true
+  },
+  "batch2": {
+    "max_batch_size": 2,
+    "graph_mode": false,
+    "paged_attention": true,
+    "requests": [
+      {
+        "generated_tokens": 3,
+        "finish_reason": "EOS",
+        "ids": [
+          236812,
+          236778,
+          106
+        ]
+      },
+      {
+        "generated_tokens": 8,
+        "finish_reason": "MAX_NEW_TOKENS",
+        "ids": [
+          1018,
+          57137,
+          47910,
+          236743,
+          59013,
+          28861,
+          74999,
+          56762
+        ]
+      }
+    ],
+    "all_finished": true
+  },
+  "dense_fallback": {
+    "prompt_tokens": 19,
+    "max_new_tokens": 160,
+    "ids_match_eager": true,
+    "first_divergence": null,
+    "graph_mode": false,
+    "paged_attention": false,
+    "generated_tokens": 160,
+    "finish_reason": "MAX_NEW_TOKENS",
+    "elapsed_s": 5.964
+  },
+  "all_passed": true
+}

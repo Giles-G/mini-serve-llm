@@ -1,0 +1,189 @@
+{
+  "note": "Project and Ollama use the same Gemma4 E2B checkpoint; Q4_K_M vs INT4 group64 and llama.cpp vs custom CUDA are not kernel-equivalent. Ollama service is -np 1, so N>1 requests queue; e2e is the fair metric, aggregate decode is not.",
+  "outputs": {
+    "16": [
+      {
+        "n": 1,
+        "project": {
+          "n": 1,
+          "e2e": 95.5,
+          "decode": 146.9,
+          "per": 146.9,
+          "ttft": 0.065
+        },
+        "ollama": {
+          "n": 1,
+          "e2e": 25.66,
+          "per": 102.9,
+          "ttft": 0.4845
+        },
+        "e2e_ratio": 3.72,
+        "per_ratio": 1.43
+      },
+      {
+        "n": 2,
+        "project": {
+          "n": 2,
+          "e2e": 117.9,
+          "decode": 159.6,
+          "per": 79.8,
+          "ttft": 0.083
+        },
+        "ollama": {
+          "n": 2,
+          "e2e": 39.54,
+          "per": 101.8,
+          "ttft": 0.6614
+        },
+        "e2e_ratio": 2.98,
+        "per_ratio": 0.78
+      },
+      {
+        "n": 4,
+        "project": {
+          "n": 4,
+          "e2e": 216.2,
+          "decode": 369.9,
+          "per": 92.5,
+          "ttft": 0.134
+        },
+        "ollama": {
+          "n": 4,
+          "e2e": 53.22,
+          "per": 100.7,
+          "ttft": 0.8626
+        },
+        "e2e_ratio": 4.06,
+        "per_ratio": 0.92
+      },
+      {
+        "n": 8,
+        "project": {
+          "n": 8,
+          "e2e": 295.7,
+          "decode": 706.4,
+          "per": 88.3,
+          "ttft": 0.263
+        },
+        "ollama": {
+          "n": 8,
+          "e2e": 60.23,
+          "per": 101.3,
+          "ttft": 1.4074
+        },
+        "e2e_ratio": 4.91,
+        "per_ratio": 0.87
+      },
+      {
+        "n": 16,
+        "project": {
+          "n": 16,
+          "e2e": 395.5,
+          "decode": 1445.8,
+          "per": 90.4,
+          "ttft": 0.481
+        },
+        "ollama": {
+          "n": 16,
+          "e2e": 64.15,
+          "per": 101.1,
+          "ttft": 2.5325
+        },
+        "e2e_ratio": 6.17,
+        "per_ratio": 0.89
+      }
+    ],
+    "64": [
+      {
+        "n": 1,
+        "project": {
+          "n": 1,
+          "e2e": 127.5,
+          "decode": 142.5,
+          "per": 142.5,
+          "ttft": 0.06
+        },
+        "ollama": {
+          "n": 1,
+          "e2e": 60.97,
+          "per": 105.6,
+          "ttft": 0.5622
+        },
+        "e2e_ratio": 2.09,
+        "per_ratio": 1.35
+      },
+      {
+        "n": 2,
+        "project": {
+          "n": 2,
+          "e2e": 146.7,
+          "decode": 159.6,
+          "per": 79.8,
+          "ttft": 0.083
+        },
+        "ollama": {
+          "n": 2,
+          "e2e": 73.4,
+          "per": 105.7,
+          "ttft": 1.1681
+        },
+        "e2e_ratio": 2.0,
+        "per_ratio": 0.75
+      },
+      {
+        "n": 4,
+        "project": {
+          "n": 4,
+          "e2e": 310.3,
+          "decode": 364.6,
+          "per": 91.2,
+          "ttft": 0.134
+        },
+        "ollama": {
+          "n": 4,
+          "e2e": 84.29,
+          "per": 104.4,
+          "ttft": 1.8204
+        },
+        "e2e_ratio": 3.68,
+        "per_ratio": 0.87
+      },
+      {
+        "n": 8,
+        "project": {
+          "n": 8,
+          "e2e": 533.9,
+          "decode": 704.2,
+          "per": 88.0,
+          "ttft": 0.243
+        },
+        "ollama": {
+          "n": 8,
+          "e2e": 89.16,
+          "per": 104.82,
+          "ttft": 3.2322
+        },
+        "e2e_ratio": 5.99,
+        "per_ratio": 0.84
+      },
+      {
+        "n": 16,
+        "project": {
+          "n": 16,
+          "e2e": 889.2,
+          "decode": 1430.3,
+          "per": 89.4,
+          "ttft": 0.447
+        },
+        "ollama": {
+          "n": 16,
+          "e2e": 90.34,
+          "per": 104.14,
+          "ttft": 6.2524
+        },
+        "e2e_ratio": 9.84,
+        "per_ratio": 0.86
+      }
+    ]
+  }
+}

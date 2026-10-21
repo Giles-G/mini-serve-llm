@@ -118,6 +118,12 @@ class Stage5Engine:
         self.decode_runner = DecodeRunner(self.model_runner, self.kv_cache_manager, self.metadata_builder)
         # 采样器：根据 logits 和采样参数（temperature、top_k、top_p）选择下一个 token
         self.sampler = Sampler()
+        warmup_graphs = getattr(model_runner, "warmup_graphs", None)
+        if warmup_graphs is not None:
+            warmup_graphs()
+        warmup_batch_graphs = getattr(model_runner, "warmup_batch_graphs", None)
+        if warmup_batch_graphs is not None:
+            warmup_batch_graphs()
 
         # 请求注册表：request_id → Request 的映射，用于快速查找
         self.requests_by_id: Dict[str, Request] = {}
@@ -332,8 +338,23 @@ class Stage5Engine:
             run_result: DecodeRunner 的执行结果，包含 output（含 logits）和 requests
             events: 事件列表，用于追加事件
         """
-        # 批量采样：对 decode 请求的 logits 进行采样
-        sampled = self.sampler.sample_batch(run_result.output.logits_by_request, run_result.requests)
+        # 批量采样：greedy + 连续 batch logits 时避免重新 stack。
+        batch_logits = getattr(run_result.output, "batch_logits", None)
+        greedy = all(
+            req.sampling_params is not None
+            and float(req.sampling_params.temperature) <= 0.0
+            for req in run_result.requests
+        )
+        if batch_logits is not None and greedy:
+            tokens = torch.argmax(batch_logits, dim=-1).tolist()
+            sampled = {
+                req.request_id: int(tokens[i])
+                for i, req in enumerate(run_result.requests)
+            }
+        else:
+            sampled = self.sampler.sample_batch(
+                run_result.output.logits_by_request, run_result.requests
+            )
 
         for req in run_result.requests:
             token_id = sampled[req.request_id]

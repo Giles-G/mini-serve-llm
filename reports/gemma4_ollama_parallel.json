@@ -1,0 +1,229 @@
+{
+  "note": "Ollama concurrency sweep with explicit OLLAMA_NUM_PARALLEL; separate server on :11435, same checkpoint and model store; project numbers from reports/gemma4_batch_benchmark_round2_*.json.",
+  "method": "N threads released by a barrier, streaming /api/chat, think=false, num_ctx=2048, num_predict=16/64, temperature=0; 2 rounds median.",
+  "configs": {
+    "1": {
+      "64": {
+        "rows": [
+          {
+            "concurrency": 1,
+            "median_aggregate_e2e_tok_s": 59.51,
+            "median_aggregate_decode_tok_s": 105.51,
+            "median_ttft_s": 0.5464,
+            "max_ttft_s": 0.5464,
+            "median_per_request_tok_s": 105.52
+          },
+          {
+            "concurrency": 4,
+            "median_aggregate_e2e_tok_s": 84.91,
+            "median_aggregate_decode_tok_s": 421.76,
+            "median_ttft_s": 1.7887,
+            "max_ttft_s": 2.4346,
+            "median_per_request_tok_s": 105.3
+          },
+          {
+            "concurrency": 16,
+            "median_aggregate_e2e_tok_s": 90.64,
+            "median_aggregate_decode_tok_s": 1678.87,
+            "median_ttft_s": 6.2644,
+            "max_ttft_s": 10.711,
+            "median_per_request_tok_s": 104.77
+          }
+        ],
+        "environment": {
+          "model": "gemma4:e2b",
+          "ollama_version": {
+            "version": "0.32.1"
+          },
+          "quantization": "Q4_K_M",
+          "parameter_size": "5.1B",
+          "context_length": 131072,
+          "prompt_tokens": 19,
+          "num_ctx": 2048,
+          "max_new_tokens": 64,
+          "gpu_state": "NVIDIA GeForce RTX 3060 Laptop GPU, 595.71, 1867 MHz, 78, 99.49 W, 3281 MiB",
+          "ollama_ps": "NAME    ID    SIZE    PROCESSOR    CONTEXT    UNTIL",
+          "ollama_num_parallel": "not exposed by the running service; OLLAMA_NUM_PARALLEL was not set in the unit file",
+          "note": "Ollama Q4_K_M system-level reference; not the same quantization or kernels as the project INT4 path"
+        }
+      }
+    },
+    "4": {
+      "64": {
+        "rows": [
+          {
+            "concurrency": 1,
+            "median_aggregate_e2e_tok_s": 62.21,
+            "median_aggregate_decode_tok_s": 107.96,
+            "median_ttft_s": 4.7158,
+            "max_ttft_s": 4.7158,
+            "median_per_request_tok_s": 107.15
+          },
+          {
+            "concurrency": 2,
+            "median_aggregate_e2e_tok_s": 101.42,
+            "median_aggregate_decode_tok_s": 169.59,
+            "median_ttft_s": 0.5792,
+            "max_ttft_s": 0.5792,
+            "median_per_request_tok_s": 84.91
+          },
+          {
+            "concurrency": 4,
+            "median_aggregate_e2e_tok_s": 143.11,
+            "median_aggregate_decode_tok_s": 213.72,
+            "median_ttft_s": 0.5689,
+            "max_ttft_s": 0.6117,
+            "median_per_request_tok_s": 52.31
+          },
+          {
+            "concurrency": 8,
+            "median_aggregate_e2e_tok_s": 159.77,
+            "median_aggregate_decode_tok_s": 427.5,
+            "median_ttft_s": 1.949,
+            "max_ttft_s": 2.0355,
+            "median_per_request_tok_s": 52.56
+          },
+          {
+            "concurrency": 16,
+            "median_aggregate_e2e_tok_s": 163.46,
+            "median_aggregate_decode_tok_s": 860.5,
+            "median_ttft_s": 3.7584,
+            "max_ttft_s": 5.2516,
+            "median_per_request_tok_s": 51.98
+          }
+        ],
+        "environment": {
+          "model": "gemma4:e2b",
+          "ollama_version": {
+            "version": "0.32.1"
+          },
+          "quantization": "Q4_K_M",
+          "parameter_size": "5.1B",
+          "context_length": 131072,
+          "prompt_tokens": 19,
+          "num_ctx": 2048,
+          "max_new_tokens": 64,
+          "gpu_state": "NVIDIA GeForce RTX 3060 Laptop GPU, 595.71, 1785 MHz, 71, 92.28 W, 3353 MiB",
+          "ollama_ps": "NAME    ID    SIZE    PROCESSOR    CONTEXT    UNTIL",
+          "ollama_num_parallel": "not exposed by the running service; OLLAMA_NUM_PARALLEL was not set in the unit file",
+          "note": "Ollama Q4_K_M system-level reference; not the same quantization or kernels as the project INT4 path"
+        }
+      }
+    },
+    "8": {
+      "64": {
+        "rows": [
+          {
+            "concurrency": 1,
+            "median_aggregate_e2e_tok_s": 62.52,
+            "median_aggregate_decode_tok_s": 105.44,
+            "median_ttft_s": 0.5804,
+            "max_ttft_s": 0.5804,
+            "median_per_request_tok_s": 105.46
+          },
+          {
+            "concurrency": 4,
+            "median_aggregate_e2e_tok_s": 140.01,
+            "median_aggregate_decode_tok_s": 214.26,
+            "median_ttft_s": 0.6606,
+            "max_ttft_s": 0.6982,
+            "median_per_request_tok_s": 52.65
+          },
+          {
+            "concurrency": 8,
+            "median_aggregate_e2e_tok_s": 172.99,
+            "median_aggregate_decode_tok_s": 237.66,
+            "median_ttft_s": 0.8512,
+            "max_ttft_s": 0.8623,
+            "median_per_request_tok_s": 29.42
+          },
+          {
+            "concurrency": 16,
+            "median_aggregate_e2e_tok_s": 179.39,
+            "median_aggregate_decode_tok_s": 482.63,
+            "median_ttft_s": 3.5157,
+            "max_ttft_s": 3.6772,
+            "median_per_request_tok_s": 29.14
+          }
+        ],
+        "environment": {
+          "model": "gemma4:e2b",
+          "ollama_version": {
+            "version": "0.32.1"
+          },
+          "quantization": "Q4_K_M",
+          "parameter_size": "5.1B",
+          "context_length": 131072,
+          "prompt_tokens": 19,
+          "num_ctx": 2048,
+          "max_new_tokens": 64,
+          "gpu_state": "NVIDIA GeForce RTX 3060 Laptop GPU, 595.71, 1747 MHz, 78, 70.34 W, 3451 MiB",
+          "ollama_ps": "NAME    ID    SIZE    PROCESSOR    CONTEXT    UNTIL",
+          "ollama_num_parallel": "not exposed by the running service; OLLAMA_NUM_PARALLEL was not set in the unit file",
+          "note": "Ollama Q4_K_M system-level reference; not the same quantization or kernels as the project INT4 path"
+        }
+      },
+      "16": {
+        "rows": [
+          {
+            "concurrency": 1,
+            "median_aggregate_e2e_tok_s": 27.09,
+            "median_aggregate_decode_tok_s": 102.51,
+            "median_ttft_s": 0.4707,
+            "max_ttft_s": 0.4707,
+            "median_per_request_tok_s": 102.47
+          },
+          {
+            "concurrency": 4,
+            "median_aggregate_e2e_tok_s": 70.57,
+            "median_aggregate_decode_tok_s": 210.15,
+            "median_ttft_s": 0.619,
+            "max_ttft_s": 0.6266,
+            "median_per_request_tok_s": 52.55
+          },
+          {
+            "concurrency": 8,
+            "median_aggregate_e2e_tok_s": 91.43,
+            "median_aggregate_decode_tok_s": 237.31,
+            "median_ttft_s": 0.8418,
+            "max_ttft_s": 0.8999,
+            "median_per_request_tok_s": 27.77
+          },
+          {
+            "concurrency": 16,
+            "median_aggregate_e2e_tok_s": 105.89,
+            "median_aggregate_decode_tok_s": 499.8,
+            "median_ttft_s": 1.9423,
+            "max_ttft_s": 2.0962,
+            "median_per_request_tok_s": 27.57
+          }
+        ],
+        "environment": {
+          "model": "gemma4:e2b",
+          "ollama_version": {
+            "version": "0.32.1"
+          },
+          "quantization": "Q4_K_M",
+          "parameter_size": "5.1B",
+          "context_length": 131072,
+          "prompt_tokens": 19,
+          "num_ctx": 2048,
+          "max_new_tokens": 16,
+          "gpu_state": "NVIDIA GeForce RTX 3060 Laptop GPU, 595.71, 1612 MHz, 72, 90.14 W, 3451 MiB",
+          "ollama_ps": "NAME    ID    SIZE    PROCESSOR    CONTEXT    UNTIL",
+          "ollama_num_parallel": "not exposed by the running service; OLLAMA_NUM_PARALLEL was not set in the unit file",
+          "note": "Ollama Q4_K_M system-level reference; not the same quantization or kernels as the project INT4 path"
+        }
+      }
+    }
+  },
+  "cross_check_ollama_bench": {
+    "config": "OLLAMA_NUM_PARALLEL=4, concurrency=16, 64 output",
+    "ok": "16/16",
+    "throughput_rps": 2.3,
+    "latency_p50_ms": 4841.9,
+    "ttft_p50_ms": 3664.8,
+    "output_tokens": 1024,
+    "wall_s": 6.935
+  }
+}

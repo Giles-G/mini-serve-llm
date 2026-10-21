@@ -1,0 +1,292 @@
+{
+  "generated_at": "2026-10-21 16:24:27",
+  "quick": false,
+  "P2_cache": {
+    "batch_parity_all_passed": true,
+    "batches": [
+      2,
+      4,
+      8,
+      16
+    ],
+    "batch_graph_keys": [
+      {
+        "batch": 2,
+        "graph_keys": [
+          [
+            2,
+            false
+          ]
+        ]
+      },
+      {
+        "batch": 4,
+        "graph_keys": [
+          [
+            2,
+            false
+          ],
+          [
+            2,
+            true
+          ],
+          [
+            3,
+            false
+          ],
+          [
+            4,
+            false
+          ],
+          [
+            4,
+            true
+          ]
+        ]
+      },
+      {
+        "batch": 8,
+        "graph_keys": [
+          [
+            2,
+            false
+          ],
+          [
+            2,
+            true
+          ],
+          [
+            3,
+            false
+          ],
+          [
+            4,
+            false
+          ],
+          [
+            4,
+            true
+          ],
+          [
+            5,
+            false
+          ],
+          [
+            6,
+            false
+          ],
+          [
+            7,
+            false
+          ],
+          [
+            8,
+            false
+          ],
+          [
+            8,
+            true
+          ]
+        ]
+      },
+      {
+        "batch": 16,
+        "graph_keys": [
+          [
+            2,
+            false
+          ],
+          [
+            2,
+            true
+          ],
+          [
+            3,
+            false
+          ],
+          [
+            4,
+            false
+          ],
+          [
+            4,
+            true
+          ],
+          [
+            5,
+            false
+          ],
+          [
+            6,
+            false
+          ],
+          [
+            7,
+            false
+          ],
+          [
+            8,
+            false
+          ],
+          [
+            8,
+            true
+          ],
+          [
+            9,
+            false
+          ],
+          [
+            10,
+            false
+          ],
+          [
+            11,
+            false
+          ],
+          [
+            12,
+            false
+          ],
+          [
+            13,
+            false
+          ],
+          [
+            14,
+            false
+          ],
+          [
+            15,
+            false
+          ],
+          [
+            16,
+            false
+          ],
+          [
+            16,
+            true
+          ]
+        ]
+      }
+    ],
+    "prefix_cache_hit_n4_64out": {
+      "batch": 4,
+      "output": 64,
+      "last_prefill_s": 0.009,
+      "wall_s": 0.681,
+      "e2e_tok_s": 376.1,
+      "per_request_tok_s": 93.8
+    }
+  },
+  "P3_memory": {
+    "vram": {
+      "n": 16,
+      "free_gib_after_startup": 0.646,
+      "batch_graphs": 19,
+      "frag_prepack_mb": 996
+    },
+    "prefill": {
+      "2048": {
+        "prefill_s": 0.808,
+        "prefill_tok_s": 2535.9,
+        "peak_alloc_gib": 2.7,
+        "free_after_gib": 1.94
+      },
+      "4096": {
+        "prefill_s": 1.646,
+        "prefill_tok_s": 2488.7,
+        "peak_alloc_gib": 3.02,
+        "free_after_gib": 1.7
+      }
+    },
+    "kv_dtype": "fp16",
+    "weight_format": "INT4 group64"
+  },
+  "P4_cuda": {
+    "server_tests_passed": 75,
+    "kernel_tests_passed": 688
+  },
+  "P5_graph": {
+    "graph_replay_parity": true,
+    "short_and_long_graphs": true
+  },
+  "runs": [
+    {
+      "cmd": [
+        "/home/giles/work/mini-serve-llm/venv/bin/python3",
+        "-m",
+        "pytest",
+        "tests",
+        "-q",
+        "--ignore=tests/test_gemma4_mlx.py"
+      ],
+      "cwd": "/home/giles/work/mini-serve-llm",
+      "returncode": 0,
+      "seconds": 5.7,
+      "tail": "........................................................................ [ 96%]\n...                                                                      [100%]\n75 passed in 3.85s\n"
+    },
+    {
+      "cmd": [
+        "/home/giles/work/mini-serve-llm/venv/bin/python3",
+        "-m",
+        "pytest",
+        "tests",
+        "-q"
+      ],
+      "cwd": "/home/giles/work/mini-llm-kernels",
+      "returncode": 0,
+      "seconds": 8.4,
+      "tail": "........................................................................ [ 10%]\n........................................................................ [ 20%]\n........................................................................ [ 31%]\n........................................................................ [ 41%]\n........................................................................ [ 52%]\n........................................................................ [ 62%]\n........................................................................ [ 73%]\n........................................................................ [ 83%]\n........................................................................ [ 94%]\n........................................                                 [100%]\n688 passed in 7.24s\n"
+    },
+    {
+      "cmd": [
+        "/home/giles/work/mini-serve-llm/venv/bin/python3",
+        "scripts/check_gemma4_batch_decode.py"
+      ],
+      "cwd": "/home/giles/work/mini-serve-llm",
+      "returncode": 0,
+      "seconds": 60.3,
+      "tail": "gemma4 graph] captured batch=3 long=False for batch decode\n[gemma4 graph] captured batch=4 long=False for batch decode\n[gemma4 graph] captured batch=4 long=True for batch decode\n[gemma4 graph] captured batch=5 long=False for batch decode\n[gemma4 graph] captured batch=6 long=False for batch decode\n[gemma4 graph] captured batch=7 long=False for batch decode\n[gemma4 graph] captured batch=8 long=False for batch decode\n[gemma4 graph] captured batch=8 long=True for batch decode\n[gemma4 graph] captured batch=9 long=False for batch decode\n[gemma4 graph] captured batch=10 long=False for batch decode\n[gemma4 graph] captured batch=11 long=False for batch decode\n[gemma4 graph] captured batch=12 long=False for batch decode\n[gemma4 graph] captured batch=13 long=False for batch decode\n[gemma4 graph] captured batch=14 long=False for batch decode\n[gemma4 graph] captured batch=15 long=False for batch decode\n[gemma4 graph] captured batch=16 long=False for batch decode\n[gemma4 graph] captured batch=16 long=True for batch decode\n{\"batch\": 16, \"match\": [true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true], \"batch_ids\": [[1408, 132182, 47910, 568, 3503, 236772, 3135, 47910], [1018, 203330, 61639, 237221, 82839, 94028, 237214, 59013], [1408, 669, 48573, 529, 496, 132182, 47910, 528], [236832, 236778, 106], [1408, 132182, 47910, 568, 3503, 236772, 3135, 47910], [1018, 203330, 61639, 237221, 82839, 94028, 237214, 59013], [1408, 669, 48573, 529, 496, 132182, 47910, 528], [236832, 236778, 106], [1408, 132182, 47910, 568, 3503, 236772, 3135, 47910], [1018, 203330, 61639, 237221, 82839, 94028, 237214, 59013], [1408, 669, 48573, 529, 496, 132182, 47910, 528], [236832, 236778, 106], [1408, 132182, 47910, 568, 3503, 236772, 3135, 47910], [1018, 203330, 61639, 237221, 82839, 94028, 237214, 59013], [1408, 669, 48573, 529, 496, 132182, 47910, 528], [236832, 236778, 106]], \"eager_ids\": [[1408, 132182, 47910, 568, 3503, 236772, 3135, 47910], [1018, 203330, 61639, 237221, 82839, 94028, 237214, 59013], [1408, 669, 48573, 529, 496, 132182, 47910, 528], [236832, 236778, 106], [1408, 132182, 47910, 568, 3503, 236772, 3135, 47910], [1018, 203330, 61639, 237221, 82839, 94028, 237214, 59013], [1408, 669, 48573, 529, 496, 132182, 47910, 528], [236832, 236778, 106], [1408, 132182, 47910, 568, 3503, 236772, 3135, 47910], [1018, 203330, 61639, 237221, 82839, 94028, 237214, 59013], [1408, 669, 48573, 529, 496, 132182, 47910, 528], [236832, 236778, 106], [1408, 132182, 47910, 568, 3503, 236772, 3135, 47910], [1018, 203330, 61639, 237221, 82839, 94028, 237214, 59013], [1408, 669, 48573, 529, 496, 132182, 47910, 528], [236832, 236778, 106]], \"batch_graphs\": [[2, false], [2, true], [3, false], [4, false], [4, true], [5, false], [6, false], [7, false], [8, false], [8, true], [9, false], [10, false], [11, false], [12, false], [13, false], [14, false], [15, false], [16, false], [16, true]]}\nsaved /home/giles/work/mini-serve-llm/reports/gemma4_batch_parity.json\n"
+    },
+    {
+      "cmd": [
+        "/home/giles/work/mini-serve-llm/venv/bin/python3",
+        "scripts/bench_gemma4_prefill.py",
+        "--sizes",
+        "2048",
+        "4096",
+        "--gemm-min-rows",
+        "8",
+        "--gemv-min-rows",
+        "100000"
+      ],
+      "cwd": "/home/giles/work/mini-serve-llm",
+      "returncode": 0,
+      "seconds": 81.2,
+      "tail": "[gemma4 graph] captured blocks=19 context_lens=1 long=False splitk=False\n[gemma4 graph] captured blocks=19 context_lens=1025 long=True splitk=True\n[gemma4 graph] captured blocks=19 context_lens=1 long=False splitk=False\n[gemma4 graph] captured blocks=19 context_lens=1025 long=True splitk=True\n{\"prompt_tokens\": 2048, \"gemm\": {\"prompt_tokens\": 2048, \"prefill_s\": 0.808, \"prefill_tok_s\": 2535.9, \"peak_alloc_gib\": 2.7, \"incremental_peak_gib\": 0.32, \"free_after_gib\": 1.94, \"generated_tokens\": 1, \"finish_reason\": \"MAX_NEW_TOKENS\"}, \"gemv\": {\"prompt_tokens\": 2048, \"prefill_s\": 8.998, \"prefill_tok_s\": 227.6, \"peak_alloc_gib\": 2.66, \"incremental_peak_gib\": 0.28, \"free_after_gib\": 2.09, \"generated_tokens\": 1, \"finish_reason\": \"MAX_NEW_TOKENS\"}, \"prefill_speedup\": 11.14}\n[gemma4 graph] captured blocks=35 context_lens=1 long=False splitk=False\n[gemma4 graph] captured blocks=35 context_lens=1025 long=True splitk=True\n[gemma4 graph] captured blocks=35 context_lens=1 long=False splitk=False\n[gemma4 graph] captured blocks=35 context_lens=1025 long=True splitk=True\n{\"prompt_tokens\": 4096, \"gemm\": {\"prompt_tokens\": 4096, \"prefill_s\": 1.646, \"prefill_tok_s\": 2488.7, \"peak_alloc_gib\": 3.02, \"incremental_peak_gib\": 0.61, \"free_after_gib\": 1.7, \"generated_tokens\": 1, \"finish_reason\": \"MAX_NEW_TOKENS\"}, \"gemv\": {\"prompt_tokens\": 4096, \"prefill_s\": 18.438, \"prefill_tok_s\": 222.2, \"peak_alloc_gib\": 2.99, \"incremental_peak_gib\": 0.58, \"free_after_gib\": 1.71, \"generated_tokens\": 1, \"finish_reason\": \"MAX_NEW_TOKENS\"}, \"prefill_speedup\": 11.2}\nsaved /home/giles/work/mini-serve-llm/reports/gemma4_e_prefill.json\n"
+    },
+    {
+      "cmd": [
+        "/home/giles/work/mini-serve-llm/venv/bin/python3",
+        "scripts/bench_gemma4_batch.py",
+        "--batch-sizes",
+        "4",
+        "--max-new-tokens",
+        "64",
+        "--output-json",
+        "/home/giles/work/mini-serve-llm/reports/gemma4_prefix_cache_bench.json"
+      ],
+      "cwd": "/home/giles/work/mini-serve-llm",
+      "returncode": 0,
+      "seconds": 71.9,
+      "tail": " 237433, 72375, 236951, 53208, 45398, 56762, 37557, 26609, 237214, 237103, 236900, 28861, 1018, 74999, 237295, 94307, 25352, 23967, 1018, 237221, 238270, 239953, 237189, 239275, 237798, 237800, 30121, 130699, 65988, 237214, 94732, 42033, 54003, 16472, 236924, 238010, 181635, 237075]]}\n[gemma4 graph] captured blocks=12 context_lens=1 long=False splitk=False\n[gemma4 graph] captured blocks=12 context_lens=1025 long=True splitk=True\n[gemma4 graph] captured batch=2 long=False for batch decode\n[gemma4 graph] captured batch=2 long=True for batch decode\n[gemma4 graph] captured batch=3 long=False for batch decode\n[gemma4 graph] captured batch=4 long=False for batch decode\n[gemma4 graph] captured batch=4 long=True for batch decode\n{\"batch\": 4, \"mode\": \"batched_graph\", \"batch_graphs\": [[2, false], [2, true], [3, false], [4, false], [4, true]], \"wall_s\": 0.681, \"last_prefill_s\": 0.009, \"aggregate_e2e_tok_s\": 376.1, \"decode_s\": 0.672, \"decode_tokens\": 252, \"aggregate_tok_s\": 375.2, \"per_request_tok_s\": 93.8, \"generated\": [64, 64, 64, 64], \"ids\": [[1408, 132182, 47910, 568, 3503, 236772, 3135, 47910, 236768, 236743, 235491, 237184, 24654, 237658, 18979, 70945, 108, 57137, 47910, 32002, 237075, 5213, 86313, 228546, 1018, 237221, 237433, 72375, 236951, 53208, 45398, 56762, 37557, 26609, 237214, 237103, 236900, 28861, 1018, 74999, 237295, 94307, 25352, 23967, 1018, 237221, 238270, 239953, 237189, 239275, 237798, 237800, 30121, 130699, 65988, 237214, 94732, 42033, 54003, 16472, 236924, 238010, 181635, 237075], [1408, 132182, 47910, 568, 3503, 236772, 3135, 47910, 236768, 236743, 235491, 237184, 24654, 237658, 18979, 70945, 108, 57137, 47910, 32002, 237075, 5213, 86313, 228546, 1018, 237221, 237433, 72375, 236951, 53208, 45398, 56762, 37557, 26609, 237214, 237103, 236900, 28861, 1018, 74999, 237295, 94307, 25352, 23967, 1018, 237221, 238270, 239953, 237189, 239275, 237798, 237800, 30121, 130699, 65988, 237214, 94732, 42033, 54003, 16472, 236924, 238010, 181635, 237075], [1408, 132182, 47910, 568, 3503, 236772, 3135, 47910, 236768, 236743, 235491, 237184, 24654, 237658, 18979, 70945, 108, 57137, 47910, 32002, 237075, 5213, 86313, 228546, 1018, 237221, 237433, 72375, 236951, 53208, 45398, 56762, 37557, 26609, 237214, 237103, 236900, 28861, 1018, 74999, 237295, 94307, 25352, 23967, 1018, 237221, 238270, 239953, 237189, 239275, 237798, 237800, 30121, 130699, 65988, 237214, 94732, 42033, 54003, 16472, 236924, 238010, 181635, 237075], [1408, 132182, 47910, 568, 3503, 236772, 3135, 47910, 236768, 236743, 235491, 237184, 24654, 237658, 18979, 70945, 108, 57137, 47910, 32002, 237075, 5213, 86313, 228546, 1018, 237221, 237433, 72375, 236951, 53208, 45398, 56762, 37557, 26609, 237214, 237103, 236900, 28861, 1018, 74999, 237295, 94307, 25352, 23967, 1018, 237221, 238270, 239953, 237189, 239275, 237798, 237800, 30121, 130699, 65988, 237214, 94732, 42033, 54003, 16472, 236924, 238010, 181635, 237075]]}\nsaved /home/giles/work/mini-serve-llm/reports/gemma4_prefix_cache_bench.json\n"
+    }
+  ],
+  "artifacts": [
+    "/home/giles/work/mini-serve-llm/reports/gemma4_batch_parity.json",
+    "/home/giles/work/mini-serve-llm/reports/gemma4_e_prefill.json",
+    "/home/giles/work/mini-serve-llm/reports/gemma4_batch_final_verification.json"
+  ]
+}

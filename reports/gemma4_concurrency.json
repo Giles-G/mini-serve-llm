@@ -1,0 +1,86 @@
+{
+  "device": "NVIDIA GeForce RTX 3060 Laptop GPU",
+  "note": "batch=2; large prefills are serialized by the scheduler token budget",
+  "results": [
+    {
+      "name": "4k_plus_short",
+      "prompt_tokens": [
+        4096,
+        17
+      ],
+      "elapsed_s": 3.4,
+      "peak_alloc_gib": 3.29,
+      "incremental_gib": 0.81,
+      "free_gib": 1.36,
+      "graph_mode": false,
+      "paged_attention": true,
+      "requests": [
+        {
+          "generated_tokens": 2,
+          "finish_reason": "MAX_NEW_TOKENS",
+          "ids": [
+            33390,
+            57137
+          ]
+        },
+        {
+          "generated_tokens": 8,
+          "finish_reason": "MAX_NEW_TOKENS",
+          "ids": [
+            1018,
+            57137,
+            47910,
+            236743,
+            59013,
+            28861,
+            237075,
+            237295
+          ]
+        }
+      ]
+    },
+    {
+      "name": "two_4k",
+      "prompt_tokens": [
+        4096,
+        4096
+      ],
+      "elapsed_s": 5.47,
+      "peak_alloc_gib": 3.36,
+      "incremental_gib": 0.87,
+      "free_gib": 1.2,
+      "graph_mode": false,
+      "paged_attention": true,
+      "requests": [
+        {
+          "generated_tokens": 8,
+          "finish_reason": "MAX_NEW_TOKENS",
+          "ids": [
+            33390,
+            57137,
+            47910,
+            92207,
+            237206,
+            18979,
+            70945,
+            236924
+          ]
+        },
+        {
+          "generated_tokens": 8,
+          "finish_reason": "MAX_NEW_TOKENS",
+          "ids": [
+            33390,
+            57137,
+            47910,
+            92207,
+            237206,
+            18979,
+            70945,
+            236924
+          ]
+        }
+      ]
+    }
+  ]
+}

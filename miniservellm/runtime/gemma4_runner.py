@@ -33,8 +33,30 @@ SLIDING = "sliding_attention"
 FULL = "full_attention"
 
 
+_FUSED_RMS_NORM = getattr(torch.nn.functional, "rms_norm", None)
+
+
 def _rms_norm(x: torch.Tensor, weight: Optional[torch.Tensor], eps: float) -> torch.Tensor:
-    """Official Gemma4RMSNorm: fp32 compute, optional scale, cast back."""
+    """Official Gemma4RMSNorm: fp32 compute, optional scale, cast back.
+
+    On CUDA, PyTorch's fused RMSNorm kernel replaces the eager formula's
+    ``float -> pow -> mean -> add -> rsqrt -> mul -> to`` launch chain with one
+    kernel for the affine (weighted) norms. On the RTX 3060 this cut batch=1
+    engine decode from 79.7 to 59.7 ms/token with INT4 legacy, and from 72.2 to
+    43.4 ms/token with the warp INT4 kernel; the generated 128-token text was
+    identical. Weightless norms (``v_norm``) keep the eager formula: fusing them
+    shifts one greedy choice, and saving 35 launches is not worth that.
+
+    MPS/CPU keep the eager formula so the reference path stays unchanged.
+    """
+    if (
+        _FUSED_RMS_NORM is not None
+        and x.is_cuda
+        and x.dtype in (torch.float16, torch.bfloat16)
+        and weight is not None
+        and weight.dtype == x.dtype
+    ):
+        return _FUSED_RMS_NORM(x, (x.shape[-1],), weight, eps)
     x32 = x.float()
     normed = x32 * torch.pow(x32.pow(2).mean(-1, keepdim=True) + eps, -0.5)
     if weight is not None:
@@ -134,6 +156,28 @@ class Gemma4EagerTextRunner:
         # forward), keeping q/k in the model dtype.
         cos = cos.to(x.dtype)
         sin = sin.to(x.dtype)
+        if x.is_cuda and x.dtype == torch.float16:
+            # The fused kernel performs the same two FP16 rounding steps as
+            # mul + addcmul in a single launch. Fall back to the eager form
+            # when the extension or shape is unavailable.
+            try:
+                from mini_llm_kernels._C import gemma4_rope_fused
+
+                if x.is_contiguous() and cos.is_contiguous() and sin.is_contiguous():
+                    return gemma4_rope_fused(x, cos, sin)
+            except (ImportError, RuntimeError, ValueError):
+                pass
+            # fuse the two product/add pairs into two in-place addcmul calls
+            # and avoid _rotate_half's cat+neg temporaries. On the RTX 3060
+            # this was ~3-4% faster than the five-kernel form and kept the
+            # 128-token greedy output identical. BF16 keeps the eager form:
+            # addcmul's BF16 rounding differed by up to one BF16 ulp in the
+            # 512-wide head, and FP16 is the 3060 target.
+            out = x * cos[:, None, :]
+            half = x.shape[-1] // 2
+            out[..., :half].addcmul_(x[..., half:], sin[:, None, :half], value=-1.0)
+            out[..., half:].addcmul_(x[..., :half], sin[:, None, half:], value=1.0)
+            return out
         return x * cos[:, None, :] + _rotate_half(x) * sin[:, None, :]
 
     def _mask(self, attention_type: str, seq_len: int, dtype: torch.dtype) -> torch.Tensor:
@@ -189,6 +233,10 @@ class Gemma4EagerTextRunner:
         up = h @ lw.up_proj.t()
         return (gate * up) @ lw.down_proj.t()
 
+    def _linear(self, weight, x: torch.Tensor) -> torch.Tensor:
+        """Projection hook; engine overrides it with a prefill GEMM path."""
+        return x @ weight.t()
+
     def _ple(self, input_ids: torch.Tensor, inputs_embeds: torch.Tensor) -> torch.Tensor:
         """PLE = (context projection + token identity) * 1/sqrt(2)."""
         w = self.w
@@ -196,7 +244,7 @@ class Gemma4EagerTextRunner:
         num_layers = self.config.num_hidden_layers
         identity = w.embed_tokens_per_layer[input_ids] * float(ple_dim) ** 0.5
         identity = identity.view(input_ids.shape[0], num_layers, ple_dim)
-        ctx = (inputs_embeds @ w.per_layer_model_projection.t()) * float(self.config.hidden_size) ** -0.5
+        ctx = self._linear(w.per_layer_model_projection, inputs_embeds) * float(self.config.hidden_size) ** -0.5
         ctx = ctx.view(input_ids.shape[0], num_layers, ple_dim)
         ctx = _rms_norm(ctx, w.per_layer_projection_norm, self.eps)
         return (ctx + identity) * (2.0 ** -0.5)

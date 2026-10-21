@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Protocol
+from typing import Dict, List, Optional, Protocol
 
 import torch
 
@@ -22,6 +22,7 @@ class PrefillModelOutput:
 @dataclass
 class DecodeModelOutput:
     logits_by_request: Dict[str, torch.Tensor]
+    batch_logits: Optional[torch.Tensor] = None
 
 
 class ModelRunner(Protocol):

@@ -1,0 +1,61 @@
+{
+  "load_s": 41.46,
+  "device": "NVIDIA GeForce RTX 3060 Laptop GPU",
+  "cases": [
+    {
+      "target_tokens": 1024,
+      "prompt_tokens": 1024,
+      "eager_tokens": 16,
+      "engine": {
+        "prompt_tokens": 1024,
+        "max_new_tokens": 16,
+        "generated_tokens": 16,
+        "finish_reason": "MAX_NEW_TOKENS",
+        "prefill_s": 0.473,
+        "elapsed_s": 0.615,
+        "graph_mode": true,
+        "peak_alloc_gib": 2.59,
+        "vram_free_after_gib": 2.07
+      },
+      "ids_match_eager": true,
+      "first_divergence": null
+    },
+    {
+      "target_tokens": 2048,
+      "prompt_tokens": 2048,
+      "eager_tokens": 16,
+      "engine": {
+        "prompt_tokens": 2048,
+        "max_new_tokens": 16,
+        "generated_tokens": 16,
+        "finish_reason": "MAX_NEW_TOKENS",
+        "prefill_s": 1.011,
+        "elapsed_s": 1.156,
+        "graph_mode": true,
+        "peak_alloc_gib": 2.79,
+        "vram_free_after_gib": 1.9
+      },
+      "ids_match_eager": true,
+      "first_divergence": null
+    },
+    {
+      "target_tokens": 4096,
+      "prompt_tokens": 4096,
+      "eager_tokens": 8,
+      "engine": {
+        "prompt_tokens": 4096,
+        "max_new_tokens": 8,
+        "generated_tokens": 8,
+        "finish_reason": "MAX_NEW_TOKENS",
+        "prefill_s": 2.427,
+        "elapsed_s": 2.499,
+        "graph_mode": true,
+        "peak_alloc_gib": 3.21,
+        "vram_free_after_gib": 1.35
+      },
+      "ids_match_eager": true,
+      "first_divergence": null
+    }
+  ],
+  "all_passed": true
+}

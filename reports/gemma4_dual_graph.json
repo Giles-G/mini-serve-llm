@@ -1,0 +1,66 @@
+{
+  "graphs": [
+    "False",
+    "True"
+  ],
+  "long": {
+    "generated_tokens": 2,
+    "prefill_s": 1.239,
+    "elapsed_s": 1.249,
+    "decode_ms": 10.71,
+    "ids": [
+      47910,
+      92207
+    ]
+  },
+  "short_first_after_long": {
+    "generated_tokens": 16,
+    "prefill_s": 0.08,
+    "elapsed_s": 0.183,
+    "decode_ms": 6.86,
+    "ids": [
+      1018,
+      57137,
+      47910,
+      236743,
+      59013,
+      28861,
+      237075,
+      237295,
+      94307,
+      26609,
+      237221,
+      237433,
+      92474,
+      237214,
+      237103,
+      236900
+    ]
+  },
+  "short_second": {
+    "generated_tokens": 16,
+    "prefill_s": 0.06,
+    "elapsed_s": 0.162,
+    "decode_ms": 6.84,
+    "ids": [
+      1018,
+      57137,
+      47910,
+      236743,
+      59013,
+      28861,
+      237075,
+      237295,
+      94307,
+      26609,
+      237221,
+      237433,
+      92474,
+      237214,
+      237103,
+      236900
+    ]
+  },
+  "vram_free_gib": 1.85,
+  "short_stable": true
+}

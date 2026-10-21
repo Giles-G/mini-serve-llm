@@ -78,6 +78,9 @@ class Gemma4PagedKVCacheManager:
         # Virtual block accounting (same math as the paged manager).
         self.free_block_ids: List[int] = list(range(n_blocks))
         self.req_block_tables: Dict[str, List[int]] = {}
+        # Per-request block-table tensors are stable for a fixed table length;
+        # reuse them instead of rebuilding a CUDA tensor on every decode step.
+        self._block_table_tensors: Dict[str, Tuple[int, torch.Tensor]] = {}
         # Single-entry memo for gather indices: within one forward the 15
         # non-shared layers query the same (rid, upto) sequentially.
         self._index_memo: Optional[Tuple[str, int, torch.Tensor, torch.Tensor]] = None
@@ -170,11 +173,16 @@ class Gemma4PagedKVCacheManager:
     def block_table_tensor(self, req: Request) -> torch.Tensor:
         """Return a CUDA-friendly int32 block table for one request."""
         table = self.req_block_tables.get(req.request_id, req.block_table)
-        return torch.tensor(
+        cached = self._block_table_tensors.get(req.request_id)
+        if cached is not None and cached[0] == len(table):
+            return cached[1]
+        tensor = torch.tensor(
             table,
             device=self.engine_config.device,
             dtype=torch.int32,
         )
+        self._block_table_tensors[req.request_id] = (len(table), tensor)
+        return tensor
 
     def gather_kv_for_request(
         self,
@@ -220,6 +228,7 @@ class Gemma4PagedKVCacheManager:
         return block_ids, offsets
 
     def free_request(self, req: Request) -> None:
+        self._block_table_tensors.pop(req.request_id, None)
         table = self.req_block_tables.pop(req.request_id, req.block_table)
         for block_id in table:
             self.free_block_ids.append(block_id)

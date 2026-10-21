@@ -1,0 +1,135 @@
+{
+  "tests": {
+    "server": 75,
+    "kernels": 688
+  },
+  "parity": {
+    "all_passed": true,
+    "batches": [
+      2,
+      4,
+      8,
+      16
+    ]
+  },
+  "batch_throughput": {
+    "16": [
+      {
+        "batch": 4,
+        "e2e_tok_s": 216.2,
+        "decode_tok_s": 369.9,
+        "per_request_decode_tok_s": 92.5,
+        "last_prefill_s": 0.134
+      },
+      {
+        "batch": 8,
+        "e2e_tok_s": 295.7,
+        "decode_tok_s": 706.4,
+        "per_request_decode_tok_s": 88.3,
+        "last_prefill_s": 0.263
+      },
+      {
+        "batch": 16,
+        "e2e_tok_s": 417.8,
+        "decode_tok_s": 1613.9,
+        "per_request_decode_tok_s": 100.9,
+        "last_prefill_s": 0.46
+      }
+    ],
+    "64": [
+      {
+        "batch": 4,
+        "e2e_tok_s": 310.3,
+        "decode_tok_s": 364.6,
+        "per_request_decode_tok_s": 91.2,
+        "last_prefill_s": 0.134
+      },
+      {
+        "batch": 8,
+        "e2e_tok_s": 533.9,
+        "decode_tok_s": 704.2,
+        "per_request_decode_tok_s": 88.0,
+        "last_prefill_s": 0.243
+      },
+      {
+        "batch": 16,
+        "e2e_tok_s": 941.5,
+        "decode_tok_s": 1616.9,
+        "per_request_decode_tok_s": 101.1,
+        "last_prefill_s": 0.45
+      }
+    ]
+  },
+  "long_context": {
+    "n": 2,
+    "context": 4096,
+    "splitk_decode_tok_s": 117.2,
+    "warpsplit_decode_tok_s": 95.7,
+    "token_ids_match": true
+  },
+  "vram": {
+    "n": 16,
+    "free_gib_after_startup": 0.646,
+    "batch_graphs": 19,
+    "frag_prepack_mb": 996
+  },
+  "notes": [
+    "N=4 remains pair_batch; WMMA M=16 padding makes 3-4x unrealistic",
+    "no GitHub push"
+  ],
+  "per_request_note": "N=16 per-request is 101 tok/s after fragment-major direct-B prepack for all large linears, 8-warp frag for lm_head/wide gateup, global-A frag for pl_proj, and L2::128B loads. Single request remains ~147.6 tok/s, so the ratio is ~68.5%, not the 85-90% target. Free VRAM ~0.646 GiB.",
+  "prefill": {
+    "2048_s": 0.817,
+    "4096_s": 1.647,
+    "2048_before_s": 0.967,
+    "4096_before_s": 2.308,
+    "window_slice": true,
+    "flash": true,
+    "parity_2k_4k": true,
+    "chunked_parity": true,
+    "flash_min_tokens": 256
+  },
+  "prefix_cache": {
+    "enabled": true,
+    "max_tokens": 64,
+    "entries": 8,
+    "max_bytes": 67108864,
+    "n16_16out": {
+      "cold_ttft_s": 0.466,
+      "hit_ttft_s": 0.037,
+      "cold_e2e": 395.5,
+      "hit_e2e": 1426.6,
+      "ids_match": true
+    },
+    "n16_64out": {
+      "hit_ttft_s": 0.037,
+      "cold_e2e": 941.5,
+      "hit_e2e": 1551.8
+    },
+    "n4_64out": {
+      "hit_ttft_s": 0.009,
+      "cold_e2e": 310.3,
+      "hit_e2e": 376.5
+    },
+    "n8_64out": {
+      "hit_ttft_s": 0.018,
+      "cold_e2e": 533.9,
+      "hit_e2e": 712.3
+    }
+  },
+  "flash_attention": {
+    "status": "landed_prefill",
+    "dims": [
+      256,
+      512
+    ],
+    "gqa": true,
+    "sliding": true,
+    "verified": {
+      "2k_tokens": true,
+      "4k_tokens": true,
+      "chunk64": true,
+      "batch_2_4_8_16": true
+    }
+  }
+}

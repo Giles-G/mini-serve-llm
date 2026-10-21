@@ -19,7 +19,10 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import gc
+from itertools import chain
 import json
+import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -98,6 +101,28 @@ def _cuda_time(fn, warmup: int, iters: int) -> float:
     ended.record()
     ended.synchronize()
     return started.elapsed_time(ended) / iters
+
+
+def _median(values):
+    ordered = sorted(values)
+    return ordered[len(ordered) // 2]
+
+
+def _logical_weight_bytes(n: int, k: int) -> int:
+    """Packed INT4 weight bytes + FP16 group scales (gs=64)."""
+    return n * k // 2 + 2 * n * k // 64
+
+
+def _gpu_state() -> str:
+    try:
+        return subprocess.run(
+            ["nvidia-smi",
+             "--query-gpu=name,driver_version,clocks.sm,temperature.gpu,power.draw,memory.used",
+             "--format=csv,noheader"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+    except Exception as exc:  # noqa: BLE001
+        return f"unavailable: {exc}"
 
 
 def _format_error(reference: torch.Tensor, actual: torch.Tensor) -> tuple[float, float]:
@@ -220,6 +245,7 @@ def _error_report(expected, actual, allowance):
         "max_relative": float((safe_diff / expected.abs().clamp_min(1e-12)).max()),
         "failed_elements": int(failed.sum()),
         "elements": failed.numel(),
+        "failure_ratio": float(failed.sum()) / max(1, failed.numel()),
         "worst": {"row": row, "column": col, "expected": float(expected[row, col]),
                   "actual": float(actual[row, col]), "allowance": float(allowance[row, col])},
         "worst_over_budget": {
@@ -255,6 +281,11 @@ def _check_parity(x, packed, scales, reference, fused, *, chunk_rows=256):
         "fused_vs_exact": fused_report,
         "fallback_vs_rounded": fallback_report,
         "cpu_fp64_reference": cpu_report,
+        "reference_contracts": {
+            "exact": "dequantized weight, FP32 matmul, TF32 disabled",
+            "rounded": "weight rounded to activation dtype, FP32 matmul, TF32 disabled",
+        },
+        "tf32_disabled": True,
         "reference_operations": operations,
         "reference_gamma": gamma,
         "weight_rounding_max_abs": float((exact - rounded).abs().max()),
@@ -290,7 +321,7 @@ def _synthetic_cases(args, device: torch.device) -> Iterable[tuple]:
         ("gate_proj", 4096, 1536),
         ("up_proj", 4096, 1536),
         ("down_proj", 1536, 4096),
-        ("per_layer_projection", 8960, 1536),
+        ("per_layer_model_projection", 8960, 1536),
         ("lm_head", 262144, 1536),
     ]
     for seed in args.seeds:
@@ -301,6 +332,97 @@ def _synthetic_cases(args, device: torch.device) -> Iterable[tuple]:
                 f"{name}.seed{seed}", n, k, args.tokens, args.group_size,
                 device, args.dtype, seed,
             )
+
+
+def _edge_cases(args, device: torch.device) -> Iterable[tuple]:
+    """Deterministic edge inputs that the shape-only suite does not cover."""
+    for seed in args.seeds:
+        generator = torch.Generator(device="cpu").manual_seed(seed + 7)
+
+        def emit(label, n, k, tokens, x, q, scales):
+            packed = _pack_int4(q).to(device)
+            yield (
+                f"{label}.seed{seed}",
+                x.to(device=device, dtype=args.dtype),
+                packed,
+                scales.to(device=device, dtype=torch.float16),
+            )
+
+        n, k = 6, 64
+        q = torch.randint(-8, 8, (n, k), generator=generator, dtype=torch.int8)
+        yield from emit(
+            "edge.zero_input", n, k, 1,
+            torch.zeros(1, k),
+            q,
+            torch.full((n, k // 64), 0.05),
+        )
+
+        n, k = 130, 128
+        q = torch.full((n, k), 7, dtype=torch.int8)
+        x = torch.empty(1, k)
+        x[:, 0::2] = 1.0
+        x[:, 1::2] = -1.0
+        yield from emit(
+            "edge.cancellation", n, k, 1, x, q,
+            torch.full((n, k // 64), 0.125),
+        )
+
+        n, k = 6, 256
+        q = torch.randint(-8, 8, (n, k), generator=generator, dtype=torch.int8)
+        yield from emit(
+            "edge.large_input", n, k, 1,
+            torch.randn(1, k, generator=generator) * 100.0,
+            q,
+            torch.full((n, k // 64), 0.05),
+        )
+
+        n, k = 6, 256
+        q = torch.randint(-8, 8, (n, k), generator=generator, dtype=torch.int8)
+        yield from emit(
+            "edge.small_input", n, k, 19,
+            torch.randn(19, k, generator=generator) * 1e-4,
+            q,
+            torch.full((n, k // 64), 1e-3),
+        )
+
+        n, k = 130, 1536
+        q = torch.randint(-8, 8, (n, k), generator=generator, dtype=torch.int8)
+        mixed = torch.empty(n, k // 64)
+        mixed[:, 0::2] = 1e-4
+        mixed[:, 1::2] = 0.1
+        yield from emit(
+            "edge.mixed_scales", n, k, 2,
+            torch.randn(2, k, generator=generator),
+            q,
+            mixed,
+        )
+
+        n, k = 2, 64
+        q = torch.randint(-8, 8, (n, k), generator=generator, dtype=torch.int8)
+        yield from emit(
+            "edge.n_tail_2", n, k, 1,
+            torch.randn(1, k, generator=generator),
+            q,
+            torch.full((n, k // 64), 0.07),
+        )
+
+        n, k = 6, 128
+        q = torch.randint(-8, 8, (n, k), generator=generator, dtype=torch.int8)
+        yield from emit(
+            "edge.k_128", n, k, 19,
+            torch.randn(19, k, generator=generator),
+            q,
+            torch.full((n, k // 64), 0.03),
+        )
+
+        n, k = 258, 1536
+        q = torch.randint(-8, 8, (n, k), generator=generator, dtype=torch.int8)
+        yield from emit(
+            "edge.n_tail_258", n, k, 1,
+            torch.randn(1, k, generator=generator),
+            q,
+            torch.full((n, k // 64), 0.02),
+        )
 
 
 def _real_cases(args, device: torch.device) -> Iterable[tuple]:
@@ -338,10 +460,13 @@ def _real_cases(args, device: torch.device) -> Iterable[tuple]:
     )
     print(f"real INT4 weights loaded in {time.perf_counter() - started:.1f}s")
 
-    seen = 0
     for seed in args.seeds:
+        # --limit is per seed so a multi-seed run covers the same projection
+        # set for every activation seed instead of spending the budget on the
+        # first seed only.
+        seen = 0
         generator = torch.Generator(device="cpu").manual_seed(seed)
-        if not args.skip_lm_head:
+        if not args.skip_lm_head and (not args.limit or seen < args.limit):
             weight = weights.lm_head
             yield (
                 f"lm_head.seed{seed}",
@@ -353,11 +478,22 @@ def _real_cases(args, device: torch.device) -> Iterable[tuple]:
                 weight.packed, weight.scales,
             )
             seen += 1
-            if args.limit and seen >= args.limit:
-                del weights
-                gc.collect()
-                return
+        if not args.limit or seen < args.limit:
+            ple = weights.per_layer_model_projection
+            yield (
+                f"per_layer_model_projection.seed{seed}",
+                torch.randn(
+                    (args.tokens, ple.packed.shape[1]),
+                    generator=generator,
+                    dtype=args.dtype,
+                ).to(device),
+                ple.packed,
+                ple.scales,
+            )
+            seen += 1
         for layer_idx, layer in enumerate(weights.layers):
+            if args.limit and seen >= args.limit:
+                break
             for name in (
                 "q_proj",
                 "k_proj",
@@ -369,6 +505,8 @@ def _real_cases(args, device: torch.device) -> Iterable[tuple]:
                 "per_layer_input_gate",
                 "per_layer_projection",
             ):
+                if args.limit and seen >= args.limit:
+                    break
                 weight = getattr(layer, name)
                 yield (
                     f"layer{layer_idx}.{name}.seed{seed}",
@@ -381,34 +519,65 @@ def _real_cases(args, device: torch.device) -> Iterable[tuple]:
                     weight.scales,
                 )
                 seen += 1
-                if args.limit and seen >= args.limit:
-                    del weights
-                    gc.collect()
-                    return
     del weights
     gc.collect()
 
 
+def _reference_chunked(x, packed, scales, chunk_rows):
+    """Rounded-weight reference without materializing a huge dequantized tile."""
+    if chunk_rows < 2 or chunk_rows % 2:
+        raise ValueError("reference chunk_rows must be even and >= 2")
+    n = packed.shape[0] * 2
+    parts = []
+    with _tf32_disabled():
+        for start in range(0, n, chunk_rows):
+            stop = min(start + chunk_rows, n)
+            parts.append(
+                _int4_dequant_matmul_pytorch(
+                    x, packed[start // 2: stop // 2], scales[start:stop]
+                )
+            )
+    return torch.cat(parts, dim=-1)
+
+
 def _run_case(args, case) -> bool:
     name, x, packed, scales = case
-    reference = _int4_dequant_matmul_pytorch(x, packed, scales)
+    reference = _reference_chunked(
+        x, packed, scales, args.reference_chunk_rows
+    )
     fused = int4_dequant_matmul(x, packed, scales)
     max_abs, mean_abs = _format_error(reference, fused)
 
-    fused_ms = _cuda_time(
-        lambda: int4_dequant_matmul(x, packed, scales),
-        args.warmup,
-        args.iters,
-    )
-    fallback_ms = None
-    if not args.skip_fallback:
-        fallback_ms = _cuda_time(
-            lambda: _int4_dequant_matmul_pytorch(x, packed, scales),
+    fused_samples = [
+        _cuda_time(
+            lambda: int4_dequant_matmul(x, packed, scales),
             args.warmup,
-            max(1, min(args.iters, 20)),
+            args.iters,
         )
+        for _ in range(args.rounds)
+    ]
+    fused_ms = _median(fused_samples)
+    fallback_ms = None
+    fallback_samples = None
+    if not args.skip_fallback:
+        fallback_samples = [
+            _cuda_time(
+                lambda: _reference_chunked(
+                    x, packed, scales, args.reference_chunk_rows
+                ),
+                args.warmup,
+                max(1, min(args.iters, 20)),
+            )
+            for _ in range(min(args.rounds, 3))
+        ]
+        fallback_ms = _median(fallback_samples)
 
     n = packed.shape[0] * 2
+    tokens = x.shape[0]
+    logical_bytes = _logical_weight_bytes(n, x.shape[-1])
+    logical_gbps = (
+        logical_bytes / (fused_ms * 1e6) if fused_ms > 0 else 0.0
+    )
     suffix = (
         f" fallback_ms={fallback_ms:.3f}"
         f" speedup={fallback_ms / fused_ms:.2f}x"
@@ -416,14 +585,31 @@ def _run_case(args, case) -> bool:
         else ""
     )
     print(
-        f"{name:32s} shape=[{args.tokens},{x.shape[-1]}]x[{n},{x.shape[-1]}]"
-        f" fused_ms={fused_ms:.3f} tflops={_tflops(args.tokens, n, x.shape[-1], fused_ms):.2f}"
+        f"{name:32s} impl={args.impl} shape=[{tokens},{x.shape[-1]}]x[{n},{x.shape[-1]}]"
+        f" fused_ms={fused_ms:.3f} range={min(fused_samples):.3f}-{max(fused_samples):.3f}"
+        f" bw={logical_gbps:.1f}GB/s"
+        f" tflops={_tflops(tokens, n, x.shape[-1], fused_ms):.2f}"
         f"{suffix} max_abs={max_abs:.5f} mean_abs={mean_abs:.6f}"
     )
     diagnostics = _check_parity(
         x, packed, scales, reference, fused, chunk_rows=args.chunk_rows
     )
-    print(json.dumps({"case": name, "parity": diagnostics}, allow_nan=True), flush=True)
+    print(json.dumps({
+        "case": name,
+        "impl": args.impl,
+        "fused_ms_samples": [round(v, 4) for v in fused_samples],
+        "fused_ms_median": round(fused_ms, 4),
+        "fused_ms_range": [round(min(fused_samples), 4), round(max(fused_samples), 4)],
+        "fallback_ms_median": round(fallback_ms, 4) if fallback_ms is not None else None,
+        "fallback_ms_samples": (
+            [round(v, 4) for v in fallback_samples]
+            if fallback_samples is not None else None
+        ),
+        "logical_weight_bytes": logical_bytes,
+        "logical_weight_gbps": round(logical_gbps, 2),
+        "tflops": round(_tflops(tokens, n, x.shape[-1], fused_ms), 4),
+        "parity": diagnostics,
+    }, allow_nan=True), flush=True)
     return diagnostics["passed"]
 
 
@@ -441,6 +627,29 @@ def main() -> None:
         default=256,
         help="Even logical output rows per bounded FP32 reference chunk",
     )
+    parser.add_argument(
+        "--reference-chunk-rows",
+        type=int,
+        default=4096,
+        help="Even logical output rows per chunked dequantize+linear reference",
+    )
+    parser.add_argument(
+        "--int4-impl",
+        choices=("legacy", "warp", "pair", "pair_vec", "pair_vec8"),
+        default="pair_vec8",
+        help="CUDA INT4 GEMV implementation under test",
+    )
+    parser.add_argument(
+        "--rounds",
+        type=int,
+        default=3,
+        help="Repeated timing rounds per case (median and range reported)",
+    )
+    parser.add_argument(
+        "--edge-cases",
+        action="store_true",
+        help="Add zero/cancellation/extreme/scale/N-tail edge cases",
+    )
     parser.add_argument("--skip-fallback", action="store_true")
     parser.add_argument("--skip-lm-head", action="store_true",
                         help="Skip the large vocabulary projection (included by default)")
@@ -457,14 +666,25 @@ def main() -> None:
         or args.limit < 0
         or args.chunk_rows < 1
         or args.chunk_rows % 2
+        or args.reference_chunk_rows < 2
+        or args.reference_chunk_rows % 2
+        or args.rounds < 1
     ):
         parser.error(
-            "tokens/group-size/iters/chunk-rows must be positive; "
-            "chunk-rows must be even; warmup/limit nonnegative"
+            "tokens/group-size/iters/chunk-rows/rounds must be positive; "
+            "chunk-rows and reference-chunk-rows must be even; "
+            "warmup/limit nonnegative"
+        )
+    if args.group_size != 64:
+        parser.error(
+            "the CUDA INT4 kernel requires group-size=64; unsupported "
+            "groups are covered by the dispatch tests, not this benchmark"
         )
     if not args.seeds:
         parser.error("at least one seed is required")
     args.dtype = torch.float16 if args.dtype == "fp16" else torch.bfloat16
+    args.impl = args.int4_impl
+    os.environ["MINI_LLM_INT4_IMPL"] = args.int4_impl
 
     if not torch.cuda.is_available() or args.device != "cuda":
         print("CUDA unavailable; run this benchmark in the RTX 3060 Remote-SSH workspace.")
@@ -487,18 +707,53 @@ def main() -> None:
     print(
         f"device={props.name} capability={props.major}.{props.minor} "
         f"vram_free={free_bytes / 2**30:.2f}GiB/{total_bytes / 2**30:.2f}GiB "
-        f"dtype={args.dtype} tokens={args.tokens}"
+        f"dtype={args.dtype} tokens={args.tokens} impl={args.impl}"
     )
     print("INT4 CUDA extension: loaded")
+    kernel_attributes = None
+    if args.impl in ("pair", "pair_vec"):
+        try:
+            from mini_llm_kernels.kernels.int4_matmul import (
+                int4_pair_kernel_attributes,
+            )
+            kernel_attributes = {
+                impl: int4_pair_kernel_attributes(
+                    pairs_per_block=4,
+                    dtype=args.dtype,
+                    vectorized=(impl == "pair_vec"),
+                )
+                for impl in ("pair", "pair_vec")
+            }
+            print(json.dumps({"kernel_attributes": kernel_attributes}))
+        except Exception as exc:  # noqa: BLE001
+            print(json.dumps({"kernel_attributes_error": str(exc)}))
+    gpu_state_before = _gpu_state()
+    print(f"gpu_state_before: {gpu_state_before}")
 
-    cases = _real_cases(args, device) if args.model else _synthetic_cases(args, device)
+    if args.model:
+        cases = _real_cases(args, device)
+    else:
+        cases = _synthetic_cases(args, device)
+        if args.edge_cases:
+            cases = chain(cases, _edge_cases(args, device))
     failures = []
     count = 0
     for case in cases:
         count += 1
         if not _run_case(args, case):
             failures.append(case[0])
-    print(json.dumps({"cases": count, "failed_cases": failures}), flush=True)
+    gpu_state_after = _gpu_state()
+    print(json.dumps({
+        "cases": count,
+        "failed_cases": failures,
+        "impl": args.impl,
+        "kernel_attributes": kernel_attributes,
+        "dtype": str(args.dtype),
+        "rounds": args.rounds,
+        "iters": args.iters,
+        "gpu_state_before": gpu_state_before,
+        "gpu_state_after": gpu_state_after,
+    }), flush=True)
     if failures:
         raise RuntimeError(f"INT4 parity failed for {len(failures)}/{count} cases: {failures}")
     print("GEMMA4 CUDA INT4 PARITY OK")

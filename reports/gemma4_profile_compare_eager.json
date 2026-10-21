@@ -1,0 +1,2196 @@
+{
+  "backend": "engine",
+  "profile_tokens": 5,
+  "start_context_len": 17,
+  "expected_decode_steps": 3,
+  "actual_decode_steps": 3,
+  "steps_match": true,
+  "record_shapes": true,
+  "categories": [
+    {
+      "category": "engine_label",
+      "self_cpu_us": 62291.41500000011,
+      "self_cuda_us": 200623.69400000002,
+      "calls": 6,
+      "include_in_kernel_sum": false,
+      "self_cpu_ms_per_step": 20.764,
+      "self_cuda_ms_per_step": 66.875
+    },
+    {
+      "category": "int4_label",
+      "self_cpu_us": 25014.72100000037,
+      "self_cuda_us": 36532.15800000004,
+      "calls": 1272,
+      "include_in_kernel_sum": false,
+      "self_cpu_ms_per_step": 8.338,
+      "self_cuda_ms_per_step": 12.177
+    },
+    {
+      "category": "int4_kernel",
+      "self_cpu_us": 0.0,
+      "self_cuda_us": 36532.15800000004,
+      "calls": 636,
+      "include_in_kernel_sum": true,
+      "self_cpu_ms_per_step": 0.0,
+      "self_cuda_ms_per_step": 12.177
+    },
+    {
+      "category": "elementwise",
+      "self_cpu_us": 13827.46599999978,
+      "self_cuda_us": 10381.872000000425,
+      "calls": 2895,
+      "include_in_kernel_sum": true,
+      "self_cpu_ms_per_step": 4.609,
+      "self_cuda_ms_per_step": 3.461
+    },
+    {
+      "category": "other",
+      "self_cpu_us": 86979.27699999957,
+      "self_cuda_us": 5247.679999999514,
+      "calls": 15710,
+      "include_in_kernel_sum": true,
+      "self_cpu_ms_per_step": 28.993,
+      "self_cuda_ms_per_step": 1.749
+    },
+    {
+      "category": "norm",
+      "self_cpu_us": 9487.685000000236,
+      "self_cuda_us": 3769.607999999861,
+      "calls": 1257,
+      "include_in_kernel_sum": true,
+      "self_cpu_ms_per_step": 3.163,
+      "self_cuda_ms_per_step": 1.257
+    },
+    {
+      "category": "attention_kernel",
+      "self_cpu_us": 0.0,
+      "self_cuda_us": 3449.5549999999366,
+      "calls": 105,
+      "include_in_kernel_sum": true,
+      "self_cpu_ms_per_step": 0.0,
+      "self_cuda_ms_per_step": 1.15
+    },
+    {
+      "category": "copy",
+      "self_cpu_us": 7020.278999999961,
+      "self_cuda_us": 1742.4069999997064,
+      "calls": 948,
+      "include_in_kernel_sum": true,
+      "self_cpu_ms_per_step": 2.34,
+      "self_cuda_ms_per_step": 0.581
+    },
+    {
+      "category": "sampler",
+      "self_cpu_us": 69.68999999997322,
+      "self_cuda_us": 66.1759999999922,
+      "calls": 3,
+      "include_in_kernel_sum": true,
+      "self_cpu_ms_per_step": 0.023,
+      "self_cuda_ms_per_step": 0.022
+    }
+  ],
+  "hotspots": [
+    {
+      "name": "engine::decode",
+      "kind": "label",
+      "calls": 3,
+      "self_cuda_ms": 200.624,
+      "self_cpu_ms": 0.0,
+      "cuda_us_per_call": 66874.565,
+      "cuda_ms_per_step": 66.875
+    },
+    {
+      "name": "void int4_dequant_matmul_pair_vec_kernel<__half>(__half const*, unsigned char const*, __half const*, __half*, int, int, int, int, int)",
+      "kind": "kernel",
+      "calls": 636,
+      "self_cuda_ms": 36.532,
+      "self_cpu_ms": 0.0,
+      "cuda_us_per_call": 57.441,
+      "cuda_ms_per_step": 12.177
+    },
+    {
+      "name": "int4::other",
+      "kind": "label",
+      "calls": 150,
+      "self_cuda_ms": 15.873,
+      "self_cpu_ms": 0.0,
+      "cuda_us_per_call": 105.818,
+      "cuda_ms_per_step": 5.291
+    },
+    {
+      "name": "int4::lm_head",
+      "kind": "label",
+      "calls": 3,
+      "self_cuda_ms": 5.419,
+      "self_cpu_ms": 0.0,
+      "cuda_us_per_call": 1806.348,
+      "cuda_ms_per_step": 1.806
+    },
+    {
+      "name": "aten::_fused_rms_norm",
+      "kind": "kernel",
+      "calls": 576,
+      "self_cuda_ms": 3.173,
+      "self_cpu_ms": 6.197,
+      "cuda_us_per_call": 5.508,
+      "cuda_ms_per_step": 1.058
+    },
+    {
+      "name": "void at::native::(anonymous namespace)::vectorized_layer_norm_kernel<c10::Half, float, true>(int, float, c10::Half const*, c10::Half const*, c10::Half const*, float*, float*, c10::Half*)",
+      "kind": "kernel",
+      "calls": 576,
+      "self_cuda_ms": 3.173,
+      "self_cpu_ms": 0.0,
+      "cuda_us_per_call": 5.508,
+      "cuda_ms_per_step": 1.058
+    },
+    {
+      "name": "void gemma4_attention_safe_kernel<__half, 128>(__half const*, __half const*, __half const*, int const*, int const*, __half*, int, int, int, int, int, int)",
+      "kind": "kernel",
+      "calls": 84,
+      "self_cuda_ms": 2.574,
+      "self_cpu_ms": 0.0,
+      "cuda_us_per_call": 30.644,
+      "cuda_ms_per_step": 0.858
+    },
+    {
+      "name": "aten::mul",
+      "kind": "kernel",
+      "calls": 537,
+      "self_cuda_ms": 1.974,
+      "self_cpu_ms": 5.204,
+      "cuda_us_per_call": 3.677,
+      "cuda_ms_per_step": 0.658
+    },
+    {
+      "name": "aten::addcmul_",
+      "kind": "kernel",
+      "calls": 300,
+      "self_cuda_ms": 1.317,
+      "self_cpu_ms": 2.281,
+      "cuda_us_per_call": 4.391,
+      "cuda_ms_per_step": 0.439
+    },
+    {
+      "name": "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native::addcmul_cuda_kernel(at::TensorIteratorBase&, c10::Scalar const&)::{lambda()#2}::operator()() const::{lambda()#8}::operator()() const::{lambda(c10::Half, c10::Half, c10::Half)#1}>(at::TensorIteratorBase&, at::native::addcmul_cuda_kernel(at::TensorIteratorBase&, c10::Scalar const&)::{lambda()#2}::operator()() const::{lambda()#8}::operator()() const::{lambda(c10::Half, c10::Half, c10::Half)#1} const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl_nocast<at::native::addcmul_cuda_kernel(at::TensorIteratorBase&, c10::Scalar const&)::{lambda()#2}::operator()() const::{lambda()#8}::operator()() const::{lambda(c10::Half, c10::Half, c10::Half)#1}>(at::TensorIteratorBase&, at::native::addcmul_cuda_kernel(at::TensorIteratorBase&, c10::Scalar const&)::{lambda()#2}::operator()() const::{lambda()#8}::operator()() const::{lambda(c10::Half, c10::Half, c10::Half)#1} const&)::{lambda(int)#1})",
+      "kind": "kernel",
+      "calls": 210,
+      "self_cuda_ms": 1.064,
+      "self_cpu_ms": 0.0,
+      "cuda_us_per_call": 5.067,
+      "cuda_ms_per_step": 0.355
+    },
+    {
+      "name": "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native::BinaryFunctor<c10::Half, c10::Half, c10::Half, at::native::binary_internal::MulFunctor<float> > >(at::TensorIteratorBase&, at::native::BinaryFunctor<c10::Half, c10::Half, c10::Half, at::native::binary_internal::MulFunctor<float> > const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl_nocast<at::native::BinaryFunctor<c10::Half, c10::Half, c10::Half, at::native::binary_internal::MulFunctor<float> > >(at::TensorIteratorBase&, at::native::BinaryFunctor<c10::Half, c10::Half, c10::Half, at::native::binary_internal::MulFunctor<float> > const&)::{lambda(int)#1})",
+      "kind": "kernel",
+      "calls": 216,
+      "self_cuda_ms": 1.036,
+      "self_cpu_ms": 0.0,
+      "cuda_us_per_call": 4.796,
+      "cuda_ms_per_step": 0.345
+    },
+    {
+      "name": "void gemma4_attention_safe_kernel<__half, 256>(__half const*, __half const*, __half const*, int const*, int const*, __half*, int, int, int, int, int, int)",
+      "kind": "kernel",
+      "calls": 21,
+      "self_cuda_ms": 0.875,
+      "self_cpu_ms": 0.0,
+      "cuda_us_per_call": 41.688,
+      "cuda_ms_per_step": 0.292
+    },
+    {
+      "name": "aten::copy_",
+      "kind": "kernel",
+      "calls": 231,
+      "self_cuda_ms": 0.741,
+      "self_cpu_ms": 1.369,
+      "cuda_us_per_call": 3.207,
+      "cuda_ms_per_step": 0.247
+    },
+    {
+      "name": "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<c10::Half, c10::Half, c10::Half, at::native::binary_internal::MulFunctor<float> >, std::array<char*, 3ul> >(int, at::native::BinaryFunctor<c10::Half, c10::Half, c10::Half, at::native::binary_internal::MulFunctor<float> >, std::array<char*, 3ul>)",
+      "kind": "kernel",
+      "calls": 255,
+      "self_cuda_ms": 0.71,
+      "self_cpu_ms": 0.0,
+      "cuda_us_per_call": 2.783,
+      "cuda_ms_per_step": 0.237
+    },
+    {
+      "name": "aten::add",
+      "kind": "kernel",
+      "calls": 258,
+      "self_cuda_ms": 0.707,
+      "self_cpu_ms": 2.446,
+      "cuda_us_per_call": 2.741,
+      "cuda_ms_per_step": 0.236
+    },
+    {
+      "name": "aten::gelu",
+      "kind": "kernel",
+      "calls": 210,
+      "self_cuda_ms": 0.7,
+      "self_cpu_ms": 2.37,
+      "cuda_us_per_call": 3.335,
+      "cuda_ms_per_step": 0.233
+    },
+    {
+      "name": "void at::native::vectorized_elementwise_kernel<4, at::native::GeluCUDAKernelImpl(at::TensorIteratorBase&, at::native::GeluType)::{lambda()#1}::operator()() const::{lambda()#3}::operator()() const::{lambda(c10::Half)#1}, std::array<char*, 2ul> >(int, at::native::GeluCUDAKernelImpl(at::TensorIteratorBase&, at::native::GeluType)::{lambda()#1}::operator()() const::{lambda()#3}::operator()() const::{lambda(c10::Half)#1}, std::array<char*, 2ul>)",
+      "kind": "kernel",
+      "calls": 210,
+      "self_cuda_ms": 0.7,
+      "self_cpu_ms": 0.0,
+      "cuda_us_per_call": 3.335,
+      "cuda_ms_per_step": 0.233
+    },
+    {
+      "name": "void fused_add_rms_norm_kernel<__half>(__half const*, __half const*, __half const*, __half*, __half*, int, int, float)",
+      "kind": "kernel",
+      "calls": 105,
+      "self_cuda_ms": 0.597,
+      "self_cpu_ms": 0.0,
+      "cuda_us_per_call": 5.684,
+      "cuda_ms_per_step": 0.199
+    },
+    {
+      "name": "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctor_add<c10::Half>, std::array<char*, 3ul> >(int, at::native::CUDAFunctor_add<c10::Half>, std::array<char*, 3ul>)",
+      "kind": "kernel",
+      "calls": 213,
+      "self_cuda_ms": 0.596,
+      "self_cpu_ms": 0.0,
+      "cuda_us_per_call": 2.796,
+      "cuda_ms_per_step": 0.199
+    },
+    {
+      "name": "aten::max",
+      "kind": "kernel",
+      "calls": 105,
+      "self_cuda_ms": 0.558,
+      "self_cpu_ms": 1.165,
+      "cuda_us_per_call": 5.311,
+      "cuda_ms_per_step": 0.186
+    },
+    {
+      "name": "void at::native::reduce_kernel<512, 1, at::native::ReduceOp<int, at::native::func_wrapper_t<int, at::native::MaxNanFunctor<int> >, unsigned int, int, 4, 4> >(at::native::ReduceOp<int, at::native::func_wrapper_t<int, at::native::MaxNanFunctor<int> >, unsigned int, int, 4, 4>)",
+      "kind": "kernel",
+      "calls": 105,
+      "self_cuda_ms": 0.558,
+      "self_cpu_ms": 0.0,
+      "cuda_us_per_call": 5.311,
+      "cuda_ms_per_step": 0.186
+    },
+    {
+      "name": "int4::layer19.down_proj",
+      "kind": "label",
+      "calls": 3,
+      "self_cuda_ms": 0.332,
+      "self_cpu_ms": 0.0,
+      "cuda_us_per_call": 110.606,
+      "cuda_ms_per_step": 0.111
+    },
+    {
+      "name": "int4::layer15.down_proj",
+      "kind": "label",
+      "calls": 3,
+      "self_cuda_ms": 0.331,
+      "self_cpu_ms": 0.0,
+      "cuda_us_per_call": 110.306,
+      "cuda_ms_per_step": 0.11
+    },
+    {
+      "name": "int4::layer22.down_proj",
+      "kind": "label",
+      "calls": 3,
+      "self_cuda_ms": 0.331,
+      "self_cpu_ms": 0.0,
+      "cuda_us_per_call": 110.274,
+      "cuda_ms_per_step": 0.11
+    },
+    {
+      "name": "int4::layer34.down_proj",
+      "kind": "label",
+      "calls": 3,
+      "self_cuda_ms": 0.331,
+      "self_cpu_ms": 0.0,
+      "cuda_us_per_call": 110.168,
+      "cuda_ms_per_step": 0.11
+    }
+  ],
+  "parent_label_note": "categories sum only self_* times; int4::/engine::/direct:: labels are reported separately and not added to raw kernel sums",
+  "cuda_summary": "-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  \n                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  \n-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  \n                                         engine::decode         0.00%       0.000us         0.00%       0.000us       0.000us     200.624ms       394.98%     200.624ms      66.875ms             3  \nvoid int4_dequant_matmul_pair_vec_kernel<__half>(__h...         0.00%       0.000us         0.00%       0.000us       0.000us      36.532ms        71.92%      36.532ms      57.441us           636  \n                                            int4::other         0.00%       0.000us         0.00%       0.000us       0.000us      15.873ms        31.25%      15.873ms     105.818us           150  \n                                          int4::lm_head         0.00%       0.000us         0.00%       0.000us       0.000us       5.419ms        10.67%       5.419ms       1.806ms             3  \n                                  aten::_fused_rms_norm         3.03%       6.197ms        10.14%      20.755ms      36.033us       3.173ms         6.25%       3.173ms       5.508us           576  \nvoid at::native::(anonymous namespace)::vectorized_l...         0.00%       0.000us         0.00%       0.000us       0.000us       3.173ms         6.25%       3.173ms       5.508us           576  \nvoid gemma4_attention_safe_kernel<__half, 128>(__hal...         0.00%       0.000us         0.00%       0.000us       0.000us       2.574ms         5.07%       2.574ms      30.644us            84  \n                                              aten::mul         2.54%       5.204ms         6.29%      12.881ms      23.988us       1.974ms         3.89%       1.974ms       3.677us           537  \n                                         aten::addcmul_         1.11%       2.281ms         3.15%       6.443ms      21.477us       1.317ms         2.59%       1.317ms       4.391us           300  \nvoid at::native::elementwise_kernel<128, 4, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us       1.064ms         2.09%       1.064ms       5.067us           210  \nvoid at::native::elementwise_kernel<128, 4, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us       1.036ms         2.04%       1.036ms       4.796us           216  \nvoid gemma4_attention_safe_kernel<__half, 256>(__hal...         0.00%       0.000us         0.00%       0.000us       0.000us     875.443us         1.72%     875.443us      41.688us            21  \n                                            aten::copy_         0.67%       1.369ms         2.88%       5.899ms      25.535us     740.721us         1.46%     741.841us       3.211us           231  \nvoid at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     709.612us         1.40%     709.612us       2.783us           255  \n                                              aten::add         1.20%       2.446ms         2.86%       5.847ms      22.662us     707.305us         1.39%     707.305us       2.741us           258  \n                                             aten::gelu         1.16%       2.370ms         2.85%       5.843ms      27.824us     700.424us         1.38%     700.424us       3.335us           210  \nvoid at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     700.424us         1.38%     700.424us       3.335us           210  \nvoid fused_add_rms_norm_kernel<__half>(__half const*...         0.00%       0.000us         0.00%       0.000us       0.000us     596.818us         1.17%     596.818us       5.684us           105  \nvoid at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     595.592us         1.17%     595.592us       2.796us           213  \n                                              aten::max         0.57%       1.165ms         1.71%       3.493ms      33.268us     557.612us         1.10%     557.612us       5.311us           105  \nvoid at::native::reduce_kernel<512, 1, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us     557.612us         1.10%     557.612us       5.311us           105  \n                                int4::layer19.down_proj         0.00%       0.000us         0.00%       0.000us       0.000us     331.817us         0.65%     331.817us     110.606us             3  \n                                int4::layer15.down_proj         0.00%       0.000us         0.00%       0.000us       0.000us     330.919us         0.65%     330.919us     110.306us             3  \n                                int4::layer22.down_proj         0.00%       0.000us         0.00%       0.000us       0.000us     330.823us         0.65%     330.823us     110.274us             3  \n                                int4::layer34.down_proj         0.00%       0.000us         0.00%       0.000us       0.000us     330.505us         0.65%     330.505us     110.168us             3  \n                                int4::layer31.down_proj         0.00%       0.000us         0.00%       0.000us       0.000us     330.439us         0.65%     330.439us     110.146us             3  \n                                int4::layer21.down_proj         0.00%       0.000us         0.00%       0.000us       0.000us     330.344us         0.65%     330.344us     110.115us             3  \n                                int4::layer23.down_proj         0.00%       0.000us         0.00%       0.000us       0.000us     330.281us         0.65%     330.281us     110.094us             3  \n                                int4::layer26.down_proj         0.00%       0.000us         0.00%       0.000us       0.000us     329.863us         0.65%     329.863us     109.954us             3  \n                                int4::layer27.down_proj         0.00%       0.000us         0.00%       0.000us       0.000us     329.736us         0.65%     329.736us     109.912us             3  \n-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  \nSelf CPU time total: 204.691ms\nSelf CUDA time total: 50.794ms\n",
+  "cpu_summary": "-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  \n                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  \n-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  \n                                         engine::decode        30.43%      62.291ms       100.00%     204.689ms      68.230ms       0.000us         0.00%      10.396ms       3.465ms             3  \n                                       cudaLaunchKernel        25.01%      51.186ms        25.01%      51.186ms      16.111us     151.523us         0.30%     151.523us       0.048us          3177  \n                                  cudaStreamSynchronize         4.65%       9.522ms         4.65%       9.522ms      79.353us       0.000us         0.00%       0.000us       0.000us           120  \n                                            aten::empty         4.34%       8.885ms         4.34%       8.885ms       4.592us       0.000us         0.00%       0.000us       0.000us          1935  \n                                  aten::_fused_rms_norm         3.03%       6.197ms        10.14%      20.755ms      36.033us       3.173ms         6.25%       3.173ms       5.508us           576  \n                                            int4::other         2.87%       5.875ms         5.05%      10.329ms      68.858us       0.000us         0.00%      25.025us       0.167us           150  \n                                              aten::mul         2.54%       5.204ms         6.29%      12.881ms      23.988us       1.974ms         3.89%       1.974ms       3.677us           537  \n                                        cudaMemcpyAsync         2.07%       4.229ms         2.07%       4.229ms      19.854us       0.000us         0.00%       0.000us       0.000us           213  \n                                         aten::rms_norm         1.61%       3.291ms        11.75%      24.046ms      41.746us       0.000us         0.00%       3.173ms       5.508us           576  \n                                    aten::empty_strided         1.21%       2.469ms         1.21%       2.469ms       5.415us       0.000us         0.00%       0.000us       0.000us           456  \n                                              aten::add         1.20%       2.446ms         2.86%       5.847ms      22.662us     707.305us         1.39%     707.305us       2.741us           258  \n                                             aten::gelu         1.16%       2.370ms         2.85%       5.843ms      27.824us     700.424us         1.38%     700.424us       3.335us           210  \n                                         aten::addcmul_         1.11%       2.281ms         3.15%       6.443ms      21.477us       1.317ms         2.59%       1.317ms       4.391us           300  \n                                            aten::slice         1.03%       2.107ms         1.42%       2.907ms       2.329us       0.000us         0.00%       0.000us       0.000us          1248  \n                                       aten::as_strided         0.84%       1.728ms         0.84%       1.728ms       0.661us       0.000us         0.00%       0.000us       0.000us          2613  \n                                             aten::view         0.84%       1.710ms         0.84%       1.710ms       1.037us       0.000us         0.00%       0.000us       0.000us          1650  \n                                           aten::select         0.81%       1.657ms         1.05%       2.143ms       3.160us       0.000us         0.00%       0.000us       0.000us           678  \n                                            aten::copy_         0.67%       1.369ms         2.88%       5.899ms      25.535us     740.721us         1.46%     741.841us       3.211us           231  \n                                          aten::reshape         0.59%       1.217ms         1.02%       2.092ms       2.778us       0.000us         0.00%       0.000us       0.000us           753  \n                                  cudaDeviceSynchronize         0.59%       1.209ms         0.59%       1.209ms     302.162us       0.000us         0.00%       0.000us       0.000us             4  \n-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  \nSelf CPU time total: 204.691ms\nSelf CUDA time total: 50.794ms\n",
+  "event_shapes": [
+    {
+      "name": "aten::_fused_rms_norm",
+      "calls": 423,
+      "input_shapes": [
+        [
+          1,
+          1536
+        ],
+        [],
+        [
+          1536
+        ],
+        []
+      ],
+      "self_cuda_ms": 2.562,
+      "self_cpu_ms": 4.573
+    },
+    {
+      "name": "aten::addcmul_",
+      "calls": 168,
+      "input_shapes": [
+        [
+          1,
+          8,
+          128
+        ],
+        [
+          1,
+          8,
+          128
+        ],
+        [
+          1,
+          1,
+          128
+        ],
+        []
+      ],
+      "self_cuda_ms": 0.846,
+      "self_cpu_ms": 1.372
+    },
+    {
+      "name": "aten::add",
+      "calls": 210,
+      "input_shapes": [
+        [
+          1,
+          1536
+        ],
+        [
+          1,
+          1536
+        ],
+        []
+      ],
+      "self_cuda_ms": 0.586,
+      "self_cpu_ms": 1.989
+    },
+    {
+      "name": "aten::max",
+      "calls": 105,
+      "input_shapes": [
+        [
+          1
+        ]
+      ],
+      "self_cuda_ms": 0.558,
+      "self_cpu_ms": 1.165
+    },
+    {
+      "name": "aten::mul",
+      "calls": 105,
+      "input_shapes": [
+        [
+          1,
+          1536
+        ],
+        [
+          1
+        ]
+      ],
+      "self_cuda_ms": 0.493,
+      "self_cpu_ms": 0.951
+    },
+    {
+      "name": "aten::mul",
+      "calls": 84,
+      "input_shapes": [
+        [
+          1,
+          8,
+          256
+        ],
+        [
+          1,
+          1,
+          256
+        ]
+      ],
+      "self_cuda_ms": 0.402,
+      "self_cpu_ms": 1.009
+    },
+    {
+      "name": "aten::gelu",
+      "calls": 105,
+      "input_shapes": [
+        [
+          1,
+          256
+        ],
+        []
+      ],
+      "self_cuda_ms": 0.352,
+      "self_cpu_ms": 1.184
+    },
+    {
+      "name": "aten::_fused_rms_norm",
+      "calls": 84,
+      "input_shapes": [
+        [
+          1,
+          8,
+          256
+        ],
+        [],
+        [
+          256
+        ],
+        []
+      ],
+      "self_cuda_ms": 0.327,
+      "self_cpu_ms": 0.939
+    },
+    {
+      "name": "aten::mul",
+      "calls": 105,
+      "input_shapes": [
+        [
+          1,
+          256
+        ],
+        [
+          1,
+          256
+        ]
+      ],
+      "self_cuda_ms": 0.307,
+      "self_cpu_ms": 0.88
+    },
+    {
+      "name": "aten::copy_",
+      "calls": 72,
+      "input_shapes": [
+        [
+          1,
+          1,
+          256
+        ],
+        [
+          1,
+          1,
+          256
+        ],
+        []
+      ],
+      "self_cuda_ms": 0.268,
+      "self_cpu_ms": 0.419
+    },
+    {
+      "name": "aten::addcmul_",
+      "calls": 42,
+      "input_shapes": [
+        [
+          1,
+          8,
+          256
+        ],
+        [
+          1,
+          8,
+          256
+        ],
+        [
+          1,
+          1,
+          256
+        ],
+        []
+      ],
+      "self_cuda_ms": 0.218,
+      "self_cpu_ms": 0.339
+    },
+    {
+      "name": "aten::mean",
+      "calls": 36,
+      "input_shapes": [
+        [
+          1,
+          1,
+          256
+        ],
+        [],
+        [],
+        []
+      ],
+      "self_cuda_ms": 0.213,
+      "self_cpu_ms": 0.424
+    },
+    {
+      "name": "aten::addcmul_",
+      "calls": 72,
+      "input_shapes": [
+        [
+          1,
+          1,
+          128
+        ],
+        [
+          1,
+          1,
+          128
+        ],
+        [
+          1,
+          1,
+          128
+        ],
+        []
+      ],
+      "self_cuda_ms": 0.201,
+      "self_cpu_ms": 0.457
+    },
+    {
+      "name": "aten::gelu",
+      "calls": 60,
+      "input_shapes": [
+        [
+          1,
+          12288
+        ],
+        []
+      ],
+      "self_cuda_ms": 0.198,
+      "self_cpu_ms": 0.651
+    },
+    {
+      "name": "aten::copy_",
+      "calls": 78,
+      "input_shapes": [
+        [
+          1,
+          256
+        ],
+        [
+          1,
+          256
+        ],
+        []
+      ],
+      "self_cuda_ms": 0.184,
+      "self_cpu_ms": 0.356
+    },
+    {
+      "name": "aten::mul",
+      "calls": 60,
+      "input_shapes": [
+        [
+          1,
+          12288
+        ],
+        [
+          1,
+          12288
+        ]
+      ],
+      "self_cuda_ms": 0.16,
+      "self_cpu_ms": 0.561
+    },
+    {
+      "name": "aten::gelu",
+      "calls": 45,
+      "input_shapes": [
+        [
+          1,
+          6144
+        ],
+        []
+      ],
+      "self_cuda_ms": 0.151,
+      "self_cpu_ms": 0.535
+    },
+    {
+      "name": "aten::_local_scalar_dense",
+      "calls": 108,
+      "input_shapes": [
+        []
+      ],
+      "self_cuda_ms": 0.147,
+      "self_cpu_ms": 0.582
+    },
+    {
+      "name": "aten::_fused_rms_norm",
+      "calls": 36,
+      "input_shapes": [
+        [
+          1,
+          1,
+          256
+        ],
+        [],
+        [
+          256
+        ],
+        []
+      ],
+      "self_cuda_ms": 0.144,
+      "self_cpu_ms": 0.335
+    },
+    {
+      "name": "aten::pow",
+      "calls": 45,
+      "input_shapes": [
+        [
+          1,
+          1,
+          1
+        ],
+        []
+      ],
+      "self_cuda_ms": 0.129,
+      "self_cpu_ms": 0.422
+    },
+    {
+      "name": "aten::mul",
+      "calls": 36,
+      "input_shapes": [
+        [
+          1,
+          1,
+          256
+        ],
+        [
+          1,
+          1,
+          1
+        ]
+      ],
+      "self_cuda_ms": 0.125,
+      "self_cpu_ms": 0.305
+    },
+    {
+      "name": "aten::mul",
+      "calls": 45,
+      "input_shapes": [
+        [
+          1,
+          6144
+        ],
+        [
+          1,
+          6144
+        ]
+      ],
+      "self_cuda_ms": 0.119,
+      "self_cpu_ms": 0.454
+    },
+    {
+      "name": "aten::add",
+      "calls": 45,
+      "input_shapes": [
+        [
+          1,
+          1,
+          1
+        ],
+        [],
+        []
+      ],
+      "self_cuda_ms": 0.112,
+      "self_cpu_ms": 0.426
+    },
+    {
+      "name": "aten::mul",
+      "calls": 21,
+      "input_shapes": [
+        [
+          1,
+          8,
+          512
+        ],
+        [
+          1,
+          1,
+          512
+        ]
+      ],
+      "self_cuda_ms": 0.112,
+      "self_cpu_ms": 0.232
+    },
+    {
+      "name": "aten::mul",
+      "calls": 36,
+      "input_shapes": [
+        [
+          1,
+          1,
+          256
+        ],
+        [
+          1,
+          1,
+          256
+        ]
+      ],
+      "self_cuda_ms": 0.098,
+      "self_cpu_ms": 0.322
+    },
+    {
+      "name": "aten::pow",
+      "calls": 36,
+      "input_shapes": [
+        [
+          1,
+          1,
+          256
+        ],
+        []
+      ],
+      "self_cuda_ms": 0.095,
+      "self_cpu_ms": 0.483
+    },
+    {
+      "name": "aten::_fused_rms_norm",
+      "calls": 21,
+      "input_shapes": [
+        [
+          1,
+          8,
+          512
+        ],
+        [],
+        [
+          512
+        ],
+        []
+      ],
+      "self_cuda_ms": 0.09,
+      "self_cpu_ms": 0.229
+    },
+    {
+      "name": "aten::copy_",
+      "calls": 18,
+      "input_shapes": [
+        [
+          1,
+          1,
+          512
+        ],
+        [
+          1,
+          1,
+          512
+        ],
+        []
+      ],
+      "self_cuda_ms": 0.078,
+      "self_cpu_ms": 0.104
+    },
+    {
+      "name": "aten::argmax",
+      "calls": 3,
+      "input_shapes": [
+        [
+          262144
+        ],
+        [],
+        []
+      ],
+      "self_cuda_ms": 0.066,
+      "self_cpu_ms": 0.07
+    },
+    {
+      "name": "aten::copy_",
+      "calls": 24,
+      "input_shapes": [
+        [
+          1,
+          512
+        ],
+        [
+          1,
+          512
+        ],
+        []
+      ],
+      "self_cuda_ms": 0.058,
+      "self_cpu_ms": 0.109
+    },
+    {
+      "name": "aten::mean",
+      "calls": 9,
+      "input_shapes": [
+        [
+          1,
+          1,
+          512
+        ],
+        [],
+        [],
+        []
+      ],
+      "self_cuda_ms": 0.055,
+      "self_cpu_ms": 0.096
+    },
+    {
+      "name": "aten::addcmul_",
+      "calls": 18,
+      "input_shapes": [
+        [
+          1,
+          1,
+          256
+        ],
+        [
+          1,
+          1,
+          256
+        ],
+        [
+          1,
+          1,
+          256
+        ],
+        []
+      ],
+      "self_cuda_ms": 0.052,
+      "self_cpu_ms": 0.114
+    },
+    {
+      "name": "aten::copy_",
+      "calls": 9,
+      "input_shapes": [
+        [
+          1,
+          1536
+        ],
+        [
+          1,
+          1536
+        ],
+        []
+      ],
+      "self_cuda_ms": 0.043,
+      "self_cpu_ms": 0.064
+    },
+    {
+      "name": "aten::copy_",
+      "calls": 9,
+      "input_shapes": [
+        [
+          1,
+          8960
+        ],
+        [
+          1,
+          8960
+        ],
+        []
+      ],
+      "self_cuda_ms": 0.041,
+      "self_cpu_ms": 0.048
+    },
+    {
+      "name": "aten::cat",
+      "calls": 9,
+      "input_shapes": [
+        [],
+        []
+      ],
+      "self_cuda_ms": 0.039,
+      "self_cpu_ms": 0.121
+    },
+    {
+      "name": "aten::_fused_rms_norm",
+      "calls": 9,
+      "input_shapes": [
+        [
+          1,
+          1,
+          512
+        ],
+        [],
+        [
+          512
+        ],
+        []
+      ],
+      "self_cuda_ms": 0.037,
+      "self_cpu_ms": 0.081
+    },
+    {
+      "name": "aten::copy_",
+      "calls": 3,
+      "input_shapes": [
+        [
+          1,
+          262144
+        ],
+        [
+          1,
+          262144
+        ],
+        []
+      ],
+      "self_cuda_ms": 0.037,
+      "self_cpu_ms": 0.032
+    },
+    {
+      "name": "aten::copy_",
+      "calls": 18,
+      "input_shapes": [
+        [
+          1
+        ],
+        [
+          1
+        ],
+        []
+      ],
+      "self_cuda_ms": 0.032,
+      "self_cpu_ms": 0.236
+    },
+    {
+      "name": "aten::mul",
+      "calls": 9,
+      "input_shapes": [
+        [
+          1,
+          1,
+          512
+        ],
+        [
+          1,
+          1,
+          1
+        ]
+      ],
+      "self_cuda_ms": 0.031,
+      "self_cpu_ms": 0.101
+    },
+    {
+      "name": "aten::mul",
+      "calls": 9,
+      "input_shapes": [
+        [
+          1,
+          1,
+          512
+        ],
+        [
+          1,
+          1,
+          512
+        ]
+      ],
+      "self_cuda_ms": 0.025,
+      "self_cpu_ms": 0.08
+    }
+  ],
+  "event_shapes_note": "record_shapes stores input shapes on CPU aten op events; CUDA kernel events do not carry shapes. Use metadata.projection_shapes for the real INT4 shapes.",
+  "backends": [
+    "engine",
+    "direct"
+  ],
+  "direct": {
+    "backend": "direct",
+    "profile_tokens": 5,
+    "start_context_len": 16,
+    "expected_decode_steps": 3,
+    "actual_decode_steps": 3,
+    "steps_match": true,
+    "record_shapes": true,
+    "categories": [
+      {
+        "category": "engine_label",
+        "self_cpu_us": 72880.245000001,
+        "self_cuda_us": 264611.15,
+        "calls": 6,
+        "include_in_kernel_sum": false,
+        "self_cpu_ms_per_step": 24.293,
+        "self_cuda_ms_per_step": 88.204
+      },
+      {
+        "category": "int4_label",
+        "self_cpu_us": 33537.927,
+        "self_cuda_us": 20972.363000000223,
+        "calls": 1662,
+        "include_in_kernel_sum": false,
+        "self_cpu_ms_per_step": 11.179,
+        "self_cuda_ms_per_step": 6.991
+      },
+      {
+        "category": "int4_kernel",
+        "self_cpu_us": 0.0,
+        "self_cuda_us": 20972.363000000223,
+        "calls": 831,
+        "include_in_kernel_sum": true,
+        "self_cpu_ms_per_step": 0.0,
+        "self_cuda_ms_per_step": 6.991
+      },
+      {
+        "category": "elementwise",
+        "self_cpu_us": 17348.571000000637,
+        "self_cuda_us": 7338.448000000853,
+        "calls": 3501,
+        "include_in_kernel_sum": true,
+        "self_cpu_ms_per_step": 5.783,
+        "self_cuda_ms_per_step": 2.446
+      },
+      {
+        "category": "other",
+        "self_cpu_us": 107491.49899999818,
+        "self_cuda_us": 4240.318000000161,
+        "calls": 18825,
+        "include_in_kernel_sum": true,
+        "self_cpu_ms_per_step": 35.83,
+        "self_cuda_ms_per_step": 1.413
+      },
+      {
+        "category": "copy",
+        "self_cpu_us": 8901.83300000055,
+        "self_cuda_us": 2768.603999999751,
+        "calls": 2106,
+        "include_in_kernel_sum": true,
+        "self_cpu_ms_per_step": 2.967,
+        "self_cuda_ms_per_step": 0.923
+      },
+      {
+        "category": "norm",
+        "self_cpu_us": 12028.338999999687,
+        "self_cuda_us": 2272.510999999934,
+        "calls": 1362,
+        "include_in_kernel_sum": true,
+        "self_cpu_ms_per_step": 4.009,
+        "self_cuda_ms_per_step": 0.758
+      },
+      {
+        "category": "attention_math",
+        "self_cpu_us": 13227.397999999943,
+        "self_cuda_us": 1045.2689999997365,
+        "calls": 735,
+        "include_in_kernel_sum": true,
+        "self_cpu_ms_per_step": 4.409,
+        "self_cuda_ms_per_step": 0.348
+      },
+      {
+        "category": "sampler",
+        "self_cpu_us": 71.64800000000105,
+        "self_cuda_us": 36.38400000007823,
+        "calls": 3,
+        "include_in_kernel_sum": true,
+        "self_cpu_ms_per_step": 0.024,
+        "self_cuda_ms_per_step": 0.012
+      }
+    ],
+    "hotspots": [
+      {
+        "name": "direct::decode",
+        "kind": "label",
+        "calls": 3,
+        "self_cuda_ms": 264.611,
+        "self_cpu_ms": 0.0,
+        "cuda_us_per_call": 88203.717,
+        "cuda_ms_per_step": 88.204
+      },
+      {
+        "name": "void int4_dequant_matmul_pair_vec_kernel<__half>(__half const*, unsigned char const*, __half const*, __half*, int, int, int, int, int)",
+        "kind": "kernel",
+        "calls": 831,
+        "self_cuda_ms": 20.972,
+        "self_cpu_ms": 0.0,
+        "cuda_us_per_call": 25.238,
+        "cuda_ms_per_step": 6.991
+      },
+      {
+        "name": "int4::lm_head",
+        "kind": "label",
+        "calls": 3,
+        "self_cuda_ms": 2.872,
+        "self_cpu_ms": 0.0,
+        "cuda_us_per_call": 957.293,
+        "cuda_ms_per_step": 0.957
+      },
+      {
+        "name": "aten::_fused_rms_norm",
+        "kind": "kernel",
+        "calls": 681,
+        "self_cuda_ms": 2.273,
+        "self_cpu_ms": 8.066,
+        "cuda_us_per_call": 3.337,
+        "cuda_ms_per_step": 0.758
+      },
+      {
+        "name": "void at::native::(anonymous namespace)::vectorized_layer_norm_kernel<c10::Half, float, true>(int, float, c10::Half const*, c10::Half const*, c10::Half const*, float*, float*, c10::Half*)",
+        "kind": "kernel",
+        "calls": 681,
+        "self_cuda_ms": 2.273,
+        "self_cpu_ms": 0.0,
+        "cuda_us_per_call": 3.337,
+        "cuda_ms_per_step": 0.758
+      },
+      {
+        "name": "aten::mul",
+        "kind": "kernel",
+        "calls": 636,
+        "self_cuda_ms": 1.357,
+        "self_cpu_ms": 6.809,
+        "cuda_us_per_call": 2.134,
+        "cuda_ms_per_step": 0.452
+      },
+      {
+        "name": "aten::copy_",
+        "kind": "kernel",
+        "calls": 630,
+        "self_cuda_ms": 1.15,
+        "self_cpu_ms": 3.943,
+        "cuda_us_per_call": 1.825,
+        "cuda_ms_per_step": 0.383
+      },
+      {
+        "name": "aten::addcmul_",
+        "kind": "kernel",
+        "calls": 300,
+        "self_cuda_ms": 0.746,
+        "self_cpu_ms": 2.544,
+        "cuda_us_per_call": 2.487,
+        "cuda_ms_per_step": 0.249
+      },
+      {
+        "name": "void at::native::vectorized_elementwise_kernel<4, at::native::float16_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda(float)#1}, std::array<char*, 2ul> >(int, at::native::float16_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda(float)#1}, std::array<char*, 2ul>)",
+        "kind": "kernel",
+        "calls": 450,
+        "self_cuda_ms": 0.689,
+        "self_cpu_ms": 0.0,
+        "cuda_us_per_call": 1.531,
+        "cuda_ms_per_step": 0.23
+      },
+      {
+        "name": "aten::bmm",
+        "kind": "kernel",
+        "calls": 210,
+        "self_cuda_ms": 0.653,
+        "self_cpu_ms": 9.355,
+        "cuda_us_per_call": 3.108,
+        "cuda_ms_per_step": 0.218
+      },
+      {
+        "name": "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native::addcmul_cuda_kernel(at::TensorIteratorBase&, c10::Scalar const&)::{lambda()#2}::operator()() const::{lambda()#8}::operator()() const::{lambda(c10::Half, c10::Half, c10::Half)#1}>(at::TensorIteratorBase&, at::native::addcmul_cuda_kernel(at::TensorIteratorBase&, c10::Scalar const&)::{lambda()#2}::operator()() const::{lambda()#8}::operator()() const::{lambda(c10::Half, c10::Half, c10::Half)#1} const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl_nocast<at::native::addcmul_cuda_kernel(at::TensorIteratorBase&, c10::Scalar const&)::{lambda()#2}::operator()() const::{lambda()#8}::operator()() const::{lambda(c10::Half, c10::Half, c10::Half)#1}>(at::TensorIteratorBase&, at::native::addcmul_cuda_kernel(at::TensorIteratorBase&, c10::Scalar const&)::{lambda()#2}::operator()() const::{lambda()#8}::operator()() const::{lambda(c10::Half, c10::Half, c10::Half)#1} const&)::{lambda(int)#1})",
+        "kind": "kernel",
+        "calls": 210,
+        "self_cuda_ms": 0.602,
+        "self_cpu_ms": 0.0,
+        "cuda_us_per_call": 2.865,
+        "cuda_ms_per_step": 0.201
+      },
+      {
+        "name": "aten::add",
+        "kind": "kernel",
+        "calls": 363,
+        "self_cuda_ms": 0.594,
+        "self_cpu_ms": 3.677,
+        "cuda_us_per_call": 1.637,
+        "cuda_ms_per_step": 0.198
+      },
+      {
+        "name": "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native::BinaryFunctor<c10::Half, c10::Half, c10::Half, at::native::binary_internal::MulFunctor<float> > >(at::TensorIteratorBase&, at::native::BinaryFunctor<c10::Half, c10::Half, c10::Half, at::native::binary_internal::MulFunctor<float> > const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl_nocast<at::native::BinaryFunctor<c10::Half, c10::Half, c10::Half, at::native::binary_internal::MulFunctor<float> > >(at::TensorIteratorBase&, at::native::BinaryFunctor<c10::Half, c10::Half, c10::Half, at::native::binary_internal::MulFunctor<float> > const&)::{lambda(int)#1})",
+        "kind": "kernel",
+        "calls": 216,
+        "self_cuda_ms": 0.593,
+        "self_cpu_ms": 0.0,
+        "cuda_us_per_call": 2.745,
+        "cuda_ms_per_step": 0.198
+      },
+      {
+        "name": "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctor_add<c10::Half>, std::array<char*, 3ul> >(int, at::native::CUDAFunctor_add<c10::Half>, std::array<char*, 3ul>)",
+        "kind": "kernel",
+        "calls": 318,
+        "self_cuda_ms": 0.527,
+        "self_cpu_ms": 0.0,
+        "cuda_us_per_call": 1.658,
+        "cuda_ms_per_step": 0.176
+      },
+      {
+        "name": "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<c10::Half, c10::Half, c10::Half, at::native::binary_internal::MulFunctor<float> >, std::array<char*, 3ul> >(int, at::native::BinaryFunctor<c10::Half, c10::Half, c10::Half, at::native::binary_internal::MulFunctor<float> >, std::array<char*, 3ul>)",
+        "kind": "kernel",
+        "calls": 255,
+        "self_cuda_ms": 0.465,
+        "self_cpu_ms": 0.0,
+        "cuda_us_per_call": 1.822,
+        "cuda_ms_per_step": 0.155
+      },
+      {
+        "name": "aten::cat",
+        "kind": "kernel",
+        "calls": 195,
+        "self_cuda_ms": 0.433,
+        "self_cpu_ms": 1.95,
+        "cuda_us_per_call": 2.219,
+        "cuda_ms_per_step": 0.144
+      },
+      {
+        "name": "aten::gelu",
+        "kind": "kernel",
+        "calls": 210,
+        "self_cuda_ms": 0.426,
+        "self_cpu_ms": 2.551,
+        "cuda_us_per_call": 2.029,
+        "cuda_ms_per_step": 0.142
+      },
+      {
+        "name": "void at::native::vectorized_elementwise_kernel<4, at::native::GeluCUDAKernelImpl(at::TensorIteratorBase&, at::native::GeluType)::{lambda()#1}::operator()() const::{lambda()#3}::operator()() const::{lambda(c10::Half)#1}, std::array<char*, 2ul> >(int, at::native::GeluCUDAKernelImpl(at::TensorIteratorBase&, at::native::GeluType)::{lambda()#1}::operator()() const::{lambda()#3}::operator()() const::{lambda(c10::Half)#1}, std::array<char*, 2ul>)",
+        "kind": "kernel",
+        "calls": 210,
+        "self_cuda_ms": 0.426,
+        "self_cpu_ms": 0.0,
+        "cuda_us_per_call": 2.029,
+        "cuda_ms_per_step": 0.142
+      },
+      {
+        "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1}, std::array<char*, 2ul>, 4, TrivialOffsetCalculator<1, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, at::native::memory::LoadWithCast<1>, at::native::memory::StoreWithCast<1> >(int, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1}, std::array<char*, 2ul>, TrivialOffsetCalculator<1, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, at::native::memory::LoadWithCast<1>, at::native::memory::StoreWithCast<1>)",
+        "kind": "kernel",
+        "calls": 153,
+        "self_cuda_ms": 0.398,
+        "self_cpu_ms": 0.0,
+        "cuda_us_per_call": 2.599,
+        "cuda_ms_per_step": 0.133
+      },
+      {
+        "name": "std::enable_if<!(false), void>::type internal::gemvx::kernel<int, int, __half, __half, __half, float, false, true, false, false, 6, false, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<__half const>, cublasGemvTensorStridedBatched<__half const>, cublasGemvTensorStridedBatched<__half>, float> >(cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<__half const>, cublasGemvTensorStridedBatched<__half const>, cublasGemvTensorStridedBatched<__half>, float>)",
+        "kind": "kernel",
+        "calls": 98,
+        "self_cuda_ms": 0.323,
+        "self_cpu_ms": 0.0,
+        "cuda_us_per_call": 3.3,
+        "cuda_ms_per_step": 0.108
+      },
+      {
+        "name": "aten::cos",
+        "kind": "kernel",
+        "calls": 105,
+        "self_cuda_ms": 0.293,
+        "self_cpu_ms": 0.951,
+        "cuda_us_per_call": 2.793,
+        "cuda_ms_per_step": 0.098
+      },
+      {
+        "name": "void at::native::vectorized_elementwise_kernel<4, at::native::cos_kernel_cuda(at::TensorIteratorBase&)::{lambda()#2}::operator()() const::{lambda()#2}::operator()() const::{lambda(float)#1}, std::array<char*, 2ul> >(int, at::native::cos_kernel_cuda(at::TensorIteratorBase&)::{lambda()#2}::operator()() const::{lambda()#2}::operator()() const::{lambda(float)#1}, std::array<char*, 2ul>)",
+        "kind": "kernel",
+        "calls": 105,
+        "self_cuda_ms": 0.293,
+        "self_cpu_ms": 0.0,
+        "cuda_us_per_call": 2.793,
+        "cuda_ms_per_step": 0.098
+      },
+      {
+        "name": "aten::sin",
+        "kind": "kernel",
+        "calls": 105,
+        "self_cuda_ms": 0.277,
+        "self_cpu_ms": 0.826,
+        "cuda_us_per_call": 2.638,
+        "cuda_ms_per_step": 0.092
+      },
+      {
+        "name": "void at::native::vectorized_elementwise_kernel<4, at::native::sin_kernel_cuda(at::TensorIteratorBase&)::{lambda()#2}::operator()() const::{lambda()#2}::operator()() const::{lambda(float)#1}, std::array<char*, 2ul> >(int, at::native::sin_kernel_cuda(at::TensorIteratorBase&)::{lambda()#2}::operator()() const::{lambda()#2}::operator()() const::{lambda(float)#1}, std::array<char*, 2ul>)",
+        "kind": "kernel",
+        "calls": 105,
+        "self_cuda_ms": 0.277,
+        "self_cpu_ms": 0.0,
+        "cuda_us_per_call": 2.638,
+        "cuda_ms_per_step": 0.092
+      },
+      {
+        "name": "void at::native::(anonymous namespace)::CatArrayBatchedCopy_vectorized<at::native::(anonymous namespace)::OpaqueType<4u>, unsigned int, 2, 128, 1, 16, 4>(char*, at::native::(anonymous namespace)::CatArrInputTensorMetadata<at::native::(anonymous namespace)::OpaqueType<4u>, unsigned int, 128, 1>, at::native::(anonymous namespace)::TensorSizeStride<unsigned int, 4u>, int, unsigned int)",
+        "kind": "kernel",
+        "calls": 105,
+        "self_cuda_ms": 0.249,
+        "self_cpu_ms": 0.0,
+        "cuda_us_per_call": 2.372,
+        "cuda_ms_per_step": 0.083
+      }
+    ],
+    "parent_label_note": "categories sum only self_* times; int4::/engine::/direct:: labels are reported separately and not added to raw kernel sums",
+    "cuda_summary": "-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  \n                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  \n-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  \n                                         direct::decode         0.00%       0.000us         0.00%       0.000us       0.000us     264.611ms       887.28%     264.611ms      88.204ms             3  \nvoid int4_dequant_matmul_pair_vec_kernel<__half>(__h...         0.00%       0.000us         0.00%       0.000us       0.000us      20.972ms        70.32%      20.972ms      25.238us           831  \n                                          int4::lm_head         0.00%       0.000us         0.00%       0.000us       0.000us       2.872ms         9.63%       2.872ms     957.293us             3  \n                                  aten::_fused_rms_norm         3.04%       8.066ms         9.58%      25.444ms      37.362us       2.273ms         7.62%       2.273ms       3.337us           681  \nvoid at::native::(anonymous namespace)::vectorized_l...         0.00%       0.000us         0.00%       0.000us       0.000us       2.273ms         7.62%       2.273ms       3.337us           681  \n                                              aten::mul         2.56%       6.809ms         6.06%      16.099ms      25.314us       1.357ms         4.55%       1.357ms       2.134us           636  \n                                            aten::copy_         1.49%       3.943ms         5.09%      13.513ms      21.448us       1.150ms         3.86%       1.151ms       1.826us           630  \n                                         aten::addcmul_         0.96%       2.544ms         2.66%       7.065ms      23.551us     746.165us         2.50%     746.165us       2.487us           300  \nvoid at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     689.175us         2.31%     689.175us       1.531us           450  \n                                              aten::bmm         3.52%       9.355ms         5.12%      13.606ms      64.791us     652.733us         2.19%     652.733us       3.108us           210  \nvoid at::native::elementwise_kernel<128, 4, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     601.679us         2.02%     601.679us       2.865us           210  \n                                              aten::add         1.39%       3.677ms         3.27%       8.678ms      23.906us     594.346us         1.99%     594.346us       1.637us           363  \nvoid at::native::elementwise_kernel<128, 4, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     592.940us         1.99%     592.940us       2.745us           216  \nvoid at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     527.113us         1.77%     527.113us       1.658us           318  \nvoid at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     464.708us         1.56%     464.708us       1.822us           255  \n                                              aten::cat         0.73%       1.950ms         1.74%       4.607ms      23.626us     432.749us         1.45%     432.749us       2.219us           195  \n                                             aten::gelu         0.96%       2.551ms         2.22%       5.888ms      28.038us     426.185us         1.43%     426.185us       2.029us           210  \nvoid at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     426.185us         1.43%     426.185us       2.029us           210  \nvoid at::native::unrolled_elementwise_kernel<at::nat...         0.00%       0.000us         0.00%       0.000us       0.000us     397.675us         1.33%     397.675us       2.599us           153  \nstd::enable_if<!(false), void>::type internal::gemvx...         0.00%       0.000us         0.00%       0.000us       0.000us     323.373us         1.08%     323.373us       3.300us            98  \n                                              aten::cos         0.36%     950.870us         0.84%       2.241ms      21.345us     293.316us         0.98%     293.316us       2.793us           105  \nvoid at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     293.316us         0.98%     293.316us       2.793us           105  \n                                              aten::sin         0.31%     825.641us         0.80%       2.114ms      20.135us     277.035us         0.93%     277.035us       2.638us           105  \nvoid at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     277.035us         0.93%     277.035us       2.638us           105  \nvoid at::native::(anonymous namespace)::CatArrayBatc...         0.00%       0.000us         0.00%       0.000us       0.000us     249.036us         0.84%     249.036us       2.372us           105  \n                                         aten::_softmax         0.36%     958.417us         0.87%       2.318ms      22.076us     196.268us         0.66%     196.268us       1.869us           105  \nvoid (anonymous namespace)::softmax_warp_forward<flo...         0.00%       0.000us         0.00%       0.000us       0.000us     196.268us         0.66%     196.268us       1.869us           105  \nvoid at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     189.473us         0.64%     189.473us       1.754us           108  \nvoid at::native::(anonymous namespace)::CatArrayBatc...         0.00%       0.000us         0.00%       0.000us       0.000us     183.713us         0.62%     183.713us       2.041us            90  \n                                int4::layer34.down_proj         0.00%       0.000us         0.00%       0.000us       0.000us     178.660us         0.60%     178.660us      59.553us             3  \n-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  \nSelf CPU time total: 265.487ms\nSelf CUDA time total: 29.823ms\n",
+    "cpu_summary": "-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  \n                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  \n-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  \n                                       cudaLaunchKernel        27.60%      73.280ms        27.60%      73.280ms      16.049us       0.000us         0.00%       0.000us       0.000us          4566  \n                                         direct::decode        27.45%      72.880ms       100.00%     265.485ms      88.495ms       0.000us         0.00%       8.851ms       2.950ms             3  \n                                            aten::empty         4.11%      10.924ms         4.11%      10.924ms       4.907us       0.000us         0.00%       0.000us       0.000us          2226  \n                                              aten::bmm         3.52%       9.355ms         5.12%      13.606ms      64.791us     652.733us         2.19%     652.733us       3.108us           210  \n                                  aten::_fused_rms_norm         3.04%       8.066ms         9.58%      25.444ms      37.362us       2.273ms         7.62%       2.273ms       3.337us           681  \n                                              aten::mul         2.56%       6.809ms         6.06%      16.099ms      25.314us       1.357ms         4.55%       1.357ms       2.134us           636  \n                                         aten::rms_norm         1.49%       3.962ms        11.08%      29.406ms      43.181us       0.000us         0.00%       2.273ms       3.337us           681  \n                                            aten::copy_         1.49%       3.943ms         5.09%      13.513ms      21.448us       1.150ms         3.86%       1.151ms       1.826us           630  \n                                              aten::add         1.39%       3.677ms         3.27%       8.678ms      23.906us     594.346us         1.99%     594.346us       1.637us           363  \n                                          aten::reshape         1.16%       3.067ms         1.67%       4.432ms       3.247us       0.000us         0.00%       0.000us       0.000us          1365  \n                                    aten::empty_strided         1.11%       2.960ms         1.11%       2.960ms       4.698us       0.000us         0.00%       0.000us       0.000us           630  \n                                           aten::matmul         1.02%       2.717ms         7.21%      19.151ms      91.196us       0.000us         0.00%     652.733us       3.108us           210  \n                                         aten::_to_copy         1.01%       2.679ms         7.21%      19.151ms      30.398us       0.000us         0.00%       1.151ms       1.826us           630  \n                                             aten::gelu         0.96%       2.551ms         2.22%       5.888ms      28.038us     426.185us         1.43%     426.185us       2.029us           210  \n                                         aten::addcmul_         0.96%       2.544ms         2.66%       7.065ms      23.551us     746.165us         2.50%     746.165us       2.487us           300  \n                                            aten::slice         0.90%       2.393ms         1.12%       2.973ms       3.303us       0.000us         0.00%       0.000us       0.000us           900  \n                                  cudaStreamSynchronize         0.88%       2.347ms         0.88%       2.347ms     391.127us       0.000us         0.00%       0.000us       0.000us             6  \n                                             aten::view         0.83%       2.207ms         0.83%       2.207ms       1.077us       0.000us         0.00%       0.000us       0.000us          2049  \n                                              aten::cat         0.73%       1.950ms         1.74%       4.607ms      23.626us     432.749us         1.45%     432.749us       2.219us           195  \n                                       aten::as_strided         0.69%       1.828ms         0.69%       1.828ms       0.725us       0.000us         0.00%       0.000us       0.000us          2523  \n-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  \nSelf CPU time total: 265.487ms\nSelf CUDA time total: 29.823ms\n",
+    "event_shapes": [
+      {
+        "name": "aten::_fused_rms_norm",
+        "calls": 528,
+        "input_shapes": [
+          [
+            1,
+            1536
+          ],
+          [],
+          [
+            1536
+          ],
+          []
+        ],
+        "self_cuda_ms": 1.914,
+        "self_cpu_ms": 6.152
+      },
+      {
+        "name": "aten::add",
+        "calls": 315,
+        "input_shapes": [
+          [
+            1,
+            1536
+          ],
+          [
+            1,
+            1536
+          ],
+          []
+        ],
+        "self_cuda_ms": 0.522,
+        "self_cpu_ms": 3.162
+      },
+      {
+        "name": "aten::addcmul_",
+        "calls": 168,
+        "input_shapes": [
+          [
+            1,
+            8,
+            128
+          ],
+          [
+            1,
+            8,
+            128
+          ],
+          [
+            1,
+            1,
+            128
+          ],
+          []
+        ],
+        "self_cuda_ms": 0.482,
+        "self_cpu_ms": 1.516
+      },
+      {
+        "name": "aten::cat",
+        "calls": 195,
+        "input_shapes": [
+          [],
+          []
+        ],
+        "self_cuda_ms": 0.433,
+        "self_cpu_ms": 1.95
+      },
+      {
+        "name": "aten::copy_",
+        "calls": 240,
+        "input_shapes": [
+          [
+            1,
+            256
+          ],
+          [
+            1,
+            256
+          ],
+          []
+        ],
+        "self_cuda_ms": 0.363,
+        "self_cpu_ms": 1.382
+      },
+      {
+        "name": "aten::mul",
+        "calls": 105,
+        "input_shapes": [
+          [
+            1,
+            1536
+          ],
+          [
+            1
+          ]
+        ],
+        "self_cuda_ms": 0.307,
+        "self_cpu_ms": 1.117
+      },
+      {
+        "name": "aten::cos",
+        "calls": 84,
+        "input_shapes": [
+          [
+            1,
+            256
+          ]
+        ],
+        "self_cuda_ms": 0.231,
+        "self_cpu_ms": 0.768
+      },
+      {
+        "name": "aten::sin",
+        "calls": 84,
+        "input_shapes": [
+          [
+            1,
+            256
+          ]
+        ],
+        "self_cuda_ms": 0.217,
+        "self_cpu_ms": 0.673
+      },
+      {
+        "name": "aten::mul",
+        "calls": 84,
+        "input_shapes": [
+          [
+            1,
+            8,
+            256
+          ],
+          [
+            1,
+            1,
+            256
+          ]
+        ],
+        "self_cuda_ms": 0.215,
+        "self_cpu_ms": 0.889
+      },
+      {
+        "name": "aten::gelu",
+        "calls": 105,
+        "input_shapes": [
+          [
+            1,
+            256
+          ],
+          []
+        ],
+        "self_cuda_ms": 0.202,
+        "self_cpu_ms": 1.232
+      },
+      {
+        "name": "aten::_fused_rms_norm",
+        "calls": 84,
+        "input_shapes": [
+          [
+            1,
+            8,
+            256
+          ],
+          [],
+          [
+            256
+          ],
+          []
+        ],
+        "self_cuda_ms": 0.191,
+        "self_cpu_ms": 1.024
+      },
+      {
+        "name": "aten::mul",
+        "calls": 105,
+        "input_shapes": [
+          [
+            1,
+            256
+          ],
+          [
+            1,
+            256
+          ]
+        ],
+        "self_cuda_ms": 0.182,
+        "self_cpu_ms": 0.934
+      },
+      {
+        "name": "aten::copy_",
+        "calls": 72,
+        "input_shapes": [
+          [
+            1,
+            1,
+            256
+          ],
+          [
+            1,
+            1,
+            256
+          ],
+          []
+        ],
+        "self_cuda_ms": 0.151,
+        "self_cpu_ms": 0.5
+      },
+      {
+        "name": "aten::mul",
+        "calls": 84,
+        "input_shapes": [
+          [
+            1,
+            128
+          ],
+          []
+        ],
+        "self_cuda_ms": 0.143,
+        "self_cpu_ms": 0.98
+      },
+      {
+        "name": "aten::copy_",
+        "calls": 70,
+        "input_shapes": [
+          [
+            8,
+            1,
+            18
+          ],
+          [
+            8,
+            1,
+            18
+          ],
+          []
+        ],
+        "self_cuda_ms": 0.139,
+        "self_cpu_ms": 0.47
+      },
+      {
+        "name": "aten::copy_",
+        "calls": 70,
+        "input_shapes": [
+          [
+            8,
+            1,
+            19
+          ],
+          [
+            8,
+            1,
+            19
+          ],
+          []
+        ],
+        "self_cuda_ms": 0.139,
+        "self_cpu_ms": 0.471
+      },
+      {
+        "name": "aten::copy_",
+        "calls": 70,
+        "input_shapes": [
+          [
+            8,
+            1,
+            20
+          ],
+          [
+            8,
+            1,
+            20
+          ],
+          []
+        ],
+        "self_cuda_ms": 0.135,
+        "self_cpu_ms": 0.459
+      },
+      {
+        "name": "aten::gelu",
+        "calls": 60,
+        "input_shapes": [
+          [
+            1,
+            12288
+          ],
+          []
+        ],
+        "self_cuda_ms": 0.13,
+        "self_cpu_ms": 0.737
+      },
+      {
+        "name": "aten::mul",
+        "calls": 60,
+        "input_shapes": [
+          [
+            1,
+            12288
+          ],
+          [
+            1,
+            12288
+          ]
+        ],
+        "self_cuda_ms": 0.122,
+        "self_cpu_ms": 0.749
+      },
+      {
+        "name": "aten::addcmul_",
+        "calls": 42,
+        "input_shapes": [
+          [
+            1,
+            8,
+            256
+          ],
+          [
+            1,
+            8,
+            256
+          ],
+          [
+            1,
+            1,
+            256
+          ],
+          []
+        ],
+        "self_cuda_ms": 0.119,
+        "self_cpu_ms": 0.368
+      },
+      {
+        "name": "aten::addcmul_",
+        "calls": 72,
+        "input_shapes": [
+          [
+            1,
+            1,
+            128
+          ],
+          [
+            1,
+            1,
+            128
+          ],
+          [
+            1,
+            1,
+            128
+          ],
+          []
+        ],
+        "self_cuda_ms": 0.114,
+        "self_cpu_ms": 0.535
+      },
+      {
+        "name": "aten::mean",
+        "calls": 36,
+        "input_shapes": [
+          [
+            1,
+            1,
+            256
+          ],
+          [],
+          [],
+          []
+        ],
+        "self_cuda_ms": 0.114,
+        "self_cpu_ms": 0.504
+      },
+      {
+        "name": "aten::bmm",
+        "calls": 28,
+        "input_shapes": [
+          [
+            8,
+            1,
+            19
+          ],
+          [
+            8,
+            19,
+            256
+          ]
+        ],
+        "self_cuda_ms": 0.097,
+        "self_cpu_ms": 1.112
+      },
+      {
+        "name": "aten::copy_",
+        "calls": 60,
+        "input_shapes": [
+          [
+            1,
+            512
+          ],
+          [
+            1,
+            512
+          ],
+          []
+        ],
+        "self_cuda_ms": 0.095,
+        "self_cpu_ms": 0.333
+      },
+      {
+        "name": "aten::gelu",
+        "calls": 45,
+        "input_shapes": [
+          [
+            1,
+            6144
+          ],
+          []
+        ],
+        "self_cuda_ms": 0.094,
+        "self_cpu_ms": 0.581
+      },
+      {
+        "name": "aten::bmm",
+        "calls": 28,
+        "input_shapes": [
+          [
+            8,
+            1,
+            20
+          ],
+          [
+            8,
+            20,
+            256
+          ]
+        ],
+        "self_cuda_ms": 0.093,
+        "self_cpu_ms": 1.055
+      },
+      {
+        "name": "aten::mul",
+        "calls": 45,
+        "input_shapes": [
+          [
+            1,
+            6144
+          ],
+          [
+            1,
+            6144
+          ]
+        ],
+        "self_cuda_ms": 0.089,
+        "self_cpu_ms": 0.545
+      },
+      {
+        "name": "aten::bmm",
+        "calls": 28,
+        "input_shapes": [
+          [
+            8,
+            1,
+            18
+          ],
+          [
+            8,
+            18,
+            256
+          ]
+        ],
+        "self_cuda_ms": 0.086,
+        "self_cpu_ms": 1.066
+      },
+      {
+        "name": "aten::_fused_rms_norm",
+        "calls": 36,
+        "input_shapes": [
+          [
+            1,
+            1,
+            256
+          ],
+          [],
+          [
+            256
+          ],
+          []
+        ],
+        "self_cuda_ms": 0.084,
+        "self_cpu_ms": 0.486
+      },
+      {
+        "name": "aten::bmm",
+        "calls": 28,
+        "input_shapes": [
+          [
+            8,
+            1,
+            256
+          ],
+          [
+            8,
+            256,
+            20
+          ]
+        ],
+        "self_cuda_ms": 0.083,
+        "self_cpu_ms": 1.228
+      },
+      {
+        "name": "aten::bmm",
+        "calls": 28,
+        "input_shapes": [
+          [
+            8,
+            1,
+            256
+          ],
+          [
+            8,
+            256,
+            18
+          ]
+        ],
+        "self_cuda_ms": 0.082,
+        "self_cpu_ms": 1.549
+      },
+      {
+        "name": "aten::bmm",
+        "calls": 28,
+        "input_shapes": [
+          [
+            8,
+            1,
+            256
+          ],
+          [
+            8,
+            256,
+            19
+          ]
+        ],
+        "self_cuda_ms": 0.074,
+        "self_cpu_ms": 1.438
+      },
+      {
+        "name": "aten::pow",
+        "calls": 45,
+        "input_shapes": [
+          [
+            1,
+            1,
+            1
+          ],
+          []
+        ],
+        "self_cuda_ms": 0.072,
+        "self_cpu_ms": 0.457
+      },
+      {
+        "name": "aten::mul",
+        "calls": 36,
+        "input_shapes": [
+          [
+            1,
+            1,
+            256
+          ],
+          [
+            1,
+            1,
+            1
+          ]
+        ],
+        "self_cuda_ms": 0.072,
+        "self_cpu_ms": 0.323
+      },
+      {
+        "name": "aten::add",
+        "calls": 45,
+        "input_shapes": [
+          [
+            1,
+            1,
+            1
+          ],
+          [],
+          []
+        ],
+        "self_cuda_ms": 0.067,
+        "self_cpu_ms": 0.488
+      },
+      {
+        "name": "aten::_softmax",
+        "calls": 35,
+        "input_shapes": [
+          [
+            8,
+            1,
+            20
+          ],
+          [],
+          []
+        ],
+        "self_cuda_ms": 0.066,
+        "self_cpu_ms": 0.293
+      },
+      {
+        "name": "aten::_softmax",
+        "calls": 35,
+        "input_shapes": [
+          [
+            8,
+            1,
+            18
+          ],
+          [],
+          []
+        ],
+        "self_cuda_ms": 0.065,
+        "self_cpu_ms": 0.338
+      },
+      {
+        "name": "aten::_softmax",
+        "calls": 35,
+        "input_shapes": [
+          [
+            8,
+            1,
+            19
+          ],
+          [],
+          []
+        ],
+        "self_cuda_ms": 0.065,
+        "self_cpu_ms": 0.327
+      },
+      {
+        "name": "aten::cos",
+        "calls": 21,
+        "input_shapes": [
+          [
+            1,
+            512
+          ]
+        ],
+        "self_cuda_ms": 0.063,
+        "self_cpu_ms": 0.182
+      },
+      {
+        "name": "aten::sin",
+        "calls": 21,
+        "input_shapes": [
+          [
+            1,
+            512
+          ]
+        ],
+        "self_cuda_ms": 0.06,
+        "self_cpu_ms": 0.152
+      }
+    ],
+    "event_shapes_note": "record_shapes stores input shapes on CPU aten op events; CUDA kernel events do not carry shapes. Use metadata.projection_shapes for the real INT4 shapes."
+  },
+  "comparison": {
+    "note": "engine and direct profiled in separate runs; per-step self times are for attribution, not wall-clock comparison",
+    "engine_steps": 3,
+    "direct_steps": 3,
+    "categories": [
+      {
+        "category": "attention_kernel",
+        "engine_cuda_ms_per_step": 1.15,
+        "direct_cuda_ms_per_step": 0.0,
+        "delta_engine_minus_direct_ms": 1.15,
+        "engine_over_direct": null
+      },
+      {
+        "category": "attention_math",
+        "engine_cuda_ms_per_step": 0.0,
+        "direct_cuda_ms_per_step": 0.348,
+        "delta_engine_minus_direct_ms": -0.348,
+        "engine_over_direct": 0.0
+      },
+      {
+        "category": "copy",
+        "engine_cuda_ms_per_step": 0.581,
+        "direct_cuda_ms_per_step": 0.923,
+        "delta_engine_minus_direct_ms": -0.342,
+        "engine_over_direct": 0.629
+      },
+      {
+        "category": "elementwise",
+        "engine_cuda_ms_per_step": 3.461,
+        "direct_cuda_ms_per_step": 2.446,
+        "delta_engine_minus_direct_ms": 1.015,
+        "engine_over_direct": 1.415
+      },
+      {
+        "category": "int4_kernel",
+        "engine_cuda_ms_per_step": 12.177,
+        "direct_cuda_ms_per_step": 6.991,
+        "delta_engine_minus_direct_ms": 5.186,
+        "engine_over_direct": 1.742
+      },
+      {
+        "category": "norm",
+        "engine_cuda_ms_per_step": 1.257,
+        "direct_cuda_ms_per_step": 0.758,
+        "delta_engine_minus_direct_ms": 0.499,
+        "engine_over_direct": 1.658
+      },
+      {
+        "category": "other",
+        "engine_cuda_ms_per_step": 1.749,
+        "direct_cuda_ms_per_step": 1.413,
+        "delta_engine_minus_direct_ms": 0.336,
+        "engine_over_direct": 1.238
+      },
+      {
+        "category": "sampler",
+        "engine_cuda_ms_per_step": 0.022,
+        "direct_cuda_ms_per_step": 0.012,
+        "delta_engine_minus_direct_ms": 0.01,
+        "engine_over_direct": 1.833
+      }
+    ],
+    "hotspots": [
+      {
+        "name": "void int4_dequant_matmul_pair_vec_kernel<__half>(__half const*, unsigned char const*, __half const*, __half*, int, int, int, int, int)",
+        "engine_cuda_ms_per_step": 12.177,
+        "direct_cuda_ms_per_step": 6.991,
+        "delta_engine_minus_direct_ms": 5.186
+      },
+      {
+        "name": "aten::_fused_rms_norm",
+        "engine_cuda_ms_per_step": 1.058,
+        "direct_cuda_ms_per_step": 0.758,
+        "delta_engine_minus_direct_ms": 0.3
+      },
+      {
+        "name": "void at::native::(anonymous namespace)::vectorized_layer_norm_kernel<c10::Half, float, true>(int, float, c10::Half const*, c10::Half const*, c10::Half const*, float*, float*, c10::Half*)",
+        "engine_cuda_ms_per_step": 1.058,
+        "direct_cuda_ms_per_step": 0.758,
+        "delta_engine_minus_direct_ms": 0.3
+      },
+      {
+        "name": "void gemma4_attention_safe_kernel<__half, 128>(__half const*, __half const*, __half const*, int const*, int const*, __half*, int, int, int, int, int, int)",
+        "engine_cuda_ms_per_step": 0.858,
+        "direct_cuda_ms_per_step": 0.0,
+        "delta_engine_minus_direct_ms": 0.858
+      },
+      {
+        "name": "aten::mul",
+        "engine_cuda_ms_per_step": 0.658,
+        "direct_cuda_ms_per_step": 0.452,
+        "delta_engine_minus_direct_ms": 0.206
+      },
+      {
+        "name": "aten::addcmul_",
+        "engine_cuda_ms_per_step": 0.439,
+        "direct_cuda_ms_per_step": 0.249,
+        "delta_engine_minus_direct_ms": 0.19
+      },
+      {
+        "name": "aten::copy_",
+        "engine_cuda_ms_per_step": 0.247,
+        "direct_cuda_ms_per_step": 0.383,
+        "delta_engine_minus_direct_ms": -0.136
+      },
+      {
+        "name": "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native::addcmul_cuda_kernel(at::TensorIteratorBase&, c10::Scalar const&)::{lambda()#2}::operator()() const::{lambda()#8}::operator()() const::{lambda(c10::Half, c10::Half, c10::Half)#1}>(at::TensorIteratorBase&, at::native::addcmul_cuda_kernel(at::TensorIteratorBase&, c10::Scalar const&)::{lambda()#2}::operator()() const::{lambda()#8}::operator()() const::{lambda(c10::Half, c10::Half, c10::Half)#1} const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl_nocast<at::native::addcmul_cuda_kernel(at::TensorIteratorBase&, c10::Scalar const&)::{lambda()#2}::operator()() const::{lambda()#8}::operator()() const::{lambda(c10::Half, c10::Half, c10::Half)#1}>(at::TensorIteratorBase&, at::native::addcmul_cuda_kernel(at::TensorIteratorBase&, c10::Scalar const&)::{lambda()#2}::operator()() const::{lambda()#8}::operator()() const::{lambda(c10::Half, c10::Half, c10::Half)#1} const&)::{lambda(int)#1})",
+        "engine_cuda_ms_per_step": 0.355,
+        "direct_cuda_ms_per_step": 0.201,
+        "delta_engine_minus_direct_ms": 0.154
+      },
+      {
+        "name": "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native::BinaryFunctor<c10::Half, c10::Half, c10::Half, at::native::binary_internal::MulFunctor<float> > >(at::TensorIteratorBase&, at::native::BinaryFunctor<c10::Half, c10::Half, c10::Half, at::native::binary_internal::MulFunctor<float> > const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl_nocast<at::native::BinaryFunctor<c10::Half, c10::Half, c10::Half, at::native::binary_internal::MulFunctor<float> > >(at::TensorIteratorBase&, at::native::BinaryFunctor<c10::Half, c10::Half, c10::Half, at::native::binary_internal::MulFunctor<float> > const&)::{lambda(int)#1})",
+        "engine_cuda_ms_per_step": 0.345,
+        "direct_cuda_ms_per_step": 0.198,
+        "delta_engine_minus_direct_ms": 0.147
+      },
+      {
+        "name": "void gemma4_attention_safe_kernel<__half, 256>(__half const*, __half const*, __half const*, int const*, int const*, __half*, int, int, int, int, int, int)",
+        "engine_cuda_ms_per_step": 0.292,
+        "direct_cuda_ms_per_step": 0.0,
+        "delta_engine_minus_direct_ms": 0.292
+      },
+      {
+        "name": "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<c10::Half, c10::Half, c10::Half, at::native::binary_internal::MulFunctor<float> >, std::array<char*, 3ul> >(int, at::native::BinaryFunctor<c10::Half, c10::Half, c10::Half, at::native::binary_internal::MulFunctor<float> >, std::array<char*, 3ul>)",
+        "engine_cuda_ms_per_step": 0.237,
+        "direct_cuda_ms_per_step": 0.155,
+        "delta_engine_minus_direct_ms": 0.082
+      },
+      {
+        "name": "aten::add",
+        "engine_cuda_ms_per_step": 0.236,
+        "direct_cuda_ms_per_step": 0.198,
+        "delta_engine_minus_direct_ms": 0.038
+      },
+      {
+        "name": "aten::gelu",
+        "engine_cuda_ms_per_step": 0.233,
+        "direct_cuda_ms_per_step": 0.142,
+        "delta_engine_minus_direct_ms": 0.091
+      },
+      {
+        "name": "void at::native::vectorized_elementwise_kernel<4, at::native::GeluCUDAKernelImpl(at::TensorIteratorBase&, at::native::GeluType)::{lambda()#1}::operator()() const::{lambda()#3}::operator()() const::{lambda(c10::Half)#1}, std::array<char*, 2ul> >(int, at::native::GeluCUDAKernelImpl(at::TensorIteratorBase&, at::native::GeluType)::{lambda()#1}::operator()() const::{lambda()#3}::operator()() const::{lambda(c10::Half)#1}, std::array<char*, 2ul>)",
+        "engine_cuda_ms_per_step": 0.233,
+        "direct_cuda_ms_per_step": 0.142,
+        "delta_engine_minus_direct_ms": 0.091
+      },
+      {
+        "name": "void at::native::vectorized_elementwise_kernel<4, at::native::float16_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda(float)#1}, std::array<char*, 2ul> >(int, at::native::float16_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda(float)#1}, std::array<char*, 2ul>)",
+        "engine_cuda_ms_per_step": 0.0,
+        "direct_cuda_ms_per_step": 0.23,
+        "delta_engine_minus_direct_ms": -0.23
+      },
+      {
+        "name": "aten::bmm",
+        "engine_cuda_ms_per_step": 0.0,
+        "direct_cuda_ms_per_step": 0.218,
+        "delta_engine_minus_direct_ms": -0.218
+      },
+      {
+        "name": "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctor_add<c10::Half>, std::array<char*, 3ul> >(int, at::native::CUDAFunctor_add<c10::Half>, std::array<char*, 3ul>)",
+        "engine_cuda_ms_per_step": 0.199,
+        "direct_cuda_ms_per_step": 0.176,
+        "delta_engine_minus_direct_ms": 0.023
+      },
+      {
+        "name": "void fused_add_rms_norm_kernel<__half>(__half const*, __half const*, __half const*, __half*, __half*, int, int, float)",
+        "engine_cuda_ms_per_step": 0.199,
+        "direct_cuda_ms_per_step": 0.0,
+        "delta_engine_minus_direct_ms": 0.199
+      },
+      {
+        "name": "aten::max",
+        "engine_cuda_ms_per_step": 0.186,
+        "direct_cuda_ms_per_step": 0.0,
+        "delta_engine_minus_direct_ms": 0.186
+      },
+      {
+        "name": "void at::native::reduce_kernel<512, 1, at::native::ReduceOp<int, at::native::func_wrapper_t<int, at::native::MaxNanFunctor<int> >, unsigned int, int, 4, 4> >(at::native::ReduceOp<int, at::native::func_wrapper_t<int, at::native::MaxNanFunctor<int> >, unsigned int, int, 4, 4>)",
+        "engine_cuda_ms_per_step": 0.186,
+        "direct_cuda_ms_per_step": 0.0,
+        "delta_engine_minus_direct_ms": 0.186
+      },
+      {
+        "name": "aten::cat",
+        "engine_cuda_ms_per_step": 0.0,
+        "direct_cuda_ms_per_step": 0.144,
+        "delta_engine_minus_direct_ms": -0.144
+      },
+      {
+        "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1}, std::array<char*, 2ul>, 4, TrivialOffsetCalculator<1, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, at::native::memory::LoadWithCast<1>, at::native::memory::StoreWithCast<1> >(int, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1}, std::array<char*, 2ul>, TrivialOffsetCalculator<1, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, at::native::memory::LoadWithCast<1>, at::native::memory::StoreWithCast<1>)",
+        "engine_cuda_ms_per_step": 0.0,
+        "direct_cuda_ms_per_step": 0.133,
+        "delta_engine_minus_direct_ms": -0.133
+      },
+      {
+        "name": "std::enable_if<!(false), void>::type internal::gemvx::kernel<int, int, __half, __half, __half, float, false, true, false, false, 6, false, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<__half const>, cublasGemvTensorStridedBatched<__half const>, cublasGemvTensorStridedBatched<__half>, float> >(cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<__half const>, cublasGemvTensorStridedBatched<__half const>, cublasGemvTensorStridedBatched<__half>, float>)",
+        "engine_cuda_ms_per_step": 0.0,
+        "direct_cuda_ms_per_step": 0.108,
+        "delta_engine_minus_direct_ms": -0.108
+      },
+      {
+        "name": "aten::cos",
+        "engine_cuda_ms_per_step": 0.0,
+        "direct_cuda_ms_per_step": 0.098,
+        "delta_engine_minus_direct_ms": -0.098
+      },
+      {
+        "name": "void at::native::vectorized_elementwise_kernel<4, at::native::cos_kernel_cuda(at::TensorIteratorBase&)::{lambda()#2}::operator()() const::{lambda()#2}::operator()() const::{lambda(float)#1}, std::array<char*, 2ul> >(int, at::native::cos_kernel_cuda(at::TensorIteratorBase&)::{lambda()#2}::operator()() const::{lambda()#2}::operator()() const::{lambda(float)#1}, std::array<char*, 2ul>)",
+        "engine_cuda_ms_per_step": 0.0,
+        "direct_cuda_ms_per_step": 0.098,
+        "delta_engine_minus_direct_ms": -0.098
+      }
+    ]
+  }
+}

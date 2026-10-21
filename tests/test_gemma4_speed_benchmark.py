@@ -1,6 +1,7 @@
 import importlib.util
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -113,7 +114,132 @@ def test_bench_direct_returns_all_tokens_and_honors_eos():
     assert result["generated_tokens"] == 3
     assert result["generated_text"] == "22"
     assert result["generated_text_raw"] == "<2,2,1>"
+    assert result["finish_reason"] == "EOS"
+    assert result["visible_text_empty"] is False
+    assert result["generation_status"] == "ok"
+    assert result["text_decode_s"] >= 0.0
     assert runner.decode_calls == 2
+
+
+class EmptyTokenizer:
+    def decode(self, ids, skip_special_tokens=True):
+        return ""
+
+
+def test_bench_direct_flags_empty_visible_text():
+    runner = FakeDirectRunner([torch.tensor([0.0, 0.0, 4.0])])
+    result = BENCH.bench_direct(
+        runner, [7], max_new_tokens=1, tokenizer=EmptyTokenizer(), eos_token_ids=(1,)
+    )
+    assert result["generated_tokens"] == 1
+    assert result["visible_text_empty"] is True
+    assert result["generation_status"] == "empty_text"
+
+
+def test_bench_direct_profiles_decode_only_with_accurate_count():
+    runner = FakeDirectRunner(
+        [
+            torch.tensor([0.0, 0.0, 4.0]),
+            torch.tensor([0.0, 0.0, 5.0]),
+            torch.tensor([0.0, 0.0, 6.0]),
+            torch.tensor([0.0, 0.0, 7.0]),
+        ]
+    )
+    profiler = FakeProfiler()
+
+    result = BENCH.bench_direct(
+        runner, [7], max_new_tokens=4, tokenizer=FakeTokenizer(),
+        eos_token_ids=(1,), profile_steps=True, profiler=profiler,
+    )
+
+    assert profiler.started == 1
+    assert profiler.steps == 2
+    assert profiler.stopped == 1
+    assert result["profile_decode_steps"] == 2
+    assert result["profile_expected_steps"] == 2
+    assert result["profile_steps_match"] is True
+    assert result["profile_start_context_len"] == 1
+    assert result["text_postprocess_s"] >= 0.0
+
+
+def test_profile_event_shapes_and_backend_comparison():
+    events = [
+        SimpleNamespace(
+            key="void int4_dequant_matmul_pair_vec_kernel",
+            count=2,
+            self_cpu_time_total=10.0,
+            self_device_time_total=800.0,
+            input_shapes=[[1, 1536], [768, 1536], [262144, 1]],
+        ),
+    ]
+    shapes = BENCH.profile_event_shapes(SimpleNamespace(events=lambda: events))
+    assert shapes[0]["input_shapes"][0] == [1, 1536]
+    assert shapes[0]["self_cuda_ms"] == 0.8
+    assert shapes[0]["calls"] == 1
+
+    engine = {
+        "actual_decode_steps": 2,
+        "categories": [{
+            "category": "int4_kernel", "self_cuda_ms_per_step": 1.0,
+            "include_in_kernel_sum": True,
+        }],
+        "hotspots": [{
+            "name": "int4", "cuda_ms_per_step": 1.0, "kind": "kernel",
+        }],
+    }
+    direct = {
+        "actual_decode_steps": 2,
+        "categories": [{
+            "category": "int4_kernel", "self_cuda_ms_per_step": 1.5,
+            "include_in_kernel_sum": True,
+        }],
+        "hotspots": [{
+            "name": "int4", "cuda_ms_per_step": 1.5, "kind": "kernel",
+        }],
+    }
+    comparison = BENCH.compare_profiles(engine, direct)
+    assert comparison["categories"][0]["delta_engine_minus_direct_ms"] == -0.5
+    assert comparison["hotspots"][0]["engine_cuda_ms_per_step"] == 1.0
+
+
+def test_profile_categories_keep_labels_separate():
+    events = [
+        SimpleNamespace(
+            key="void int4_dequant_matmul_pair_kernel",
+            count=10,
+            self_cpu_time_total=100.0,
+            self_device_time_total=2000.0,
+        ),
+        SimpleNamespace(
+            key="int4::lm_head",
+            count=2,
+            self_cpu_time_total=10.0,
+            self_device_time_total=500.0,
+        ),
+        SimpleNamespace(
+            key="engine::decode",
+            count=2,
+            self_cpu_time_total=300.0,
+            self_device_time_total=1000.0,
+        ),
+        SimpleNamespace(
+            key="void gemma4_attention_safe_kernel",
+            count=4,
+            self_cpu_time_total=50.0,
+            self_device_time_total=400.0,
+        ),
+    ]
+    rows = {row["category"]: row for row in BENCH.profile_categories(events, 2)}
+    assert rows["int4_kernel"]["include_in_kernel_sum"] is True
+    assert rows["int4_kernel"]["self_cuda_ms_per_step"] == 1.0
+    assert rows["int4_label"]["include_in_kernel_sum"] is False
+    assert rows["engine_label"]["include_in_kernel_sum"] is False
+    assert rows["attention_kernel"]["self_cuda_ms_per_step"] == 0.2
+
+    hotspots = BENCH.profile_hotspots(events, 2)
+    assert hotspots[0]["name"].startswith("void int4_dequant_matmul_pair_kernel")
+    assert hotspots[0]["cuda_us_per_call"] == 200.0
+    assert hotspots[0]["cuda_ms_per_step"] == 1.0
 
 
 def _patch_engine(monkeypatch, steps, tokenizer):
@@ -160,6 +286,9 @@ def test_bench_engine_profiles_decode_only_with_accurate_count(monkeypatch):
     assert profiler.steps == 2
     assert profiler.stopped == 1
     assert result["profile_decode_steps"] == 2
+    assert result["profile_steps_match"] is True
+    assert result["profile_expected_steps"] == 2
+    assert result["profile_start_context_len"] == 5
     assert result["generated_token_ids"] == [10, 11, 12, 13]
     assert result["generated_text"] == "10111213"
 

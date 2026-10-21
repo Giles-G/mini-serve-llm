@@ -1,0 +1,75 @@
+{
+  "note": "batch graph, greedy, 19-token prompt, prmt fast dequant + FP16 pipe epilogue + fused RoPE/GELU + two-tile down split2; B<=15 padded",
+  "rows": [
+    {
+      "batch": 2,
+      "output": 16,
+      "e2e": 117.9,
+      "decode": 159.6,
+      "per_request": 79.8
+    },
+    {
+      "batch": 2,
+      "output": 64,
+      "e2e": 146.7,
+      "decode": 159.6,
+      "per_request": 79.8
+    },
+    {
+      "batch": 3,
+      "output": 16,
+      "e2e": 175.2,
+      "decode": 275.1,
+      "per_request": 91.7
+    },
+    {
+      "batch": 3,
+      "output": 64,
+      "e2e": 240.3,
+      "decode": 272.2,
+      "per_request": 90.7
+    },
+    {
+      "batch": 4,
+      "output": 16,
+      "e2e": 216.2,
+      "decode": 369.9,
+      "per_request": 92.5
+    },
+    {
+      "batch": 4,
+      "output": 64,
+      "e2e": 310.3,
+      "decode": 364.6,
+      "per_request": 91.2
+    },
+    {
+      "batch": 8,
+      "output": 16,
+      "e2e": 295.7,
+      "decode": 706.4,
+      "per_request": 88.3
+    },
+    {
+      "batch": 8,
+      "output": 64,
+      "e2e": 533.9,
+      "decode": 704.2,
+      "per_request": 88.0
+    },
+    {
+      "batch": 16,
+      "output": 16,
+      "e2e": 395.5,
+      "decode": 1445.8,
+      "per_request": 90.4
+    },
+    {
+      "batch": 16,
+      "output": 64,
+      "e2e": 889.2,
+      "decode": 1430.3,
+      "per_request": 89.4
+    }
+  ]
+}
